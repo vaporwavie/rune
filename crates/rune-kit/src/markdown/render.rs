@@ -56,6 +56,10 @@ const SHELLS: [&str; 7] = ["bash", "sh", "shell", "zsh", "fish", "console", "ter
 /// Plain-text fence names, which [`MarkdownStyle::plain_code_text`] colours as a fence with none.
 const PLAIN_TEXT: [&str; 4] = ["text", "txt", "plain", "plaintext"];
 
+fn is_prose(b: &Block) -> bool {
+    matches!(b, Block::Para(_) | Block::Heading(..) | Block::List { .. } | Block::Quote(_))
+}
+
 /// The keys [`Renderer::blocks`] gives `n` blocks.
 pub(super) fn rendered_keys(n: usize, keys: &[String]) -> Vec<String> {
     let mut used = Vec::new();
@@ -333,7 +337,11 @@ impl Renderer {
             if top_level {
                 self.current_block_key.replace(key.clone().into());
             }
-            c = c.child(self.block(b, maps.get(i).unwrap_or(&empty)).key(key).mt(top));
+            let mut e = self.block(b, maps.get(i).unwrap_or(&empty));
+            if let Some(w) = self.s.prose_width.filter(|_| top_level && is_prose(b)) {
+                e = e.max_w(w);
+            }
+            c = c.child(e.key(key).mt(top));
             prev_mb = mb;
             after_heading = matches!(b, Block::Heading(..));
         }
