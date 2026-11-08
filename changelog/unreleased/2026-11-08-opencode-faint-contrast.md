@@ -1,0 +1,1 @@
+- **The OpenCode theme's faint text and light warning text pass 4.5:1.** `text_faint` is `#6f6f6f` in light and `#8f8f8f` in dark (was `#808080` in both), and the light `warning.fg` is `#805711` (was `#cb9f34`, 2.3:1), the warning icon's colour. Apps reading these tokens get darker or lighter text.
