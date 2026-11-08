@@ -1,0 +1,1 @@
+- **`Button::show_shortcut` draws the shortcut after the label** (`Rate ⌘D`) in the label's font at 60% of its ink, for keyboard-first apps where the tooltip that carries it is rarely seen. Text labels only.

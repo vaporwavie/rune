@@ -205,6 +205,7 @@ pub struct Button {
     expanded: Option<bool>,
     help: Option<String>,
     shortcut: Option<String>,
+    show_shortcut: bool,
     acts: Acts,
 }
 
@@ -233,6 +234,7 @@ impl Button {
             expanded: None,
             help: None,
             shortcut: None,
+            show_shortcut: false,
             acts: Acts::default(),
         }
     }
@@ -305,6 +307,13 @@ impl Button {
         self.shortcut = Some(s.into());
         self
     }
+    /// Also draw the [`Button::shortcut`] after the label, in the label's font and ink at 60%
+    /// opacity (`Rate ⌘D`), for keyboard-first apps where a tooltip is never seen. Text labels
+    /// only: a [`Button::label_with`] label draws what it likes.
+    pub fn show_shortcut(mut self) -> Self {
+        self.show_shortcut = true;
+        self
+    }
     pub fn on_press<S: 'static>(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.acts.press(f);
         self
@@ -363,7 +372,15 @@ impl Button {
             e = e.child(ic);
         }
         e = match self.look {
-            Label::Text => e.child(text(self.label).key("label").font(font).color(ink).a11y_hidden()),
+            Label::Text => {
+                let labelled = e.child(text(self.label).key("label").font(font).color(ink).a11y_hidden());
+                // ⎋ reads as a refresh arrow in most UI fonts once it leaves a menu, so it's spelled.
+                let shown = self.shortcut.as_deref().map(format_shortcut).map(|sc| if sc == "⎋" { "esc".to_owned() } else { sc });
+                match shown.filter(|sc| self.show_shortcut && !sc.is_empty()) {
+                    Some(sc) => labelled.child(text(sc).key("shortcut").font(font).color(k.alpha(ink, 0.6)).a11y_hidden()),
+                    None => labelled,
+                }
+            }
             // The button's edges spring on the label's own curve, so the padding holds while
             // the label grows or shrinks.
             Label::Rolling(key) => e.motion(RollingText::SPRING).width_leads()
