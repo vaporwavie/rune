@@ -374,6 +374,7 @@ pub struct TextArea {
     grow: Option<(usize, usize)>,
     max_height: Option<f32>,
     invalid: bool,
+    plain: bool,
     state: State,
     edits: EditActs,
 }
@@ -404,12 +405,21 @@ impl TextArea {
             grow: None,
             max_height: None,
             invalid: false,
+            plain: false,
             state: State::Rest,
             edits: EditActs::default(),
         }
     }
     pub fn placeholder(mut self, p: impl Into<String>) -> Self {
         self.placeholder = p.into();
+        self
+    }
+    /// No box, as [`TextInput::plain`]: no fill, radius, shadow, border, hover tint or focus
+    /// outline, for a field inside a container that draws its own (a chat composer). Focus
+    /// shows only as the caret, an invalid field only as red text, and a disabled one dims.
+    /// The inner padding stays.
+    pub fn plain(mut self) -> Self {
+        self.plain = true;
         self
     }
     /// The accessible name, as [`TextInput::label`].
@@ -484,7 +494,7 @@ impl TextArea {
         let c = &k.c;
         let disabled = self.state == State::Disabled;
         let style = TextStyle { line_height: (13.0f32 * 1.35 * 2.0).round() / 2.0, ..k.ty.ui };
-        let red = self.invalid && !disabled && k.invalid_text;
+        let red = self.invalid && !disabled && (k.invalid_text || self.plain);
         let ink = if red { c.danger.fg } else { c.text_base };
         let hint = if red { c.danger.fg } else { c.text_faint };
         let field = text_input(&self.edit, style)
@@ -524,6 +534,9 @@ impl TextArea {
             Some(w) => e.w(w),
             None => e.w_full(),
         };
+        if self.plain {
+            return if disabled { e.layer_opacity(0.5) } else { e };
+        }
         shell(k, e, self.state, self.invalid && !disabled, self.edit.focused && !disabled)
     }
 }

@@ -1,0 +1,1 @@
+- **`TextArea::plain` draws a text area with no box**, as `TextInput::plain` does a single-line field: no fill, radius, shadow, border, hover tint or focus outline, so a container such as a chat composer can draw its own and hold a footer below the text. Focus shows as the caret, an invalid area as red text, and a disabled one dims.
