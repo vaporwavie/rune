@@ -174,10 +174,15 @@ enum Label {
 }
 
 /// An accelerator as a menu shows it, the same key on every layout; any other text as given.
+/// Escape is spelled `esc`, as the Mac keyboard labels it: away from a menu's column of
+/// keycaps, ⎋ reads as a refresh arrow. Elsewhere it is already `Esc`.
 fn format_shortcut(s: &str) -> String {
     let s = s.trim();
     if let Ok(sc) = s.parse::<rune::Shortcut>() {
-        sc.menu_keycaps().join(if cfg!(target_os = "macos") { "" } else { "+" })
+        let caps = sc.menu_keycaps().into_iter().map(|cap| if cap == "⎋" { "esc".to_owned() } else { cap });
+        caps.collect::<Vec<_>>().join(if cfg!(target_os = "macos") { "" } else { "+" })
+    } else if s == "⎋" {
+        "esc".to_owned()
     } else {
         s.to_owned()
     }
@@ -205,6 +210,7 @@ pub struct Button {
     expanded: Option<bool>,
     help: Option<String>,
     shortcut: Option<String>,
+    show_shortcut: bool,
     acts: Acts,
 }
 
@@ -233,6 +239,7 @@ impl Button {
             expanded: None,
             help: None,
             shortcut: None,
+            show_shortcut: false,
             acts: Acts::default(),
         }
     }
@@ -305,6 +312,14 @@ impl Button {
         self.shortcut = Some(s.into());
         self
     }
+    /// Also draws the [`Button::shortcut`] after the label (`Rate ⌘D`), in the label's font and
+    /// the faint text a menu item's shortcut takes (on a Contrast or Submit fill, the label's
+    /// ink faded), for keyboard-first apps where the tooltip that carries it is rarely seen.
+    /// Text labels only: a [`Button::label_with`] label draws what it likes.
+    pub fn show_shortcut(mut self) -> Self {
+        self.show_shortcut = true;
+        self
+    }
     pub fn on_press<S: 'static>(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.acts.press(f);
         self
@@ -363,7 +378,13 @@ impl Button {
             e = e.child(ic);
         }
         e = match self.look {
-            Label::Text => e.child(text(self.label).key("label").font(font).color(ink).a11y_hidden()),
+            Label::Text => {
+                let shown = self.shortcut.as_deref().filter(|_| self.show_shortcut).map(format_shortcut).filter(|sc| !sc.is_empty());
+                let filled = matches!(self.variant, ButtonVariant::Contrast | ButtonVariant::Submit);
+                let faint = if filled { k.alpha(ink, 0.6) } else { k.c.text_faint };
+                e.child(text(self.label).key("label").font(font).color(ink).a11y_hidden())
+                    .children(shown.map(|sc| text(sc).key("shortcut").font(font).color(faint).a11y_hidden()))
+            }
             // The button's edges spring on the label's own curve, so the padding holds while
             // the label grows or shrinks.
             Label::Rolling(key) => e.motion(RollingText::SPRING).width_leads()

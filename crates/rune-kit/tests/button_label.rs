@@ -1,5 +1,5 @@
 use rune::{Cx, El, Env, Runtime};
-use rune_kit::{Button, Kit};
+use rune_kit::{Button, ButtonVariant, Kit};
 
 struct S {
     label: String,
@@ -113,4 +113,36 @@ fn a_rolling_button_with_an_icon_and_neighbour_springs_without_jumps() {
     }
     assert!((cancel_xs[0] - cancel_from).abs() < 1.0, "neighbour starts at its old x: {} vs {cancel_from}", cancel_xs[0]);
     assert!(cancel_xs.windows(2).all(|x| (x[1] - x[0]).abs() < 4.0), "neighbour slides with no jump: {cancel_xs:?}");
+}
+
+#[test]
+fn a_shown_shortcut_follows_the_label_in_faint_text_and_spells_escape() {
+    fn view(_: &(), _: &mut Cx<()>) -> El {
+        let k = Kit::neutral(true);
+        rune::row()
+            .gap(8.0)
+            .child(Button::new("Cancel").variant(ButtonVariant::Ghost).shortcut("esc").show_shortcut().build(&k).key("cancel"))
+            .child(Button::new("Close").shortcut("⎋").show_shortcut().build(&k).key("close"))
+            .child(Button::new("Open").variant(ButtonVariant::Contrast).shortcut("⏎").show_shortcut().build(&k).key("open"))
+            .child(Button::new("Save").shortcut("⌘S").build(&k).key("save"))
+    }
+    let k = Kit::neutral(true);
+    let mut rt = Runtime::new((), view, (600.0, 100.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    let els = rt.elements();
+    let find = |path: &str| els.iter().find(|e| e.path.ends_with(path)).unwrap_or_else(|| panic!("no {path}"));
+    let esc = if cfg!(target_os = "macos") { "esc" } else { "Esc" };
+
+    let (button, label, shortcut) = (find("cancel"), find("cancel/label"), find("cancel/shortcut"));
+    assert_eq!(shortcut.text.as_deref(), Some(esc));
+    assert!(shortcut.rect[0] > label.rect[0] + label.rect[2], "the shortcut follows the label");
+    assert!(shortcut.rect[0] + shortcut.rect[2] <= button.rect[0] + button.rect[2], "inside the button");
+    assert_eq!(shortcut.text_color, Some(k.c.text_faint), "faint, as a menu item's shortcut");
+    assert_eq!(button.label.as_deref(), Some("Cancel"), "a reader hears the label, and the shortcut as a hint");
+    assert_eq!(button.help.as_deref(), Some(format!("Cancel  {esc}").as_str()));
+
+    assert_eq!(find("close/shortcut").text.as_deref(), Some("esc"), "⎋ is spelled out wherever it is drawn");
+    assert_eq!(find("close").help.as_deref(), Some("Close  esc"));
+    assert_eq!(find("open/shortcut").text_color, Some(k.alpha(k.c.text_contrast, 0.6)), "faint text wouldn't read on a contrast fill");
+    assert!(els.iter().all(|e| !e.path.ends_with("save/shortcut")), "a shortcut shows only when asked");
 }
