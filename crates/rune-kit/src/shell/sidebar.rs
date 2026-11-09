@@ -18,8 +18,8 @@ pub const ROW_HEIGHT: f32 = 28.0;
 pub const TWO_LINE_ROW_HEIGHT: f32 = 40.0;
 /// Each level of [`SidebarRow::depth`] indents this far.
 pub const INDENT: f32 = 16.0;
-/// Rows sit this far in from the sidebar's sides.
-const INSET: f32 = 8.0;
+/// Rows sit this far in from the sidebar's sides, and their content this far in from the row's.
+pub const INSET: f32 = 8.0;
 
 enum Body {
     Items(Vec<Themed>),
