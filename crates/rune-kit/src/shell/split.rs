@@ -145,6 +145,7 @@ pub struct SplitView {
     motion: PaneMotion,
     peek: Option<SidebarPeek>,
     reduced: bool,
+    title: Option<El>,
 }
 
 impl SplitView {
@@ -163,6 +164,7 @@ impl SplitView {
             motion: PaneMotion::new(),
             peek: None,
             reduced: false,
+            title: None,
         }
     }
     /// The leading pane. `access` finds its state in the app's; the grip and the toggle button
@@ -185,6 +187,13 @@ impl SplitView {
     /// Points the traffic lights take at the window's leading edge: `Cx::titlebar_inset`.
     pub fn titlebar_inset(mut self, points: f32) -> Self {
         self.inset = points.max(0.0);
+        self
+    }
+    /// The start of the sidebar's title bar row, past the traffic lights and before an
+    /// in-header toggle: the app's mark or name. It shrinks before the toggle does, so give
+    /// its text `truncate`. Keep it non-interactive, since the row drags the window.
+    pub fn sidebar_title(mut self, title: El) -> Self {
+        self.title = Some(title);
         self
     }
     /// Leaves out the sidebar's toggle button (the app shows its own, or none).
@@ -252,6 +261,7 @@ impl SplitView {
         let past_toggle = if toggle { lights + side + t.gap } else { lights };
         let peek = self.peek;
         let d = Dock { k, spring, motion: self.motion, reduced: self.reduced };
+        let title = self.title;
 
         let mut overlay = None;
         let mut zones = Vec::new();
@@ -321,7 +331,8 @@ impl SplitView {
                 .pt(top)
                 .center_y()
                 .window_drag()
-                .child(el().key("sidebar-titlebar-clear").w((clear - self.padding[0]).max(0.0)).motion(spring).a11y_hidden());
+                .child(el().key("sidebar-titlebar-clear").w((clear - self.padding[0]).max(0.0)).motion(spring).a11y_hidden())
+                .children(title.map(|t| row().key("sidebar-title").shrink().clip_rounded(0.0).motion(spring).child(t)));
             if toggle && t.in_header {
                 band = band.child(el().key("sidebar-spacer").grow(1.0).a11y_hidden()).child(el().key("sidebar-toggle-slot").w(side).ml(8.0).a11y_hidden());
             }
