@@ -1,7 +1,10 @@
-//! Native application and Dock menus. One App owns the process-wide custom menu at a time.
-//! Default AppKit/winit items are preserved. Other native platforms return Unsupported;
-//! headless scripts use the same item lookup and action dispatch on every platform.
+//! Native application and Dock menus. One App owns the process-wide custom menu at a time:
+//! the one whose window last took focus, so with a window per App (`run_windows`) the menu bar
+//! holds the key window's items and they act in it. Default AppKit/winit items are preserved.
+//! Other native platforms return Unsupported; headless scripts use the same item lookup and
+//! action dispatch on every platform.
 use std::sync::{Arc, Mutex, Weak};
+use crate::machine::{Attempt, Seq};
 use crate::{App, AppHandle, Shortcut, Tx, app::Shared};
 
 #[cfg(target_os = "macos")]
@@ -17,7 +20,7 @@ mod standard;
 #[cfg(target_os = "macos")]
 mod standard_macos;
 #[cfg(target_os = "macos")]
-pub(crate) use default_macos::{ensure as ensure_default_menu, promote as promote_default_menu};
+pub(crate) use default_macos::{ensure as ensure_default_menu, promote as promote_default_menu, set_layout_direction};
 #[cfg(target_os = "macos")]
 pub(crate) use standard_macos::{adopt as adopt_standard_view, install as install_standard_menus};
 #[cfg(target_os = "macos")]
@@ -31,6 +34,7 @@ struct Description {
     id: String,
     title: String,
     location: Location,
+    after: Option<String>,
     equivalent: Option<Shortcut>,
     keys_first: bool,
     enabled: bool,
@@ -38,7 +42,8 @@ struct Description {
     separator: bool,
 }
 
-/// A custom native item. Defaults to the app menu, enabled and unchecked, with its title as id.
+/// A custom native item. Defaults to the app menu (after its About item, in the order given),
+/// enabled and unchecked, with its title as id.
 pub struct MenuItem<S> { description: Description, action: fn(&mut S, &mut Tx) }
 impl<S> Clone for MenuItem<S> {
     fn clone(&self) -> Self { Self { description: self.description.clone(), action: self.action } }
@@ -46,7 +51,7 @@ impl<S> Clone for MenuItem<S> {
 impl<S> MenuItem<S> {
     pub fn new(title: impl Into<String>, action: fn(&mut S, &mut Tx)) -> Self {
         let title = title.into();
-        Self { description: Description { id: title.clone(), title, location: Location::App,
+        Self { description: Description { id: title.clone(), title, location: Location::App, after: None,
             equivalent: None, keys_first: false, enabled: true, checked: false, separator: false }, action }
     }
     /// A separator line, placed with `menu` or `dock` like an item. It has no id or title,
@@ -57,9 +62,16 @@ impl<S> MenuItem<S> {
         item
     }
     pub fn id(mut self, id: impl Into<String>) -> Self { self.description.id = id.into(); self }
-    /// Place this item in a named top-level menu. Existing native menus are reused.
+    /// Place this item in a named top-level menu. Existing native menus are reused. A menu
+    /// Rune makes is titled with the app's `Label::Menu(name)`, so the name stays the same in
+    /// every language (`rune::set_labels`).
     pub fn menu(mut self, title: impl Into<String>) -> Self { self.description.location = Location::Named(title.into()); self }
     pub fn dock(mut self) -> Self { self.description.location = Location::Dock; self }
+    /// Place this item right after `anchor` in its menu: another of this app's items by id, or
+    /// a native item by its AppKit action (`"paste:"`, `"selectAll:"`), as Electron's menu
+    /// items name the item they follow. Items after the same anchor keep the order given. A
+    /// menu without the anchor takes the item at its end, as without one.
+    pub fn after(mut self, anchor: impl Into<String>) -> Self { self.description.after = Some(anchor.into()); self }
     pub fn key_equivalent(mut self, shortcut: Shortcut) -> Self { self.description.equivalent = Some(shortcut); self }
     /// Let the window's own key handling see this item's key equivalent first. AppKit gives a
     /// menu equivalent to the menu before any view, so by default the item takes the chord
@@ -100,14 +112,16 @@ impl std::error::Error for MenuError {}
 
 struct State<S> {
     items: Vec<MenuItem<S>>,
-    revision: u64,
+    /// Each new set of items is a new attempt: a click on an item from an earlier set, or a
+    /// guard that drained one, is stale.
+    revision: Seq,
     running: bool,
     headless: bool,
     errors: Vec<MenuError>,
 }
 pub(crate) struct Hub<S>(Mutex<State<S>>);
 impl<S> Default for Hub<S> {
-    fn default() -> Self { Self(Mutex::new(State { items: Vec::new(), revision: 0, running: false, headless: false, errors: Vec::new() })) }
+    fn default() -> Self { Self(Mutex::new(State { items: Vec::new(), revision: Seq::default(), running: false, headless: false, errors: Vec::new() })) }
 }
 
 fn validate<S>(items: &[MenuItem<S>]) -> Result<(), MenuError> {
@@ -127,7 +141,7 @@ impl<S: 'static> App<S> {
     /// Windows/Linux) are available through AppHandle::take_menu_errors().
     pub fn menu_item(self, item: MenuItem<S>) -> Self {
         let mut state = self.shared.menus.0.lock().unwrap();
-        state.items.push(item); state.revision += 1;
+        state.items.push(item); state.revision.next();
         drop(state);
         self
     }
@@ -136,14 +150,16 @@ impl<S: 'static> AppHandle<S> {
     /// Replace all this App's custom items, preserving native defaults. Validates and queues
     /// the new snapshot; enabled/checked changes reach AppKit on the next event-loop drain.
     /// Native installation failures are retained by take_menu_errors(). On Windows/Linux this
-    /// returns Unsupported without changing anything (except inside a headless run).
+    /// returns Unsupported without changing anything (except inside a headless run). On macOS
+    /// the menus and standard items Rune made also take the app's current labels
+    /// (`rune::set_labels`), so an app calls this again after its language changes.
     pub fn set_menu(&self, items: impl IntoIterator<Item = MenuItem<S>>) -> Result<(), MenuError> {
         let items: Vec<_> = items.into_iter().collect();
         let mut state = self.shared.menus.0.lock().unwrap();
         if !cfg!(target_os = "macos") && !state.headless { return Err(MenuError::Unsupported); }
         if !state.running { return Err(MenuError::NotRunning); }
         validate(&items)?;
-        state.items = items; state.revision += 1;
+        state.items = items; state.revision.next();
         drop(state);
         self.shared.wake();
         Ok(())
@@ -179,18 +195,18 @@ pub(crate) fn take_unhandled(key: Option<&crate::KeyEvent>) -> Option<crate::run
 pub(crate) fn fire<S: 'static>(shared: &Arc<Shared<S>>, selector: &str) -> Result<(), MenuError> {
     enqueue(shared, selector, None)
 }
-fn enqueue<S: 'static>(shared: &Arc<Shared<S>>, selector: &str, expected: Option<u64>) -> Result<(), MenuError> {
+fn enqueue<S: 'static>(shared: &Arc<Shared<S>>, selector: &str, expected: Option<Attempt>) -> Result<(), MenuError> {
     let state = shared.menus.0.lock().unwrap();
-    if expected.is_some_and(|r| r != state.revision) { return Ok(()); }
+    let revision = state.revision.current();
+    if expected.is_some_and(|r| r != revision) { return Ok(()); }
     let index = lookup(&state, selector)?;
     let id = state.items[index].description.id.clone();
-    let revision = state.revision;
     drop(state);
     let weak = Arc::downgrade(shared);
     AppHandle { shared: shared.clone() }.update(move |s, tx| {
         let Some(shared) = weak.upgrade() else { return };
         let state = shared.menus.0.lock().unwrap();
-        if !state.running || state.revision != revision { return; }
+        if !state.running || state.revision.current() != revision { return; }
         let action = lookup(&state, &id).ok().map(|i| state.items[i].action);
         drop(state);
         if let Some(action) = action { action(s, tx); }
@@ -198,11 +214,28 @@ fn enqueue<S: 'static>(shared: &Arc<Shared<S>>, selector: &str, expected: Option
     Ok(())
 }
 
+/// Who holds the macOS menu bar's custom items: nobody, or the guard of the App whose window
+/// last took focus (`Guard::claim`), with the items it put there.
+#[cfg(target_os = "macos")]
+enum Bar {
+    Free,
+    Owned { guard: u64, native: macos::Native },
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static BAR: std::cell::RefCell<Bar> = const { std::cell::RefCell::new(Bar::Free) };
+    static NEXT_GUARD: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
 pub(crate) struct Guard<S: 'static> {
     shared: Weak<Shared<S>>,
-    revision: Option<u64>,
+    /// The set of items it last put in the bar; `None` before its first drain or after
+    /// another App's items took the bar.
+    revision: Option<Attempt>,
+    /// This guard's name in `BAR`.
     #[cfg(target_os = "macos")]
-    native: Option<macos::Native>,
+    id: u64,
 }
 impl<S: 'static> Guard<S> {
     pub(crate) fn attach(shared: &Arc<Shared<S>>, headless: bool) -> Self {
@@ -213,32 +246,78 @@ impl<S: 'static> Guard<S> {
         }
         drop(state);
         let mut guard = Self { shared: Arc::downgrade(shared), revision: None,
-            #[cfg(target_os = "macos")] native: None };
+            #[cfg(target_os = "macos")] id: NEXT_GUARD.with(|n| n.replace(n.get() + 1)) };
         guard.drain();
         guard
+    }
+    /// This App's window took focus: its items take the menu bar, so they act in it. An App
+    /// without items of its own leaves the bar to the one that has it.
+    pub(crate) fn claim(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(shared) = self.shared.upgrade() else { return };
+            let state = shared.menus.0.lock().unwrap();
+            if state.headless || state.items.is_empty() { return; }
+            drop(state);
+            let taken = BAR.with(|bar| match &*bar.borrow() {
+                Bar::Owned { guard, .. } => *guard != self.id,
+                Bar::Free => true,
+            });
+            if taken {
+                // The previous holder's items leave with its `Native`, before this one's go in.
+                BAR.with(|bar| *bar.borrow_mut() = Bar::Free);
+                self.revision = None;
+                self.drain();
+            }
+        }
     }
     pub(crate) fn drain(&mut self) {
         let Some(shared) = self.shared.upgrade() else { return };
         let state = shared.menus.0.lock().unwrap();
-        if self.revision == Some(state.revision) { return; }
-        let (items, revision, headless) = (state.items.clone(), state.revision, state.headless);
+        if self.revision == Some(state.revision.current()) { return; }
+        let (items, revision, headless) = (state.items.clone(), state.revision.current(), state.headless);
         drop(state);
         let result = validate(&items).and_then(|()| {
             if headless { return Ok(()); }
             #[cfg(target_os = "macos")]
             {
-                if items.is_empty() { self.native = None; return Ok(()); }
-                if self.native.is_none() { self.native = Some(macos::Native::new()?); }
                 let weak = Arc::downgrade(&shared);
                 let sink = Arc::new(move |id: &str| {
                     if let Some(shared) = weak.upgrade()
                         && let Err(error) = enqueue(&shared, id, Some(revision)) { eprintln!("rune: {error}"); }
                 });
-                self.native.as_mut().unwrap().set(&items.iter().map(|i| i.description.clone()).collect::<Vec<_>>(), sink)
+                let descriptions: Vec<_> = items.iter().map(|i| i.description.clone()).collect();
+                BAR.with(|bar| {
+                    let mut bar = bar.borrow_mut();
+                    let (next, result) = match std::mem::replace(&mut *bar, Bar::Free) {
+                        // Another window's App has the bar until this one's window takes focus.
+                        Bar::Owned { guard, native } if guard != self.id => (Bar::Owned { guard, native }, Ok(())),
+                        // Dropping the `Native` takes its items out.
+                        Bar::Owned { .. } | Bar::Free if items.is_empty() => (Bar::Free, Ok(())),
+                        Bar::Owned { mut native, .. } => {
+                            let result = native.set(&descriptions, sink);
+                            (Bar::Owned { guard: self.id, native }, result)
+                        }
+                        Bar::Free => match macos::Native::new() {
+                            Ok(mut native) => {
+                                let result = native.set(&descriptions, sink);
+                                (Bar::Owned { guard: self.id, native }, result)
+                            }
+                            Err(error) => (Bar::Free, Err(error)),
+                        },
+                    };
+                    *bar = next;
+                    result
+                })
             }
             #[cfg(not(target_os = "macos"))]
             { if items.is_empty() { Ok(()) } else { Err(MenuError::Unsupported) } }
         });
+        // The app's labels may have changed with its language since the menus were made.
+        #[cfg(target_os = "macos")]
+        if !headless && let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            default_macos::relabel(&objc2_app_kit::NSApplication::sharedApplication(mtm));
+        }
         self.revision = Some(revision);
         if let Err(error) = result {
             eprintln!("rune: {error}");
@@ -252,6 +331,12 @@ impl<S: 'static> Drop for Guard<S> {
             let mut state = shared.menus.0.lock().unwrap();
             state.running = false; state.items.clear();
         }
+        // The bar waits for the next window to take focus (`claim`).
+        #[cfg(target_os = "macos")]
+        let _ = BAR.try_with(|bar| {
+            let mut bar = bar.borrow_mut();
+            if matches!(&*bar, Bar::Owned { guard, .. } if *guard == self.id) { *bar = Bar::Free; }
+        });
     }
 }
 

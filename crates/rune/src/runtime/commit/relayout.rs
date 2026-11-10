@@ -43,11 +43,39 @@ pub(super) fn reusable(n: &Node) -> bool {
     })
 }
 
+/// How a commit measures, decided once before it starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CommitKind {
+    /// Run the view and flatten what it returns.
+    Rebuild,
+    /// Only the window resized: lay the last commit's nodes out again at the new size.
+    Relayout,
+    /// Only virtual windows moved: keep mounted subtrees and build the rows that enter.
+    Remount,
+}
+
 impl<S: 'static> Runtime<S> {
+    /// Which way this commit measures. Both shortcuts need everything the view reads to be as
+    /// the last commit built it, checked here once for both.
+    pub(super) fn commit_kind(&self, tx: &Tx) -> CommitKind {
+        let unchanged = self.state_unchanged && !tx.settle && !self.reuse.read_moved
+            && self.reuse.scale == self.env.scale && self.reuse.srgb == Some(self.srgb_blend)
+            && self.playground.is_none() && !self.patch_pending()
+            // Exiting nodes left the layout tree.
+            && self.layout.live_count() == self.nodes.len();
+        if !unchanged { return CommitKind::Rebuild; }
+        if self.relayout {
+            // The nodes it built are all there, in the layout tree's order.
+            return if self.nodes.iter().all(reusable) { CommitKind::Relayout } else { CommitKind::Rebuild };
+        }
+        if self.virtual_only() { CommitKind::Remount } else { CommitKind::Rebuild }
+    }
+
     /// Measures a commit: lays the last tree out again when only the viewport changed since it
     /// was built, remounts virtual rows alone when only their window moved, else runs the view.
     pub(super) fn measure_commit(&mut self, tx: &Tx) -> Measured {
-        if self.resize_only(tx) {
+        let kind = self.commit_kind(tx);
+        if kind == CommitKind::Relayout {
             // The view keeps what it last read; `settle_layout_reads` and the caret check run it
             // when the new layout moves them.
             let reads = self.layout_seen.reads.clone();
@@ -64,7 +92,7 @@ impl<S: 'static> Runtime<S> {
                 }
             };
         }
-        if self.virtual_only(tx) {
+        if kind == CommitKind::Remount {
             let _blend = crate::theme::scope(self.srgb_blend);
             let _bars = crate::platform::scroll_bars::scope(self.scroll_bars.state, self.scroll_bars.runtime_id);
             let reads = self.layout_seen.reads.clone();
@@ -87,17 +115,6 @@ impl<S: 'static> Runtime<S> {
         }
         self.refresh_layout_seen();
         self.measure(tx)
-    }
-
-    /// Whether this commit only resized the window: nothing the view reads changed since the
-    /// last commit built it, and the nodes it built are all there, in the layout tree's order.
-    pub(super) fn resize_only(&self, tx: &Tx) -> bool {
-        self.relayout && self.state_unchanged && !tx.settle && !self.reuse.read_moved
-            && self.reuse.scale == self.env.scale && self.reuse.srgb == Some(self.srgb_blend)
-            && self.playground.is_none() && !self.patch_pending()
-            // Exiting nodes left the layout tree.
-            && self.layout.live_count() == self.nodes.len()
-            && self.nodes.iter().all(reusable)
     }
 }
 
@@ -161,7 +178,7 @@ impl<S: 'static> Measurement<'_, S> {
             nodes,
             reduced_motion: self.reduced_motion,
             time_scale: self.time_scale,
-            defaults: self.defaults,
+            defaults: self.defaults.clone(),
             titlebar: self.titlebar,
             caret_read: self.caret_read,
             layout_reads: self.layout_reads,
@@ -178,7 +195,7 @@ impl<S: 'static> Measurement<'_, S> {
         for v in self.virtuals.values_mut() {
             let scroll = self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id));
             let sticky = || self.nodes.iter().find(|n| n.path == v.scroll_path).and_then(|n| n.scroll).is_some_and(|s| s.stick_bottom);
-            let pinned = scroll.map_or_else(sticky, |s| s.pinned);
+            let pinned = scroll.map_or_else(sticky, |s| s.pinned());
             let offset = (scroll.map_or(0.0, |s| s.offset as f32) - v.top).max(0.0);
             v.anchor = if pinned { None } else { v.first_visible(offset.min(v.max_offset()), |_| true) };
         }
@@ -203,7 +220,7 @@ impl<S: 'static> Measurement<'_, S> {
         self.virtuals.values().any(|v| {
             self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id)).is_some_and(|s| {
                 let offset = (s.offset as f32 - v.top).max(0.0);
-                v.needs_window(offset, s.pinned) || v.spare(offset, s.pinned) > v.viewport
+                v.needs_window(offset, s.pinned()) || v.spare(offset, s.pinned()) > v.viewport
             })
         })
     }

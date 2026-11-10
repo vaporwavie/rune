@@ -20,19 +20,34 @@ const SLACK_WAIT: f64 = 0.12;
 pub(super) struct Slack {
     /// `h` is the slack in points, stepped toward 0 once closing.
     track: GrowTrack,
-    closing: bool,
+    phase: SlackPhase,
+    /// The last step moved `h`, so the frame after it still counts as moving.
     stepped: bool,
-    acc: f32,
     /// The viewport's presented top and bottom last frame.
     edges: Option<[f32; 2]>,
-    /// When a row of the stack last grew.
-    grew_at: f64,
     /// The window size at the last commit: a resize lands the slack.
     pub(super) window: (f32, f32),
     /// `Tx::follow_edge`: until the viewport's edges reach their layout, the rows ride them
     /// and the room they free adds no slack.
     pub(super) follow: bool,
 }
+
+/// Whether the slack waits under the rows or closes on the growth spring.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlackPhase {
+    /// Held while the stack grows, and for `SLACK_WAIT` after a row last grew (`grew_at`).
+    Held { grew_at: f64 },
+    /// Closing, with `acc` seconds of frame time not yet stepped in `SUBSTEP`s.
+    Closing { acc: f32 },
+}
+
+impl Default for SlackPhase {
+    fn default() -> Self { SlackPhase::Held { grew_at: 0.0 } }
+}
+
+/// Done closing without the stack growing again: the wait is already over, so slack that opens
+/// next closes at once.
+const WAITED: SlackPhase = SlackPhase::Held { grew_at: f64::NEG_INFINITY };
 
 impl Slack {
     pub(super) fn height(&self) -> f32 { self.track.h }
@@ -41,22 +56,55 @@ impl Slack {
 
     /// No slack, in a window of this size.
     pub(super) fn landed(window: (f32, f32)) -> Slack { Slack { window, ..Slack::default() } }
+
+    /// Moves the phase on at `now` with `dt` of frame time, once `h` has this frame's growth
+    /// and edges: a growing stack holds the slack, one quiet for `SLACK_WAIT` starts it closing,
+    /// and closing steps `h` toward 0 on the stack's spring.
+    fn settle(&mut self, growing: bool, now: f64, dt: f32, spec: &crate::GrowthSpec) {
+        if growing {
+            self.phase = SlackPhase::Held { grew_at: now };
+            self.track.v = 0.0;
+        }
+        if self.track.h <= 1.0 / 128.0 {
+            self.track = GrowTrack::default();
+            if matches!(self.phase, SlackPhase::Closing { .. }) { self.phase = WAITED; }
+        } else if let SlackPhase::Held { grew_at } = self.phase && now - grew_at >= SLACK_WAIT {
+            self.phase = SlackPhase::Closing { acc: 0.0 };
+            self.track.age = 0.0;
+            self.track.v = 0.0;
+        }
+        if let SlackPhase::Closing { mut acc } = self.phase {
+            acc += dt;
+            while acc >= SUBSTEP {
+                self.track.step(spec.spring, &spec.edge, false);
+                acc -= SUBSTEP;
+            }
+            self.phase = if self.track.moving() { SlackPhase::Closing { acc } } else {
+                self.track = GrowTrack::default();
+                WAITED
+            };
+        }
+    }
 }
 
 /// Steps a glide toward the current bottom, or the offset `Tx::scroll_to` asked for while the
 /// content reaches it. Returns whether it is still moving.
 pub(super) fn glide(st: &mut ScrollState, dt: f32) -> bool {
-    let to = st.glide_to.map_or(st.max, |to| to.min(st.max));
+    let ScrollMode::Glide { v, to: aim } = st.mode else { return false };
+    let to = aim.offset().map_or(st.max, |to| to.min(st.max));
     // Content shrinking past the glide's end lands it there, rather than its speed carrying
     // it past and springing back.
     if st.offset >= st.max && to >= st.max {
         st.offset = st.max;
-        st.glide = None;
-        st.glide_to = None;
+        st.mode = ScrollMode::Rest;
         return false;
     }
-    let moving = scroll_offset::glide_axis(st.glide_spring(), &mut st.offset, &mut st.glide, to, dt);
-    if !moving { st.glide_to = None; }
+    let mut glide = Some(v);
+    let moving = scroll_offset::glide_axis(st.glide_spring(), &mut st.offset, &mut glide, to, dt);
+    st.mode = match glide {
+        Some(v) => ScrollMode::Glide { v, to: aim },
+        None => ScrollMode::Rest,
+    };
     moving
 }
 
@@ -79,14 +127,11 @@ impl<S: 'static> Runtime<S> {
             let Some(i) = self.scroll_viewport(&key) else { continue };
             let (id, sticky, view_h) = (self.nodes[i].id, self.nodes[i].scroll.is_some_and(|s| s.stick_bottom), f64::from(self.nodes[i].local.h));
             let Some(st) = self.scrolls.get_mut(&id) else { continue };
-            targets.push((id, animated, sticky, view_h, st.offset, st.glide));
+            targets.push((id, animated, sticky, view_h, st.offset, st.glide()));
             // Stand at the bottom first so a virtual list mounts and measures its tail rows,
             // which can differ from the estimate: the trip below then ends at the true bottom.
             st.offset = st.max;
-            st.pinned = true;
-            st.glide = None;
-            st.glide_to = None;
-            st.v = 0.0;
+            st.pin();
         }
         for _ in 0..3 {
             if !self.virtual_window_changed() { break; }
@@ -101,13 +146,11 @@ impl<S: 'static> Runtime<S> {
             // A settled frame (a window showing or uncovering) lands at the end.
             if animated && !self.reduced_motion && !self.settled && st.max - start > 0.5 {
                 st.offset = start.max(st.max - GLIDE_REACH * view_h);
-                st.glide = Some(glide.unwrap_or(0.0));
+                st.mode = ScrollMode::Glide { v: glide.unwrap_or(0.0), to: GlideTo::Bottom };
                 st.spring = None;
-                st.shrink_glide = false;
-                st.pinned = false;
             } else {
                 st.offset = st.max;
-                st.pinned = sticky;
+                if sticky { st.pin() } else { st.mode = ScrollMode::Rest }
             }
         }
         if self.virtual_window_changed() {
@@ -141,7 +184,7 @@ impl<S: 'static> Runtime<S> {
     /// negative while fitting rows sit low in a box that has not shrunk yet.
     pub(super) fn stuck_offset(&self, i: usize, bottom: f32) -> Option<f64> {
         let n = &self.nodes[i];
-        let st = self.scrolls.get(&n.id).filter(|st| st.pinned)?;
+        let st = self.scrolls.get(&n.id).filter(|st| st.pinned())?;
         if !n.scroll.is_some_and(|s| s.stick_bottom) { return None; }
         let c = self.scroll_content(i)?;
         let lag = self.stuck_lag(i, c, bottom)?;
@@ -211,7 +254,7 @@ impl<S: 'static> Runtime<S> {
     /// Steps stick-to-bottom viewport `i`'s `Slack` after its offset. Returns whether any is left.
     pub(super) fn step_slack(&mut self, i: usize, dt: f32) -> bool {
         let id = self.nodes[i].id;
-        if self.scrolls.get(&id).is_some_and(|st| !st.pinned && !st.slack.moving()) {
+        if self.scrolls.get(&id).is_some_and(|st| !st.pinned() && !st.slack.moving()) {
             if let Some(st) = self.scrolls.get_mut(&id) { st.slack.edges = None; }
             return false;
         }
@@ -231,15 +274,11 @@ impl<S: 'static> Runtime<S> {
         let now = self.t;
         let target = self.nodes[i].target;
         let Some(st) = self.scrolls.get_mut(&id) else { return false };
+        let pinned = st.pinned();
         let s = &mut st.slack;
         let h0 = s.track.h;
         let [top, bottom] = [view[1], view[3]];
-        if growing {
-            s.grew_at = now;
-            s.closing = false;
-            s.track.v = 0.0;
-        }
-        if st.pinned {
+        if pinned {
             // Growth fills the slack first. Room the bottom edge gains while the rows sit on it
             // joins it, unless the whole viewport moved down with it.
             let mut h = s.track.h - grown;
@@ -251,23 +290,7 @@ impl<S: 'static> Runtime<S> {
         }
         s.edges = Some([top, bottom]);
         if s.follow && (top - target[1]).abs() < 0.01 && (bottom - target[3]).abs() < 0.01 { s.follow = false; }
-        if s.track.h <= 1.0 / 128.0 {
-            s.track = GrowTrack::default();
-            s.closing = false;
-        } else if !s.closing && !growing && now - s.grew_at >= SLACK_WAIT {
-            s.closing = true;
-            s.acc = 0.0;
-            s.track.age = 0.0;
-            s.track.v = 0.0;
-        }
-        if s.closing {
-            s.acc += dt;
-            while s.acc >= SUBSTEP {
-                s.track.step(spec.spring, &spec.edge, false);
-                s.acc -= SUBSTEP;
-            }
-            if !s.track.moving() { s.track = GrowTrack::default(); s.closing = false; }
-        }
+        s.settle(growing, now, dt, &spec);
         s.stepped = (s.track.h - h0).abs() > 1e-5;
         s.moving()
     }
@@ -311,6 +334,33 @@ impl<S: 'static> Runtime<S> {
 mod tests {
     use super::*;
     use crate::el::{col, el};
+
+    #[test]
+    fn slack_waits_out_growth_then_closes_and_slack_after_that_closes_at_once() {
+        let (spec, dt) = (GrowthSpec::default(), 1.0 / 120.0);
+        let mut s = Slack::default();
+        s.track.h = 40.0;
+        s.settle(true, 1.0, dt, &spec);
+        assert_eq!(s.phase, SlackPhase::Held { grew_at: 1.0 });
+        s.settle(false, 1.0 + SLACK_WAIT * 0.9, dt, &spec);
+        assert_eq!((s.phase, s.track.h), (SlackPhase::Held { grew_at: 1.0 }, 40.0), "held through the wait");
+        s.settle(false, 1.0 + SLACK_WAIT, dt, &spec);
+        assert!(matches!(s.phase, SlackPhase::Closing { .. }) && s.track.h < 40.0);
+        let h = s.track.h;
+        s.settle(true, 1.2, dt, &spec);
+        assert_eq!((s.phase, s.track.h), (SlackPhase::Held { grew_at: 1.2 }, h), "growth holds it again");
+
+        let mut now = 1.2;
+        while s.phase != WAITED {
+            now += f64::from(dt);
+            s.settle(false, now, dt, &spec);
+            assert!(now < 3.0, "closes: {s:?}");
+        }
+        assert_eq!(s.track.h, 0.0);
+        s.track.h = 10.0;
+        s.settle(false, now + f64::from(dt), dt, &spec);
+        assert!(matches!(s.phase, SlackPhase::Closing { .. }), "the wait was already over");
+    }
 
     // One state type for every test here: each type monomorphises a whole `Runtime<S>`.
     #[derive(Default)]
@@ -625,7 +675,7 @@ mod tests {
         assert_eq!(scroll_state(&rt, "scroll").offset, bottom);
         key(&mut rt, crate::Key::PageUp);
         assert_eq!(scroll_state(&rt, "scroll").offset, bottom - page, "the list pages, not the composer");
-        assert!(!scroll_state(&rt, "scroll").pinned);
+        assert!(!scroll_state(&rt, "scroll").pinned());
         // The pointer over the composer doesn't claim the keys either.
         let (x, y) = rt.find("composer").unwrap();
         rt.pointer_move(x, y);
@@ -634,7 +684,7 @@ mod tests {
         key(&mut rt, crate::Key::PageDown);
         key(&mut rt, crate::Key::PageDown);
         assert_eq!(scroll_state(&rt, "scroll").offset, bottom);
-        assert!(scroll_state(&rt, "scroll").pinned, "back on the end, the list follows it again");
+        assert!(scroll_state(&rt, "scroll").pinned(), "back on the end, the list follows it again");
         let composer = rt.state.composer.as_ref().unwrap();
         assert!(composer.focused);
         assert_eq!(composer.text, "hello");
@@ -666,7 +716,7 @@ mod tests {
         rt.update_if(|_, tx| { tx.scroll_page("scroll", 5); false });
         rt.frame(1.0 / 120.0);
         assert_eq!(scroll_state(&rt, "scroll").offset, bottom, "clamped at the end");
-        assert!(scroll_state(&rt, "scroll").pinned);
+        assert!(scroll_state(&rt, "scroll").pinned());
         rt.state.rows += 5;
         rt.invalidate();
         for _ in 0..120 { rt.frame(1.0 / 120.0); }
@@ -685,7 +735,7 @@ mod tests {
         let st = scroll_state(&rt, "scroll");
         let pages = (st.max - st.offset) / page;
         assert!((2.5..3.5).contains(&pages), "three pages above the end: {pages} (bottom was {bottom})");
-        assert!(!scroll_state(&rt, "scroll").pinned);
+        assert!(!scroll_state(&rt, "scroll").pinned());
         let shown = rt.elements().into_iter().filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with('r')) && e.rect[1] + e.rect[3] > 0.0 && e.rect[1] < 300.0).count();
         assert!(shown >= 5, "the window mounted the rows it pages to ({shown})");
     }

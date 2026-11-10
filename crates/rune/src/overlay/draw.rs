@@ -6,8 +6,8 @@ use super::*;
 impl<T: 'static> Overlay<T> {
     /// Draws a frame if one is due; true while it needs more (animating).
     pub(super) fn draw(&mut self) -> bool {
-        self.end_fade_out(Instant::now());
-        if !self.drawing() {
+        self.presence_due(Instant::now());
+        if !self.presence.drawing() {
             self.drain_hidden();
             return false;
         }
@@ -54,7 +54,7 @@ impl<T: 'static> Overlay<T> {
     /// for the frame that commits what changed since the last.
     pub(super) fn open_popup(&mut self) {
         let window = match self.live.as_ref().map(|l| &l.backing) {
-            Some(Backing::Window(w)) if self.visible && !self.is_occluded() => Some(w.clone()),
+            Some(Backing::Window(w)) if self.presence.shown() && !self.presence.occluded() => Some(w.clone()),
             _ => None,
         };
         if self.popup.open(&mut self.rt, window.as_ref(), true) { self.dirty = true; }
@@ -109,7 +109,7 @@ impl<T: 'static> Overlay<T> {
             self.sync_occlusion();
             // Until it's uncovered, only the retry (or a due timer, in `wake_due`) steps it,
             // however often other windows turn the loop.
-            if self.occluded {
+            if self.presence.occluded() {
                 if self.retry.is_none_or(|retry| retry <= Instant::now()) {
                     self.meter.skipped();
                     self.missed(crate::window::Missed::Occluded, false, false);
@@ -242,6 +242,9 @@ impl<T: 'static> Overlay<T> {
         if self.options.input == OverlayInput::Regions && let Some(x11) = &mut self.x11 { x11.regions(self.rt.hit_regions(), live.scale); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if let Backing::Layer(layer) = &live.backing { layer.input_regions(self.rt.hit_regions(), self.interactive); }
+        // An X11 input shape applies at once with no commit; `regions` skips an unchanged shape.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Backing::Xwayland(surface) = &mut live.backing { surface.regions(self.rt.hit_regions()); }
         let target_format = if self.rt.srgb_blend() { live.config.format.remove_srgb_suffix() } else { live.config.format };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: (target_format != live.config.format).then_some(target_format),
@@ -260,6 +263,7 @@ impl<T: 'static> Overlay<T> {
         }
         frame::submit_and_present(live, renderer, gpu, &self.rt, enc, frame, prewarm);
         crate::render::gpu_events::presented();
+        self.clock.presented(&mut self.rt, Instant::now());
         if !prewarm { self.meter.presented(); }
         self.dirty = false;
         #[cfg(target_os = "macos")]
@@ -315,17 +319,18 @@ impl<T: 'static> Overlay<T> {
     }
 
     /// Records whether the shown panel is on screen. Occluded, it stops its display link,
-    /// ambient loops and live values; uncovered, it redraws once and resumes them.
+    /// ambient loops and live values; uncovered, it redraws once and resumes them. A
+    /// fading-out panel never becomes occluded (`Presence::set_occluded`).
     #[cfg(target_os = "macos")]
     pub(super) fn occluded(&mut self, occluded: bool) {
-        self.occluded = occluded;
+        if !self.presence.set_occluded(occluded) { return; }
         self.idle = true;
         // What it last presented may not be what shows once uncovered.
         self.quiet = Default::default();
         if occluded {
             if let Some(live) = &mut self.live && let Some(pacing) = &mut live.pacing { pacing.stop(); }
             self.rt.set_live_visible(false);
-        } else if self.drawing() {
+        } else if self.presence.drawing() {
             self.dirty = true;
             self.occluded_wait = crate::window::OCCLUDED_RETRY;
             self.rt.set_live_visible(true);
@@ -343,12 +348,10 @@ impl<T: 'static> Overlay<T> {
         self.set_occluded(occluded);
     }
 
-    /// Applies an occlusion reading. A fading-out panel reads as covered once its alpha nears
-    /// zero, but it's still drawing its exit, so it never becomes occluded mid-fade.
+    /// Applies an occlusion reading when it changes what the panel holds.
     #[cfg(target_os = "macos")]
     pub(super) fn set_occluded(&mut self, occluded: bool) {
-        if occluded && self.fading_out.is_some() { return; }
-        if occluded != self.occluded { self.occluded(occluded); }
+        if occluded != self.presence.occluded() { self.occluded(occluded); }
     }
 
     /// A display link made while the displays slept fails; try again once they may be back. One

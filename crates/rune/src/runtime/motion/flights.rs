@@ -12,17 +12,25 @@ pub(super) struct Launches {
 }
 
 /// A launch in the air, the offsets outside the scene it was started against, the ones its
-/// last frame drew it under, and how fast they last moved between frames with no commit. Its
-/// re-aims folded `folded` of what its flight added to them into its path, when `1 - travel`
-/// was `folded_at`.
+/// last frame drew it under (none before its first frame), and how fast they last moved
+/// between frames with no commit. Its re-aims folded `folded` of what its flight added to them
+/// into its path, when `1 - travel` was `folded_at`.
 struct Launched {
     id: NodeId,
     shift: [f32; 2],
-    last: Option<[f32; 2]>,
-    seen: (f64, u64),
+    drawn: Option<Drawn>,
     drift: [f32; 2],
     folded: [f32; 2],
     folded_at: [f32; 2],
+}
+
+/// The offsets outside the scene a launch's frame drew it under, at scene time `at`, after
+/// commit `commit`.
+#[derive(Clone, Copy)]
+struct Drawn {
+    offset: [f32; 2],
+    at: f64,
+    commit: u64,
 }
 
 impl Launches {
@@ -42,11 +50,11 @@ impl Launches {
     pub(super) fn restart(&mut self, scene: &Scene, id: NodeId) -> [rune_motion::Vec2; 2] {
         let Some(l) = self.flying.iter_mut().find(|l| l.id == id) else { return [rune_motion::Vec2::ZERO; 2] };
         let ([ox, oy], [vx, vy]) = l.blend(scene);
-        if let Some(last) = l.last {
+        if let Some(drawn) = l.drawn {
             let carried = l.carried(scene);
             let travel = scene.get(id, prop::TRAVEL).unwrap_or(rune_motion::Vec2::new(1.0, 1.0));
             (l.folded, l.folded_at) = (carried, [1.0 - travel.x, 1.0 - travel.y]);
-            l.shift = last;
+            l.shift = drawn.offset;
         }
         [rune_motion::Vec2::new(ox, oy), rune_motion::Vec2::new(vx, vy)]
     }
@@ -82,12 +90,11 @@ impl Launches {
     pub(super) fn offset_fix(&mut self, scene: &Scene, id: NodeId, offset: [f32; 2], commit: u64) -> [f32; 2] {
         let Some(l) = self.flying.iter_mut().find(|l| l.id == id) else { return [0.0; 2] };
         let now = scene.now();
-        if let Some(last) = l.last && l.seen.1 == commit && now > l.seen.0 {
-            let dt = (now - l.seen.0) as f32;
-            l.drift = [(offset[0] - last[0]) / dt, (offset[1] - last[1]) / dt];
+        if let Some(last) = l.drawn && last.commit == commit && now > last.at {
+            let dt = (now - last.at) as f32;
+            l.drift = [(offset[0] - last.offset[0]) / dt, (offset[1] - last.offset[1]) / dt];
         }
-        l.last = Some(offset);
-        l.seen = (now, commit);
+        l.drawn = Some(Drawn { offset, at: now, commit });
         let travel = scene.get(id, prop::TRAVEL).unwrap_or(rune_motion::Vec2::new(1.0, 1.0));
         [(l.shift[0] - offset[0]) * (1.0 - travel.x), (l.shift[1] - offset[1]) * (1.0 - travel.y)]
     }
@@ -105,7 +112,7 @@ impl Launched {
     /// that moves it. Drawn under `offset + (shift - offset) * (1 - travel)`: its rate is the
     /// offset's drift times travel plus `(offset - shift) * rate`.
     fn blend(&self, scene: &Scene) -> ([f32; 2], [f32; 2]) {
-        let Some(last) = self.last else { return ([0.0; 2], [0.0; 2]) };
+        let Some(Drawn { offset: last, .. }) = self.drawn else { return ([0.0; 2], [0.0; 2]) };
         let travel = scene.get(self.id, prop::TRAVEL).unwrap_or(rune_motion::Vec2::new(1.0, 1.0));
         let rate = scene.store().sample_velocity(self.id, prop::TRAVEL).unwrap_or(rune_motion::Vec2::ZERO);
         let (t, r) = ([travel.x, travel.y], [rate.x, rate.y]);
@@ -165,6 +172,7 @@ impl<S: 'static> Runtime<S> {
         // transition (a crossfade in place) and with the parents it leaves or enters with.
         if instant || tx.settle || self.reduced_motion { return; }
         let mut old_index: Option<HashMap<NodeId, usize>> = None;
+        let mut built_index: Option<HashMap<NodeId, usize>> = None;
         // Descendants first: matching an element unmounts its old subtree, matched ones included.
         for (key, from) in old.into_iter().rev() {
             let Some(&(i, true)) = by_id.get(&key) else { continue };
@@ -172,17 +180,17 @@ impl<S: 'static> Runtime<S> {
             if from == to || self.node_index.contains_key(&from) || !self.scene.contains(from) || self.is_exiting(from) { continue; }
             let index = old_index.get_or_insert_with(|| self.nodes.iter().enumerate().map(|(k, n)| (n.id, k)).collect());
             let Some(&from_i) = index.get(&from) else { continue };
-            // Scroll offsets live outside the scene: start where `from` was seen on screen.
-            let mut offset = rune_motion::Vec2::ZERO;
-            if self.built {
-                // Flights drop the cover offsets of flights around them.
-                let shift = |k: usize| self.inh_scratch.get(k).map_or([0.0; 2], |h| [h.dx - h.cover[0], h.dy - h.cover[1]]);
-                let source = self.nodes[from_i].parent.map_or([0.0; 2], shift);
-                let row = self.row_dy.get(from_i).copied().unwrap_or(0.0);
-                let dest = std::iter::successors(nodes[i].parent, |&p| nodes[p].parent)
-                    .find_map(|p| index.get(&nodes[p].id).copied()).map_or([0.0; 2], shift);
-                offset = rune_motion::Vec2::new(source[0] - dest[0], source[1] + row - dest[1]);
-            }
+            // Scroll offsets live outside the scene: start where `from` was seen on screen. They
+            // come from the last build, which a commit earlier in the same frame (a glide's poll
+            // before the key that closes it) leaves in place, so look nodes up by id.
+            let built = &*built_index.get_or_insert_with(|| self.built_ids.iter().enumerate().map(|(k, &id)| (id, k)).collect());
+            // Flights drop the cover offsets of flights around them.
+            let shift = |id: NodeId| built.get(&id).and_then(|&k| self.inh_scratch.get(k)).map_or([0.0; 2], |h| [h.dx - h.cover[0], h.dy - h.cover[1]]);
+            let source = self.nodes[from_i].parent.map_or([0.0; 2], |p| shift(self.nodes[p].id));
+            let row = built.get(&from).and_then(|&k| self.row_dy.get(k)).copied().unwrap_or(0.0);
+            let dest = std::iter::successors(nodes[i].parent, |&p| nodes[p].parent)
+                .map(|p| nodes[p].id).find(|id| built.contains_key(id)).map_or([0.0; 2], shift);
+            let offset = rune_motion::Vec2::new(source[0] - dest[0], source[1] + row - dest[1]);
             let spring = tx.motion.or(nodes[i].matched.as_ref().and_then(|m| m.1)).unwrap_or(motion::REFLOW);
             let fill = self.color(from, P_FILL, self.nodes[from_i].vis.fill);
             let opacity = self.scene.get(from, prop::OPACITY);
@@ -195,6 +203,12 @@ impl<S: 'static> Runtime<S> {
             if let Some(o) = opacity.filter(|&o| o != nodes[i].vis.opacity) && !live(crate::live::Property::Opacity) {
                 self.scene.set(to, prop::OPACITY, o);
                 self.scene.animate(to, prop::OPACITY, nodes[i].vis.opacity, spring);
+            }
+            // Its content mounted with it and flies as part of what was seen, so none of it fades
+            // in on its own (each fresh level under a present parent otherwise would).
+            for j in i + 1..nodes.len() {
+                if !std::iter::successors(nodes[j].parent, |&p| nodes[p].parent).any(|p| p == i) { break; }
+                self.scene.enter_now(nodes[j].id);
             }
             self.flying.retain(|f| f.0 != to);
             self.flying.push((to, nodes[i].local));
@@ -217,7 +231,10 @@ impl<S: 'static> Runtime<S> {
         if rect.w <= 0.0 || clip[2] <= clip[0] || clip[3] <= clip[1] { return; }
         self.glyph_scratch.clear();
         self.text.set_glyph_inks(spec.color, &[]);
+        // From outlines where text draws them, which a flight's zoom magnifies without blurring.
+        self.text.set_emit(self.text.moving_emit());
         self.text.glyphs_for_layout(layout, scale, [origin[0] * scale, origin[1] * scale], false, &mut self.glyph_scratch);
+        self.text.set_emit(crate::text::outline::Emit::Atlas);
         let color = spec.color;
         let srgb = self.srgb_blend;
         // Colour glyphs live in the image atlas, which may move them before the flight ends.
@@ -281,7 +298,7 @@ impl<S: 'static> Runtime<S> {
             self.flying.retain(|f| f.0 != to);
             self.flying.push((to, nodes[i].local));
             self.launches.flying.retain(|l| l.id != to);
-            self.launches.flying.push(Launched { id: to, shift, last: None, seen: (0.0, 0), drift: [0.0; 2], folded: [0.0; 2], folded_at: [0.0; 2] });
+            self.launches.flying.push(Launched { id: to, shift, drawn: None, drift: [0.0; 2], folded: [0.0; 2], folded_at: [0.0; 2] });
         }
     }
 

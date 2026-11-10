@@ -98,7 +98,7 @@ fn uber_dxbc_is_fresh() {
         let root = env!("CARGO_MANIFEST_DIR");
         std::fs::write(format!("{root}/uber.vs.dxbc"), &vs).unwrap();
         std::fs::write(format!("{root}/uber.fs.dxbc"), &fs).unwrap();
-        std::fs::write(format!("{root}/src/render/uber_dxbc_hash.rs"), format!(
+        std::fs::write(format!("{root}/src/render/uber/dxbc_hash.rs"), format!(
             "// Written by `cargo run -p rune --example regenerate_dxbc`, or by\n\
              // `RUNE_REGENERATE_DXBC=1 cargo test -p rune --lib uber_dxbc_is_fresh`, on Windows.\n\
              pub(super) const UBER_DXBC_WGSL_BLAKE3: &str = \"{wgsl}\";\n\
@@ -118,9 +118,9 @@ fn uber_dxbc_is_fresh() {
 #[test]
 fn renderers_load_the_precompiled_uber_shader() {
     let gpu = crate::render::Gpu::headless();
-    let wgsl = super::super::metallib::uber_wgsl();
-    assert!(super::uber(&gpu.device, &wgsl, |_| ()).is_some(), "a DX12 device takes the bytecode");
-    assert!(super::uber(&gpu.device, "changed", |_| ()).is_none(), "other WGSL compiles");
-    assert!(super::with_dxbc_enabled(false, || super::uber(&gpu.device, &wgsl, |_| ())).is_none());
+    let (wgsl, abi) = crate::render::uber_shader_identity();
+    assert!(super::uber(&gpu.device, &wgsl, abi, |_| ()).is_some(), "a DX12 device takes the bytecode");
+    assert!(super::uber(&gpu.device, "changed", abi, |_| ()).is_none(), "other WGSL compiles");
+    assert!(super::with_dxbc_enabled(false, || super::uber(&gpu.device, &wgsl, abi, |_| ())).is_none());
     drop(crate::render::Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm));
 }

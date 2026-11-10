@@ -13,9 +13,15 @@ impl<S: 'static> Runtime<S> {
     }
 
     pub fn set_live_visible(&mut self, visible: bool) {
+        let changed = visible != self.surface_visible;
         self.live_wake.visible(visible);
         self.surface_visible = visible;
         if !visible { self.loop_wake = None; }
+        // The window's own setup shows and hides it before the first frame; the app hears the
+        // changes after that (`App::on_visibility`).
+        if changed && self.commits > 0 && let Some(f) = self.on_visibility {
+            self.update(|s, tx| f(s, visible, tx));
+        }
     }
     pub(crate) fn live_visible(&self) -> bool { self.surface_visible }
     pub fn live_pending(&self) -> bool {
@@ -145,13 +151,32 @@ impl<S: 'static> Runtime<S> {
                         |b| { let [s, e] = <[f32; 2]>::decode(b); rune_motion::Vec2::new(s, e) }, op,
                         |_, _| false,
                     ),
-                    Property::Fill => {
+                    Property::Fill | Property::TextColor | Property::Border | Property::Shadow | Property::GradientTop | Property::GradientBottom => {
                         let bits = match op {
                             LatchOp::Snap(b) | LatchOp::Set(b) | LatchOp::Pulse { rest: b, .. } => b,
                         };
                         // The renderer uses the exact authored colour after its track settles.
-                        node.vis.fill = Color::decode(bits);
-                        apply(&mut self.scene, node.id, P_FILL, enter, leave, Color::decode, op, |_, _| false);
+                        let c = Color::decode(bits);
+                        let p = match bound.property {
+                            Property::Fill => { node.vis.fill = c; P_FILL }
+                            Property::TextColor => {
+                                if let Some(spec) = &mut node.text { if spec.color != c { spec.color = c; } }
+                                else if node.vis.icon.is_some_and(|(_, ic)| ic != c) && let Some((_, ic)) = &mut node.vis.cold_mut().icon { *ic = c; }
+                                P_TEXT
+                            }
+                            Property::Border => { node.vis.set_border_color(c); P_BORDER }
+                            Property::Shadow => {
+                                if node.vis.shadows.first().is_some_and(|s| s.color != c) { node.vis.cold_mut().shadows[0].color = c; }
+                                P_SHADOWS[0]
+                            }
+                            _ => {
+                                let k = usize::from(bound.property == Property::GradientBottom);
+                                if node.vis.gradient.as_deref().is_some_and(|g| g[k] != c)
+                                    && let Some(g) = node.vis.cold_mut().gradient.as_deref_mut() { g[k] = c; }
+                                P_GRADIENT[k]
+                            }
+                        };
+                        apply(&mut self.scene, node.id, p, enter, leave, Color::decode, op, |_, _| false);
                     }
                     Property::Rect => {
                         let frame_of = |b| {

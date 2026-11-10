@@ -321,6 +321,16 @@ impl Builder {
             return false;
         }
         let alt = inl.text[start..end].to_owned();
+        let mut alt_map = SpanMap::default();
+        for (src, out) in &map.0 {
+            let overlap = start.max(out.start)..end.min(out.end);
+            if !overlap.is_empty() {
+                let source = if src.len() == out.len() {
+                    src.start + (overlap.start - out.start)..src.start + (overlap.end - out.start)
+                } else { src.clone() };
+                alt_map.push(source, overlap.start - start..overlap.end - start);
+            }
+        }
         inl.text.truncate(start);
         inl.spans.retain_mut(|s| {
             s.1 = s.1.min(start);
@@ -332,7 +342,7 @@ impl Builder {
         });
         map.truncate_out(start);
         self.flush_inline();
-        self.push(Block::Image { src, alt, title }, BlockMap::None);
+        self.push(Block::Image { src, alt, title }, BlockMap::Inline(alt_map));
         self.inline = Some((InlineKind::Para, Inline::default(), Vec::new(), SpanMap::default()));
         true
     }
@@ -346,6 +356,16 @@ impl Builder {
 }
 
 pub(super) const PAD: &str = "\u{202f}\u{202f}";
+/// Inline code's padding before it, ending in a left-to-right isolate (LRI), and after it,
+/// starting with its end (PDI): `markdown.css` sets `:not(pre) > code { direction: ltr;
+/// unicode-bidi: isolate }`, so code reads left to right and moves as one inside Arabic text.
+pub(super) const OPEN: &str = "\u{202f}\u{202f}\u{2066}";
+pub(super) const CLOSE: &str = "\u{2069}\u{202f}\u{202f}";
+
+/// `text` without inline code's padding and isolates.
+pub(super) fn unpadded(text: &str) -> String {
+    text.replace(OPEN, "").replace(CLOSE, "")
+}
 
 /// Source byte range of the inner code text inside a backtick code span `src[range]`.
 fn code_span_content_range(src: &str, range: Range<usize>, rendered: &str) -> Range<usize> {
@@ -595,11 +615,11 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 let code_src = code_span_content_range(src, range, &t);
                 let inl = b.inline();
                 let a = inl.1.text.len();
-                inl.1.text.push_str(PAD);
+                inl.1.text.push_str(OPEN);
                 let start = inl.1.text.len();
                 inl.1.text.push_str(&t);
                 let end = inl.1.text.len();
-                inl.1.text.push_str(PAD);
+                inl.1.text.push_str(CLOSE);
                 inl.1.spans.push((a, start, Style::CodePad));
                 inl.1.spans.push((start, end, Style::Code));
                 inl.1.spans.push((end, inl.1.text.len(), Style::CodePad));

@@ -27,6 +27,10 @@ impl<S: 'static> Host<S> {
                 attrs = winit::platform::startup_notify::WindowAttributesExtStartupNotify::with_activation_token(attrs, token);
             }
         }
+        let maximize = self.open_maximized && !self.shown && self.options.resizable;
+        // Windows maximizes it once cloaked: maximizing shows a window.
+        #[cfg(not(target_os = "windows"))]
+        { attrs = attrs.with_maximized(maximize); }
         let chrome = frame_chrome(self.chrome, self.titlebar, self.rt.titlebar_set());
         #[cfg(target_os = "macos")]
         if !self.options.borderless && chrome.full_size_content {
@@ -48,7 +52,9 @@ impl<S: 'static> Host<S> {
         #[cfg(target_os = "windows")]
         if visible {
             cloak.hold(&window, Instant::now() + win::READY_FALLBACK);
+            // Unfocused (`App::open_inactive`), the first show doesn't activate it.
             window.set_visible(true);
+            if maximize { window.set_maximized(true); }
         }
         // First, before anything observes the view (macOS) or an assistive client asks.
         let a11y = {
@@ -154,6 +160,7 @@ impl<S: 'static> Host<S> {
             self.rt.settle_all();
         }
         self.shown = true;
+        if visible { self.life.show(); }
         self.idle = true;
         self.rt.set_live_visible(visible);
         *self.native_handle.native.window.lock().unwrap() = Arc::downgrade(&window);
@@ -175,7 +182,7 @@ impl<S: 'static> Host<S> {
         #[cfg(target_os = "macos")]
         let full_screen = mac::FullScreenWatch::new(&window);
         #[cfg(target_os = "macos")]
-        let prime = if visible && panel.is_none() { 2 } else { 0 };
+        let prime = if visible && panel.is_none() { native::Prime::launching() } else { native::Prime::Steady };
         #[cfg(target_os = "macos")]
         let native = Native {
             pacing: crate::platform::display_link::DisplayLink::new(&window, self.frame_wake.clone()),
@@ -204,8 +211,6 @@ impl<S: 'static> Host<S> {
             surface,
             config,
             window,
-            visible,
-            occluded: false,
             retry: None,
             occluded_wait: OCCLUDED_RETRY,
             hidden_wait: TIMEOUT_RETRY,
@@ -213,11 +218,11 @@ impl<S: 'static> Host<S> {
             cursor: crate::cursor::os::OsCursor::new(event_loop),
             alpha,
             quiet: false,
+            timer_frame: TimerFrame::default(),
             presented: None,
             #[cfg(target_os = "windows")]
-            steady_until: None,
-            #[cfg(target_os = "windows")]
-            steady_frame: false,
+            steady: Steady::Rest,
+            redraw: std::cell::Cell::new(Redraw::Idle),
         });
         if launcher { self.win.as_mut().unwrap().first_frame.prepare(); }
         self.apply_placement(event_loop);
@@ -246,7 +251,7 @@ impl<S: 'static> Host<S> {
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut drew = false;
         #[cfg(target_os = "macos")]
-        if visible && !self.rt.minimize_request && !self.finished && !event_loop.exiting()
+        if visible && !self.rt.minimize_request && !self.life.finished() && !event_loop.exiting()
             && self.win.as_ref().is_some_and(|w| w.native.panel.is_none() && w.window.is_minimized() != Some(true))
         {
             let presents = self.meter.totals().presents;
@@ -255,7 +260,7 @@ impl<S: 'static> Host<S> {
             self.shell(event_loop);
         }
         if !drew && (visible || launcher) && let Some(w) = &self.win {
-            w.window.request_redraw();
+            w.request_redraw();
         }
         Ok(())
     }

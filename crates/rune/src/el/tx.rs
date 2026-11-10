@@ -82,6 +82,12 @@ pub struct Tx {
     pub(crate) font_smoothing: Option<crate::text::FontSmoothing>,
     pub(crate) font_families: Option<(String, String)>,
     pub(crate) blur: bool,
+    /// `Tx::focus` and `Tx::return_focus`: the key, whether its ring shows, and which asked.
+    pub(crate) focus_to: Option<(String, bool, FocusAsk)>,
+    /// `Tx::focus_visible`.
+    pub(crate) focus_visible: bool,
+    /// `Tx::by_keys`.
+    pub(crate) by_keys: bool,
     /// The text selection as the event arrived (`Tx::text_selection`).
     pub(crate) selection: Option<Rc<crate::TextSelection>>,
     /// `Tx::select_text`, `Tx::select_all_text` and `Tx::clear_text_selection`; the last wins.
@@ -95,6 +101,15 @@ pub struct Tx {
     pub(crate) playground: Vec<crate::playground::Request>,
     /// `Tx::invalidate_memos_by_prefix`.
     pub(crate) evict_memos: Vec<String>,
+    /// `Tx::clock`.
+    pub(crate) clock: f64,
+}
+
+/// Which asked for focus: [`Tx::focus`], or [`Tx::return_focus`] handing it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusAsk {
+    Focus,
+    Return,
 }
 
 /// A change to the text selection a handler asked for, carried out after its commit.
@@ -118,6 +133,19 @@ pub enum Shell {
     /// Close the window as if the user had: `App::keep_running` keeps the app and its state.
     Close,
     Quit,
+    /// Quit, then start the app again (`Tx::relaunch`).
+    Relaunch,
+}
+
+impl Shell {
+    /// What follows the app's exit for this request, when it quits.
+    pub(crate) fn after(self) -> Option<crate::quit::After> {
+        match self {
+            Shell::Close => None,
+            Shell::Quit => Some(crate::quit::After::Exit),
+            Shell::Relaunch => Some(crate::quit::After::Relaunch),
+        }
+    }
 }
 
 impl Tx {
@@ -199,14 +227,39 @@ impl Tx {
         self.wakes.push(duration);
     }
 
+    /// The window's logical clock in seconds as this handler or poll runs: the `clock` `poll`
+    /// gets, and the frame's for a handler. Headless runs step it virtually, so a state
+    /// machine that stamps its timers with it (`rune::machine`) runs the same in a script.
+    /// 0 for a `Tx` no runtime made.
+    pub fn clock(&self) -> f64 {
+        self.clock
+    }
+
+    /// Wake the app's poll hook once the clock reaches `due` (seconds on [`Tx::clock`]), as
+    /// [`Tx::wake_after`] does for the time left; a deadline already past wakes the next
+    /// frame. A timed state stores its deadline and asks for it here, and its poll checks
+    /// `clock >= due` to fire the timer as an event.
+    pub fn wake_at(&mut self, due: f64) {
+        self.wakes.push(std::time::Duration::from_secs_f64((due - self.clock).max(0.0)));
+    }
+
     /// Close the window after this handler, as the close button would (`App::on_close` runs).
     pub fn close_window(&mut self) {
         self.shell = self.shell.max(Some(Shell::Close));
     }
 
-    /// Quit the app after this handler, whether or not it keeps running without a window.
+    /// Quit the app after this handler, whether or not it keeps running without a window. Every
+    /// open window's `App::on_quit` runs as it ends; no `on_close` does.
     pub fn quit(&mut self) {
-        self.shell = Some(Shell::Quit);
+        self.shell = self.shell.max(Some(Shell::Quit));
+    }
+
+    /// Quit the app as [`Tx::quit`] does, then start it again, with the same arguments, once
+    /// this process has exited, as Electron's `app.relaunch()` and `app.quit()` do: a menu's
+    /// Restart, or an update put in place. A system shutdown or logoff that ends the app first
+    /// doesn't start it again.
+    pub fn relaunch(&mut self) {
+        self.shell = Some(Shell::Relaunch);
     }
 
     /// Minimize this window after this handler, as its minimize button would (winit's
@@ -298,6 +351,39 @@ impl Tx {
     /// model clears it too. Does nothing when nothing has focus.
     pub fn blur(&mut self) {
         self.blur = true;
+    }
+
+    /// Focus the element keyed `key` once this handler's change is on screen, as a web page's
+    /// `element.focus()`: a menu's trigger as the menu closes, say. The first shown, focusable
+    /// element with that key takes it (or its first focusable child), drawing its focus ring when
+    /// `ring` (`:focus-visible`). A text field focused through its model (`TextEdit::focused`)
+    /// in the same change wins over it. Nothing happens when no such element shows.
+    pub fn focus(&mut self, key: impl Into<String>, ring: bool) {
+        self.focus_to = Some((key.into(), ring, FocusAsk::Focus));
+    }
+
+    /// [`Tx::focus`] for focus a closing menu or popover hands back to its trigger, as a web
+    /// menu's `onCloseAutoFocus` does after the change that closed it. A modal that opens in the
+    /// same change (a dialog a menu's pick opens) keeps focus, and as it closes hands it back to
+    /// where focus was before that change, as a web dialog that opened from a menu item records
+    /// that item: when it's gone, nothing has focus.
+    pub fn return_focus(&mut self, key: impl Into<String>, ring: bool) {
+        self.focus_to = Some((key.into(), ring, FocusAsk::Return));
+    }
+
+    /// Whether keyboard focus was showing its ring (`:focus-visible`) as this event arrived:
+    /// the keyboard, not the pointer, has been driving. A menu that opens with it returns focus
+    /// to its trigger with the ring.
+    pub fn focus_visible(&self) -> bool {
+        self.focus_visible
+    }
+
+    /// Whether a key brought this change: a key handler, or a control that Return or Space
+    /// pressed. A menu that opens from it is a keyboard open (Kobalte's `keyboard` gesture),
+    /// which lights its first row and hands focus back to its trigger with the ring, whatever
+    /// put focus on the trigger before.
+    pub fn by_keys(&self) -> bool {
+        self.by_keys
     }
 
     /// The [`El::selectable`] text selection as this event arrived: the texts it covers with

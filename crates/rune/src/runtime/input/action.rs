@@ -42,7 +42,7 @@ pub(super) enum Action {
     KeyUp(KeyEvent),
     /// A wheel delta at window point (x, y) for the `on_wheel` handlers at the pointer,
     /// innermost first (`runtime/input/gesture.rs`).
-    Wheel(u64, Vec<String>, crate::WheelEvent),
+    Wheel(crate::machine::Attempt, Vec<String>, crate::WheelEvent),
     Gesture(Vec<String>, gesture_dispatch::Gesture),
     Ime(Ime),
     Paste(crate::ClipboardContent, Option<Option<String>>),
@@ -51,6 +51,9 @@ pub(super) enum Action {
     /// A `Tx::open_file` or `Tx::save_file` callback's id and the dialog's answer.
     FileDialog(u64, crate::file_dialog::FileDialogResult),
     Focus(String, f32, f32),
+    /// A text field's menu: the field, the window point it opens at, and where in the field a
+    /// press asked for it (none from the keyboard).
+    FieldMenu(String, (f32, f32), Option<(f32, f32)>),
     Blur,
     /// What assistive technology asked of an element (`a11y/actions.rs`).
     A11y(String, A11yAct),
@@ -210,6 +213,7 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     if one.font_families.is_some() { tx.font_families = one.font_families; }
     if one.rewind.is_some() { tx.rewind = one.rewind; }
     tx.blur |= one.blur;
+    if one.focus_to.is_some() { tx.focus_to = one.focus_to; }
     if one.select.is_some() {
         tx.select = one.select;
         tx.select_from_change = one.select_from_change;
@@ -300,14 +304,14 @@ impl<S: 'static> Runtime<S> {
         let repeat = matches!(action, Action::DragRepeat(..));
         let ran = match action {
             Action::WindowFocus(focused) => {
-                if !focused { self.held = None; }
+                if !focused { self.held = physical_dispatch::Activation::Up; }
                 let Some(f) = self.nodes.get(self.app_root()).and_then(|n| n.handlers.on_window_focus.clone()) else { return false };
                 f(states!(self), focused, &mut one);
                 true
             }
             Action::Physical(event, fallback) => {
                 // The window lost key focus (an internal focus move also notifies handlers).
-                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = None; }
+                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = physical_dispatch::Activation::Up; }
                 let ran = self.dispatch_physical(event, fallback, tx);
                 let live_only = std::mem::take(&mut tx.live_only);
                 return if ran && live_only { self.skip_view("a key handler") } else { ran };
@@ -319,15 +323,19 @@ impl<S: 'static> Runtime<S> {
             Action::HoverFocus(path) => match path {
                 Some(path) => {
                     self.set_focus(Some(path), false);
-                    self.hover_focus = true;
+                    self.focus.step(focus_machine::FocusEvent::Hover(true));
                     one.instant = true;
                     true
                 }
-                None => std::mem::take(&mut self.hover_focus),
+                None => {
+                    let lit = self.focus.hovered();
+                    self.focus.step(focus_machine::FocusEvent::Hover(false));
+                    lit
+                }
             },
             Action::Dismiss(path) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.modal.as_ref().map(|m| m.dismiss.clone())) else { return false };
-                self.set_focus(None, self.keyboard_focus);
+                self.set_focus(None, self.focus.keyboard());
                 f(states!(self), &mut one);
                 true
             }
@@ -492,9 +500,10 @@ impl<S: 'static> Runtime<S> {
             }
             Action::FileDialog(id, result) => self.run_file_dialog(id, result, &mut one),
             Action::Focus(path, x, y) => self.focus_input(path, x, y, &mut one),
+            Action::FieldMenu(path, at, local) => self.field_menu(path, at, local, &mut one),
             Action::Blur => {
-                if self.focused.is_none() { return false; }
-                self.set_focus(None, self.keyboard_focus);
+                if self.focus.path().is_none() { return false; }
+                self.set_focus(None, self.focus.keyboard());
                 true
             }
             Action::A11y(path, act) => self.run_a11y(path, act, &mut one),

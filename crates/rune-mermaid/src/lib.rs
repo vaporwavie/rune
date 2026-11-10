@@ -119,6 +119,7 @@ mod ink;
 mod journey;
 mod layered;
 mod layered_draw;
+mod lenient;
 mod mindmap;
 mod parts;
 mod pie;
@@ -239,6 +240,26 @@ pub fn render_streaming(src: &str, style: &DiagramStyle, hover: Hover, color: Co
 /// new since the last build still comes in on its own.
 pub fn render_streamed(src: &str, style: &DiagramStyle, hover: Hover, color: Color) -> Option<El> {
     render_inner(src, style, hover, color, Mode::Settled)
+}
+
+/// A diagram's title and drawing without its card, for a viewer that frames and scales it
+/// itself (a lightbox whose frame stays the card's size while the drawing grows).
+#[non_exhaustive]
+pub struct Drawing {
+    pub el: El,
+    /// The points `el` takes.
+    pub size: [f32; 2],
+    /// The fill and border of the card it would draw in, for the viewer's frame.
+    pub surface: Color,
+    pub surface_border: Color,
+}
+
+/// [`render_with_hover`]'s title and drawing alone, laid out and fitted for `style.max_width`
+/// as its card would be.
+pub fn render_drawing(src: &str, style: &DiagramStyle, hover: Hover, color: Color) -> Option<Drawing> {
+    let hover = (hover != Hover::Off).then_some((hover, color));
+    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style);
+    Some(Drawing { el, size, surface: style.surface, surface_border: style.surface_border })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -473,6 +494,8 @@ pub(crate) struct NodeStyle {
     pub fill: Option<Color>,
     pub stroke: Option<Color>,
     pub color: Option<Color>,
+    /// `stroke-width`, in Mermaid's px (one point each).
+    pub width: Option<f32>,
 }
 
 impl NodeStyle {
@@ -481,6 +504,7 @@ impl NodeStyle {
             fill: over.fill.or(self.fill),
             stroke: over.stroke.or(self.stroke),
             color: over.color.or(self.color),
+            width: over.width.or(self.width),
         }
     }
 
@@ -630,10 +654,16 @@ pub(crate) fn parse_style_props(props: &str) -> NodeStyle {
             "fill" => out.fill = parse_color_spec(v),
             "stroke" => out.stroke = parse_color_spec(v),
             "color" => out.color = parse_color_spec(v),
+            "stroke-width" => out.width = px(v).map(|w| w.clamp(0.0, 5.0)),
             _ => {}
         }
     }
     out
+}
+
+/// A CSS length in px (`2px`, `2`).
+fn px(v: &str) -> Option<f32> {
+    v.trim_end_matches("px").trim().parse::<f32>().ok().filter(|w| w.is_finite())
 }
 
 pub(crate) fn parse_edge_style_props(props: &str) -> EdgeStyle {
@@ -643,7 +673,7 @@ pub(crate) fn parse_edge_style_props(props: &str) -> EdgeStyle {
         let v = v.trim().trim_end_matches("!important").trim();
         match k.trim() {
             "stroke" => out.stroke = parse_color_spec(v),
-            "stroke-width" => out.width = v.trim_end_matches("px").trim().parse::<f32>().ok().map(|w| w.clamp(0.75, 5.0)),
+            "stroke-width" => out.width = px(v).map(|w| w.clamp(0.75, 5.0)),
             _ => {}
         }
     }

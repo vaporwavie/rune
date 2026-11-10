@@ -1,0 +1,1 @@
+- **The `whodunit` fork includes upstream `dev` through `e95e8cfe`**, retaining its plain text area, button shortcut labels, prose width, sidebar title and inset, and OpenCode contrast patches. Capped Markdown prose keeps upstream's list-copy fixes.

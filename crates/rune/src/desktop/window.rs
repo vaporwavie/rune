@@ -12,7 +12,7 @@ use crate::el::Shell;
 use crate::render::{Gpu, OFFSCREEN_FORMAT, Renderer};
 use crate::runtime::{Env, Runtime};
 use crate::tooling::{Args, Kind, Trace};
-use crate::window::WakeEvent;
+use crate::window::{Life, WakeEvent};
 use crate::{WindowHandle, WindowSpec};
 
 /// Corner radius of a titled window, in points.
@@ -92,8 +92,6 @@ pub(crate) struct Window<S: 'static> {
     panel: bool,
     /// The app's own window, not one `App::window` added.
     main: bool,
-    /// When it last hid, in `reopen::stamp` order.
-    hidden_at: Option<u64>,
     shadow: bool,
     click_through: bool,
     on_top: bool,
@@ -102,9 +100,7 @@ pub(crate) struct Window<S: 'static> {
     /// `WindowOptions::physical_size`, in pixels of the display the window opens on.
     physical: Option<(u32, u32)>,
     frame: [f32; 4],
-    visible: bool,
-    /// Closed without `keep_running`: it never shows again.
-    finished: bool,
+    life: Life,
     placed: Option<Value>,
 }
 
@@ -118,6 +114,7 @@ impl<S: 'static> Window<S> {
         let own = app.resolve_args(inherited);
         let comp = app.compositor.take();
         let (open, keep_running, on_close, on_focus, on_reopen) = (app.open, app.keep_running, app.on_close, app.on_focus, app.on_reopen);
+        let (on_mods, on_visibility) = (app.on_mods, app.on_visibility);
         let on_ime = app.on_ime;
         let native = std::mem::take(&mut app.macos_window);
         let (modifier_keys, tab_visits_controls, srgb_blend) = (app.modifier_keys, app.tab_visits_controls, app.srgb_blend);
@@ -132,6 +129,8 @@ impl<S: 'static> Window<S> {
         let mut rt = crate::tooling::runtime_for(&spec, state, size, Env::new(dark, scale), Arc::new(|| {}));
         crate::playground::attach(&mut rt, playground, &spec, own.playground.clone(), own.variant.clone(), false);
         rt.on_focus = on_focus;
+        rt.on_mods = on_mods;
+        rt.on_visibility = on_visibility;
         rt.app_ime.hook = on_ime;
         rt.set_modifier_keys(modifier_keys);
         rt.set_tab_visits_controls(tab_visits_controls);
@@ -151,7 +150,6 @@ impl<S: 'static> Window<S> {
             launcher: native.launcher,
             panel: native.nonactivating_panel,
             main,
-            hidden_at: None,
             shadow: native.shadow != Some(false),
             click_through: options.click_through,
             on_top: options.always_on_top,
@@ -159,21 +157,20 @@ impl<S: 'static> Window<S> {
             position: options.position,
             physical: options.physical_size,
             frame: [0.0, 0.0, size.0, size.1],
-            visible,
-            finished: false,
+            life: if visible { Life::Shown { covered: false } } else { Life::Unopened },
             placed: None,
         }
     }
 
-    fn set_visible(&mut self, visible: bool) {
-        self.visible = visible;
+    fn publish(&mut self) {
+        let visible = self.life.shown();
         self.rt.set_live_visible(visible);
         self.shared.visible.store(visible, Ordering::Release);
     }
 
     fn request(&mut self, request: WindowRequest, changes: &mut Changes) {
         match request {
-            WindowRequest::Open(_) | WindowRequest::Show if self.finished => {}
+            WindowRequest::Open(_) | WindowRequest::Show if self.life.finished() => {}
             WindowRequest::Open(_) => {
                 self.show();
                 changes.front = true;
@@ -191,29 +188,30 @@ impl<S: 'static> Window<S> {
     }
 
     fn show(&mut self) {
-        if self.visible { return; }
+        if self.life.shown() || !self.life.show() { return; }
         // A launcher reveals the frame it kept up to date while hidden; others land their motion.
         if !self.launcher { self.rt.settle_all(); }
-        self.set_visible(true);
+        self.publish();
     }
 
     fn hide(&mut self) {
-        if !self.visible { return; }
-        self.hidden_at = Some(crate::platform::reopen::stamp());
+        if !self.life.shown() { return; }
+        self.life.hide(crate::platform::reopen::stamp);
         self.rt.cancel_popups();
         self.rt.cancel_file_dialogs();
         self.rt.cancel_pointer();
-        self.set_visible(false);
+        self.publish();
     }
 
+    /// As the native host closes (`Life::closes`): a headless window always exists.
     fn close(&mut self) {
-        if !(self.visible || !self.keep_running) { return; }
+        if !self.life.closes(self.keep_running, true) { return; }
         if let Some(f) = self.on_close { self.rt.update(f); }
         self.hide();
         if !self.keep_running {
             self.rt.cancel_popups();
             self.rt.cancel_file_dialogs();
-            self.finished = true;
+            self.life.finish();
         }
     }
 
@@ -244,7 +242,7 @@ impl<S: 'static> Window<S> {
 impl<S: 'static> Member for Window<S> {
     fn key(&self) -> &str { &self.key }
     fn frame(&self) -> [f32; 4] { self.frame }
-    fn visible(&self) -> bool { self.visible }
+    fn visible(&self) -> bool { self.life.shown() }
     fn click_through(&self) -> bool { self.click_through }
     fn on_top(&self) -> bool { self.on_top }
     fn radius(&self) -> f32 { self.radius }
@@ -276,7 +274,7 @@ impl<S: 'static> Member for Window<S> {
         if let Some(p) = requests.position { self.move_to(desktop.to_points(p)); }
         if let Some(place) = &requests.place { self.place(desktop, place, t); }
         if let Some(request) = requests.window { self.request(request, &mut changes); }
-        if requests.focus && self.visible { changes.front = true; changes.keys = true; }
+        if requests.focus && self.life.shown() { changes.front = true; changes.keys = true; }
         // `quit` ends a native app; a recording runs to the end of its timeline.
         let queued = self.handle.as_ref().map(WindowHandle::take_headless).unwrap_or_default();
         for event in queued {
@@ -284,7 +282,7 @@ impl<S: 'static> Member for Window<S> {
                 WakeEvent::Window(_, request) => self.request(request, &mut changes),
                 WakeEvent::Place(_, place) => self.place(desktop, &place, t),
                 WakeEvent::Position(_, p) => self.move_to(desktop.to_points(p)),
-                WakeEvent::Focus(_) if self.visible => { changes.front = true; changes.keys = true; }
+                WakeEvent::Focus(_) if self.life.shown() => { changes.front = true; changes.keys = true; }
                 _ => {}
             }
         }
@@ -293,9 +291,9 @@ impl<S: 'static> Member for Window<S> {
             self.rt.minimize_request = false;
             match self.rt.shell_request.take() {
                 Some(Shell::Close) => self.close(),
-                Some(Shell::Quit) | None => {}
+                Some(Shell::Quit | Shell::Relaunch) | None => {}
             }
-            if self.visible {
+            if self.life.shown() {
                 self.rt.open_popup_headless();
             } else {
                 self.rt.cancel_popups();
@@ -330,7 +328,7 @@ impl<S: 'static> Member for Window<S> {
             Kind::Wheel(dx, dy) => crate::tooling::wheel(rt, (x, y), *dx, *dy),
             Kind::Fling(vx, vy) => crate::tooling::fling(rt, (x, y), *vx, *vy),
             Kind::Files(step) => crate::tooling::file_input(rt, step, (x, y)),
-            Kind::Mark(_) | Kind::Reopen | Kind::Menu(_) | Kind::PopupMenu(_) | Kind::FileDialog(_) | Kind::Shortcut(_) => {}
+            Kind::Mark(_) | Kind::Reopen | Kind::OpenUrl(_) | Kind::Menu(_) | Kind::PopupMenu(_) | Kind::FileDialog(_) | Kind::Shortcut(_) => {}
             kind => { crate::tooling::canvas_input(rt, kind, (x, y)); }
         }
     }
@@ -342,17 +340,17 @@ impl<S: 'static> Member for Window<S> {
 
     fn reopen_candidate(&self) -> crate::platform::reopen::Candidate {
         crate::platform::reopen::Candidate {
-            reopenable: !self.finished && !self.panel,
-            visible: self.visible,
+            reopenable: !self.life.finished() && !self.panel,
+            visible: self.life.shown(),
             // A headless desktop has no Dock to minimize into.
             minimized: false,
-            hidden_at: self.hidden_at,
+            hidden_at: self.life.hidden_at(),
             main: self.main,
         }
     }
 
     fn reopen_hook(&mut self, has_visible_windows: bool) -> bool {
-        let Some(f) = self.on_reopen.filter(|_| !self.finished) else { return false };
+        let Some(f) = self.on_reopen.filter(|_| !self.life.finished()) else { return false };
         let mut handled = false;
         self.rt.update(|s, tx| handled = f(s, has_visible_windows, tx));
         handled

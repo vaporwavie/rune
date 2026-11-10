@@ -3,13 +3,6 @@
 
 use super::*;
 
-/// How long a Windows window keeps presenting every refresh after its last change. With G-SYNC
-/// or FreeSync in windowed mode the display refreshes when the foreground window presents, so a
-/// hover's lone presents swing the refresh rate, and many panels' brightness with it (Hex #689).
-/// A steady run at the display's rate, then rest, changes the rate once per interaction.
-#[cfg(target_os = "windows")]
-const STEADY: Duration = Duration::from_secs(1);
-
 impl<S: 'static> Host<S> {
     /// A shown frame with no drawable. Asking for a redraw here would turn the loop at once, for
     /// as long as the window is occluded or its displays sleep, so it waits for `retry`, with
@@ -17,12 +10,13 @@ impl<S: 'static> Host<S> {
     /// ran the runtime.
     pub(super) fn missed_frame(&mut self, missed: Missed, stepped: bool) {
         let Some(l) = self.win.as_mut() else { return };
+        l.timer_frame.drawn();
         l.presented = None;
         let now = Instant::now();
         if missed == Missed::Occluded {
             // Covered or asleep with no notification yet: rest as if one came, and look
             // again on `retry`.
-            l.occluded = true;
+            self.life.cover(true);
             l.first_frame.skipped(now);
             #[cfg(target_os = "macos")]
             l.set_live_resize(false);
@@ -45,9 +39,10 @@ impl<S: 'static> Host<S> {
     /// reports with no event lands here first, and the frame that next draws settles.
     pub(super) fn covered_frame(&mut self) {
         let Some(l) = self.win.as_mut() else { return };
+        l.timer_frame.drawn();
         l.presented = None;
         l.stop_pacing();
-        let shown = l.visible;
+        let shown = self.life.shown();
         l.first_frame.skipped(Instant::now());
         self.land_frame();
         if shown {
@@ -65,20 +60,22 @@ impl<S: 'static> Host<S> {
     pub(super) fn draw(&mut self, resizing: bool) {
         let launcher = self.launcher();
         let (Some(l), Some(_)) = (self.win.as_mut(), self.gpu.as_ref()) else { return };
-        let hidden = launcher && !l.visible;
-        if (!launcher && (!l.visible || l.occluded)) || l.minimized() {
+        let hidden = launcher && !self.life.shown();
+        if (!launcher && !self.life.uncovered()) || l.minimized() {
             return self.covered_frame();
         }
         // A missed frame's retry, or the timer pacing unpaced motion: input waits for it, and
         // `new_events` runs due timers meanwhile.
         if !resizing && l.backing_off(Instant::now()) { return; }
+        // The frame a due timer asked for is here, drawing or running covered below.
+        l.timer_frame.drawn();
         // Starting the display link for a window that isn't on screen would wait for a tick that
         // sleeping displays never send, and a running link holds back its timers (`wake_deadline`).
         #[cfg(target_os = "macos")]
         if !hidden {
             if !l.natively_occluded() {
-                l.native.prime = 0;
-            } else if l.native.prime == 0 {
+                l.native.prime.stop();
+            } else if !l.native.prime.presumes() {
                 self.meter.skipped();
                 self.missed_frame(Missed::Occluded, false);
                 return;
@@ -89,13 +86,13 @@ impl<S: 'static> Host<S> {
         // Only a timer woke the resting window, so its frame may draw what's on screen. It
         // decides that before starting the display link, which would draw it at once anyway.
         #[cfg(target_os = "macos")]
-        let deferred = l.quiet && !hidden && !resizing && l.native.prime == 0
+        let deferred = l.quiet && !hidden && !resizing && !l.native.prime.presumes()
             && l.native.pacing.as_ref().is_some_and(|p| p.defers_start(Instant::now()));
         #[cfg(not(target_os = "macos"))]
         let deferred = false;
         #[cfg(target_os = "macos")]
         let target = if hidden || resizing || deferred { None } else if let Some(pacing) = &mut l.native.pacing {
-            if l.native.prime > 0 && !pacing.running() {
+            if l.native.prime.presumes() && !pacing.running() {
                 None
             } else {
                 let Some(target) = pacing.next_frame().target() else { return };
@@ -103,8 +100,8 @@ impl<S: 'static> Host<S> {
             }
         } else { None };
         #[cfg(target_os = "macos")]
-        let shown = if !hidden && l.native.prime > 0 {
-            l.native.prime -= 1;
+        let shown = if !hidden && l.native.prime.presumes() {
+            l.native.prime.spend();
             let Some(shown) = crate::platform::macos::PresumeShown::new(&l.surface) else {
                 self.meter.skipped();
                 self.missed_frame(Missed::Occluded, false);
@@ -142,7 +139,7 @@ impl<S: 'static> Host<S> {
         // when it draws what's on screen.
         let quiet = std::mem::take(&mut l.quiet) && !hidden && !live_resize && l.presented.is_some() && self.comp.is_none()
             && self.trace.is_none() && self.args.trace.is_none() && self.rt.live_visible()
-            && self.rt.window_frame.is_none() && self.frame_anim.is_none();
+            && self.rt.window_frame.is_none() && self.frame_move.is_none();
         #[cfg(target_os = "macos")]
         let quiet = quiet && shown.is_none() && !l.native.materials.native();
         let built = if quiet {
@@ -201,7 +198,7 @@ impl<S: 'static> Host<S> {
         }
         let frame_time = target.unwrap_or(now);
         let presents_at = target;
-        self.rt.window_resting = self.frame_anim.is_none() && self.rt.window_frame.is_none();
+        self.rt.window_resting = self.frame_move.is_none() && self.rt.window_frame.is_none();
         let target_ms = target.zip(self.trace_start).map(|(target, start)| crate::frame::present_time::ms_since(start, target));
         let rt = &mut self.rt;
         if hidden && l.first_frame.settles() { rt.settle_all(); }
@@ -289,10 +286,10 @@ impl<S: 'static> Host<S> {
         if let Some(shadow) = &l.native.shadow { shadow.presented(); }
         // The frame landed with this present; later ones needn't wait for a transaction.
         #[cfg(target_os = "macos")]
-        if self.frame_anim.is_none() { l.present_with_transaction(false); }
-        if !l.first_frame.ready
+        if self.frame_move.is_none() { l.present_with_transaction(false); }
+        if !l.first_frame.ready()
             && gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_ok() {
-            l.first_frame.ready = true;
+            l.first_frame.gpu_done();
         }
         // The window shows once the GPU has finished the frame it presents.
         #[cfg(target_os = "windows")]
@@ -301,6 +298,7 @@ impl<S: 'static> Host<S> {
             l.native.cloak.lift(&l.window);
         }
         let submitted = Instant::now();
+        self.clock.presented(rt, submitted);
         self.meter.presented();
         #[cfg(target_os = "macos")]
         if let Some(pacing) = &mut l.native.pacing { pacing.presented(submitted); }
@@ -320,7 +318,7 @@ impl<S: 'static> Host<S> {
             if self.args.frames.is_some_and(|n| self.trace_frames >= n) {
                 // While the window still shows its last frames.
                 trace.settle_presents(crate::frame::present_time::SETTLE);
-                self.finished = true;
+                self.life.finish();
                 return;
             }
         }
@@ -329,23 +327,23 @@ impl<S: 'static> Host<S> {
         let next_tick = l.next_tick(now).filter(|_| !hidden);
         let rests = !hidden && !(self.trace.is_some() && self.args.frames.is_some());
         #[cfg(target_os = "windows")]
-        let steady = {
-            // A frame the hold alone asked for changes nothing unless it draws something new.
-            let held = std::mem::take(&mut l.steady_frame);
-            let changed = !held || (self.comp.is_none() && !l.presented.as_ref().is_some_and(|p| p.same(rt, &l.config)));
-            if changed { l.steady_until = Some(now + STEADY); }
-            !hidden && l.steady_until.is_some_and(|until| now < until)
-        };
-        self.idle = Presented::settle(&mut l.presented, rt, &l.config, animating || self.frame_anim.is_some(), next_tick, rests, self.comp.is_some());
+        {
+            // A frame the run alone asked for changes nothing unless it draws something new.
+            let changed = !l.steady.held_frame() || (self.comp.is_none() && !l.presented.as_ref().is_some_and(|p| p.same(rt, &l.config)));
+            let event = if hidden { SteadyEvent::Ends } else { SteadyEvent::Drew { changed, focused: rt.has_window_focus(), now } };
+            l.steady = l.steady.step(event).0;
+        }
+        self.idle = Presented::settle(&mut l.presented, rt, &l.config, animating || self.frame_move.is_some(), next_tick, rests, self.comp.is_some());
         #[cfg(target_os = "macos")]
         if !hidden && let Some(latency) = l.native.launch_drawables.settle(self.idle, now) {
             l.config.desired_maximum_frame_latency = latency;
             l.surface.configure(&gpu.device, &l.config);
         }
         #[cfg(target_os = "windows")]
-        if self.idle && steady {
-            l.steady_frame = true;
-            l.window.request_redraw();
+        if self.idle && !hidden {
+            let (steady, again) = l.steady.step(SteadyEvent::Rests { now });
+            l.steady = steady;
+            if again { l.request_redraw(); }
         }
         if !hidden && (!self.idle || (self.trace.is_some() && self.args.frames.is_some())) {
             // Without a running display link, macOS hands out drawables faster than the
@@ -353,7 +351,7 @@ impl<S: 'static> Host<S> {
             #[cfg(target_os = "macos")]
             if !l.native.pacing.as_mut().is_some_and(|p| p.start()) { l.retry = Some(now + TIMER_FRAME); }
             #[cfg(not(target_os = "macos"))]
-            l.window.request_redraw();
+            l.request_redraw();
             self.meter.set_pacing(l.pacing_state(true));
         } else {
             l.stop_pacing();
@@ -364,7 +362,7 @@ impl<S: 'static> Host<S> {
         // moves it. While the user drags the edge, it waits until they let go.
         #[cfg(target_os = "macos")]
         if !hidden && !live_resize && self.rt.window_frame.is_some() {
-            let shown = if std::mem::take(&mut self.rt.fit_held) { 0.0 } else { crate::frame::clock::RESUME_STEP };
+            let shown = if self.rt.fit.take_held() { 0.0 } else { crate::frame::clock::RESUME_STEP };
             self.take_frame_request(self.frame_secs(frame_time) - shown, true);
         }
     }

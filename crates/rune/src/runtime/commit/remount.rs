@@ -35,26 +35,15 @@ struct ListPlan {
 }
 
 impl<S: 'static> Runtime<S> {
-    /// Whether this commit only shifts or fills `virtual_rows` windows, so `view` and already
-    /// mounted subtrees need not rebuild.
-    pub(in crate::runtime) fn virtual_only(&self, tx: &Tx) -> bool {
+    /// Whether a commit that resized nothing and changed nothing the view reads
+    /// ([`Runtime::commit_kind`]) only shifts or fills `virtual_rows` windows, so `view` and
+    /// already mounted subtrees need not rebuild.
+    pub(in crate::runtime) fn virtual_only(&self) -> bool {
         #[cfg(feature = "hot")]
         if self.hot.is_some() {
             return false;
         }
-        if self.relayout
-            || !self.state_unchanged
-            || tx.settle
-            || self.checking_live_only()
-            || self.reuse.read_moved
-            || self.reuse.scale != self.env.scale
-            || self.reuse.srgb != Some(self.srgb_blend)
-            || self.playground.is_some()
-            || self.patch_pending()
-            || self.virtuals.is_empty()
-            || self.nodes.is_empty()
-            || self.layout.live_count() != self.nodes.len()
-        {
+        if self.checking_live_only() || self.virtuals.is_empty() || self.nodes.is_empty() {
             return false;
         }
         if !self.nodes.iter().all(|n| {
@@ -193,7 +182,7 @@ impl<S: 'static> Measurement<'_, S> {
 
             let sticky = self.nodes[scroll_idx].scroll.unwrap().stick_bottom;
             let old_scroll = self.scrolls.get(&scroll_id);
-            let pinned = old_scroll.map_or(sticky, |s| s.pinned);
+            let pinned = old_scroll.map_or(sticky, |s| s.pinned());
             let mut offset = old_scroll.map_or(0.0, |s| s.offset as f32);
             v.viewport = self.nodes[scroll_idx].local.h;
             offset = (offset - v.top).max(0.0);
@@ -313,7 +302,7 @@ impl<S: 'static> Measurement<'_, S> {
                 let key = &v.keys[row_i];
                 if !plan.mounted_rows.contains_key(key) {
                     let row = build_indexed_row(&plan.rows, state, &plan.path, key, row_i, self.key_warnings);
-                    if row.has_virtual {
+                    if row.flags.has(crate::el::ElFlags::HAS_VIRTUAL) {
                         nested_virtual = true;
                         break;
                     }
@@ -339,7 +328,7 @@ impl<S: 'static> Measurement<'_, S> {
             let v = self.virtuals.get_mut(&plan.path).unwrap();
             plan.quiet = plan.range.clone().map(|i| v.mounts_quietly(i, self.commits)).collect();
             for (pos, row) in &mut plan.built_rows {
-                row.virtual_mount = plan.quiet[*pos];
+                row.flags.set(crate::el::ElFlags::VIRTUAL_MOUNT, plan.quiet[*pos]);
             }
         }
 
@@ -543,7 +532,7 @@ impl<S: 'static> Measurement<'_, S> {
             nodes,
             reduced_motion: self.reduced_motion,
             time_scale: self.time_scale,
-            defaults: self.defaults,
+            defaults: self.defaults.clone(),
             titlebar: self.titlebar,
             caret_read: self.caret_read,
             layout_reads: self.layout_reads,

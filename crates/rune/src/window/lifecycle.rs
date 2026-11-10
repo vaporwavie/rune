@@ -32,23 +32,108 @@ impl<S: 'static> Host<S> {
 
     pub(super) fn show(&mut self, event_loop: &ActiveEventLoop) {
         if self.launcher() { self.reveal_launcher(event_loop); return; }
-        // Hidden, it may have missed a new accent's or scroller style's redraw: build with the current ones.
-        self.rt.set_system_accent(crate::system_accent());
-        self.rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(self.args.scroll_bars));
-        let built = self.win.as_ref().is_some_and(|w| !w.visible) && self.build_for_show();
-        self.apply_placement(event_loop);
-        let Some(w) = self.win.as_mut() else { self.create(event_loop, None, false); return };
-        if !w.visible {
-            w.show(false);
+        self.reveal(event_loop, Reveal::Show, None);
+    }
+
+    pub(super) fn open(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
+        if self.launcher() { self.reveal_launcher(event_loop); return; }
+        // The launcher's startup token belongs to the first window only.
+        let token = token.or_else(|| self.startup_token(event_loop));
+        self.reveal(event_loop, Reveal::Open, token);
+    }
+
+    /// The window shown, or not, so far: the shown one, and nothing while it's hidden.
+    pub(super) fn shown_win(&self) -> Option<&Win> { self.win.as_ref().filter(|_| self.life.shown()) }
+
+    /// The window as a reveal finds it.
+    fn found(&self) -> Found {
+        let Some(w) = &self.win else { return Found::Missing };
+        let minimized = w.window.is_minimized() == Some(true);
+        match self.life {
+            Life::Shown { covered } => Found::Shown { covered, minimized },
+            _ => Found::Hidden { minimized },
         }
-        w.visible = true;
-        w.occluded = false;
-        self.rt.set_live_visible(!w.minimized());
-        self.rt.cancel_timer_frame();
-        self.idle = true;
-        self.native_handle.native.number.store(native_window_number(&w.window).unwrap_or(0), Ordering::Release);
-        if !built { self.rt.settle_all(); }
-        w.window.request_redraw();
+    }
+
+    /// Brings the window on screen (`Reveal`); a window closed for good stays closed.
+    pub(super) fn reveal(&mut self, event_loop: &ActiveEventLoop, reveal: Reveal, mut token: Option<String>) {
+        if self.life.finished() { return; }
+        let mut built = false;
+        for effect in reveal.effects(self.found()) {
+            match effect {
+                RevealEffect::ReadSystem => {
+                    self.rt.set_system_accent(crate::system_accent());
+                    self.rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(self.args.scroll_bars));
+                }
+                RevealEffect::Build => built = self.build_for_show(),
+                RevealEffect::Place => self.apply_placement(event_loop),
+                RevealEffect::Create => {
+                    // `App::open_inactive`: the first open leaves focus where it is.
+                    let focus = reveal == Reveal::Open && !(self.open_inactive && !self.shown);
+                    self.create(event_loop, token.take(), focus);
+                    // On macOS a new window becomes key without activating the app, so activate
+                    // it like a reopen does. The launch open leaves activation to the platform.
+                    #[cfg(target_os = "macos")]
+                    if focus && self.started && let Some(w) = self.shown_win() { w.focus(); }
+                }
+                RevealEffect::OrderIn { focus } => if let Some(w) = &self.win { w.show(focus) },
+                RevealEffect::Unminimize => if let Some(w) = &self.win { w.window.set_minimized(false) },
+                RevealEffect::Settle => {
+                    if !built { self.rt.settle_all(); }
+                    self.idle = true;
+                }
+                RevealEffect::Shown { live } => {
+                    self.life.show();
+                    self.rt.set_live_visible(live);
+                }
+                RevealEffect::CancelTimerFrame => self.rt.cancel_timer_frame(),
+                RevealEffect::Number => if let Some(w) = &self.win {
+                    self.native_handle.native.number.store(native_window_number(&w.window).unwrap_or(0), Ordering::Release);
+                },
+                RevealEffect::Focus => self.activate(event_loop, token.take()),
+                RevealEffect::Redraw => if let Some(w) = &self.win { w.request_redraw() },
+                // No settle, frame, surface configure or acquisition on a cached reveal, unless
+                // the refreshed frame left motion running.
+                RevealEffect::RedrawIfMoving => if !self.idle && let Some(w) = &self.win { w.request_redraw() },
+            }
+        }
+    }
+
+    /// The first window's startup token (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), which
+    /// later windows don't inherit.
+    fn startup_token(&self, event_loop: &ActiveEventLoop) -> Option<String> {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if !self.shown {
+            use winit::platform::startup_notify::{EventLoopExtStartupNotify, reset_activation_token_env};
+            let token = event_loop.read_token_from_env().map(|t| t.into_raw());
+            reset_activation_token_env();
+            return token;
+        }
+        let _ = event_loop;
+        None
+    }
+
+    /// Focuses a shown window; Wayland's compositor wants the open's token for that.
+    fn activate(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
+        let Some(w) = self.win.as_mut() else { return };
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if is_wayland(event_loop) {
+            match token {
+                Some(token) => {
+                    if w.native.activator.is_none() {
+                        w.native.activator = crate::platform::activation::Activator::new(&w.window);
+                    }
+                    if let Some(a) = w.native.activator.as_mut() {
+                        a.activate(&token);
+                    }
+                }
+                // Without a token the compositor may only mark the window urgent.
+                None => w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational)),
+            }
+            return;
+        }
+        let _ = (event_loop, token);
+        w.focus();
     }
 
     /// A hidden or released window that fits its content builds what changed while it was
@@ -71,7 +156,7 @@ impl<S: 'static> Host<S> {
     }
 
     pub(super) fn focus(&self, event_loop: &ActiveEventLoop) {
-        let Some(w) = self.win.as_ref().filter(|w| w.visible) else { return };
+        let Some(w) = self.shown_win() else { return };
         if w.window.is_minimized() == Some(true) { w.window.set_minimized(false); }
         if is_wayland(event_loop) {
             w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
@@ -83,7 +168,7 @@ impl<S: 'static> Host<S> {
     /// Applies everything other threads asked for since the last wake-up. A `wake` polls a
     /// hidden window first, so a reveal in the same turn sees what `poll` changed.
     pub(super) fn drain(&mut self, event_loop: &ActiveEventLoop, wake: bool) {
-        let shown = self.win.as_ref().is_some_and(|w| w.visible);
+        let shown = self.shown_win().is_some();
         let stale_before = self.rt.needs_commit();
         let clipboard = self.clipboard.receive(&mut self.rt);
         let answered = self.popup.answer(&mut self.rt) | self.file_dialog.answer(&mut self.rt);
@@ -103,7 +188,10 @@ impl<S: 'static> Host<S> {
         self.clipboard.flush(&mut self.rt);
         // The next frame polls for the wake.
         if wake && !quiet { self.rt.cancel_timer_frame(); }
-        if requests.quit {
+        if let Some(after) = requests.quit {
+            // Quitting from now on: a close later in this turn closes for the quit.
+            // `Windows::exiting` carries out its effects.
+            let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
             // A tracking menu holds the event loop until it ends.
             self.popup.cancel(&mut self.rt);
             self.file_dialog.cancel(&mut self.rt);
@@ -131,15 +219,16 @@ impl<S: 'static> Host<S> {
         // paced (`refresh_hidden`). A covered or minimised one runs them without asking for a
         // frame it wouldn't draw.
         let launcher = self.launcher();
-        let framed = match self.win.as_ref().filter(|w| drain_frame(launcher, w.visible, shown, changed, quiet)) {
+        let visible = self.life.shown();
+        let framed = match self.win.as_ref().filter(|_| drain_frame(launcher, visible, shown, changed, quiet)) {
             None => false,
-            Some(w) if launcher && !w.visible => self.refresh_hidden(),
-            Some(w) if (!launcher && w.occluded) || w.minimized() => {
+            Some(_) if launcher && !visible => self.refresh_hidden(),
+            Some(w) if (!launcher && self.life.covered()) || w.minimized() => {
                 self.covered_frame();
                 self.shell(event_loop);
                 true
             }
-            Some(w) => { w.window.request_redraw(); true }
+            Some(w) => { w.request_redraw(); true }
         };
         // Neither a poll nor a frame comes to schedule the updates' `wake_after`s.
         if !polled && !framed { self.rt.schedule_pending_wakes(); }
@@ -150,7 +239,7 @@ impl<S: 'static> Host<S> {
     /// shown. A hidden launcher renders poll's changes hidden, paced, keeping its cached frame
     /// fresh. A minimize waits for a show in the same turn (`shows`). Returns whether it polled.
     pub(super) fn poll_hidden(&mut self, event_loop: &ActiveEventLoop, shows: bool) -> bool {
-        if event_loop.exiting() || self.win.as_ref().is_some_and(|w| w.visible) { return false; }
+        if event_loop.exiting() || self.shown_win().is_some() { return false; }
         let changed = self.rt.poll_hidden();
         self.clipboard.flush(&mut self.rt);
         let minimize = shows && std::mem::take(&mut self.rt.minimize_request);
@@ -168,8 +257,8 @@ impl<S: 'static> Host<S> {
     pub(super) fn refresh_hidden(&mut self) -> bool {
         let now_due = self.hidden_launcher_renders();
         let Some(w) = &mut self.win else { return false };
-        let render = now_due || w.first_frame.deadline.is_some() || w.hidden_pace.changed(Instant::now());
-        if render { w.window.request_redraw(); }
+        let render = now_due || w.first_frame.deadline().is_some() || w.hidden_pace.changed(Instant::now());
+        if render { w.request_redraw(); }
         render
     }
 
@@ -183,25 +272,27 @@ impl<S: 'static> Host<S> {
     /// opens the pop-up menu it asked for, if the window is still there to open it over.
     pub(super) fn shell(&mut self, event_loop: &ActiveEventLoop) {
         self.show_title();
-        if self.rt.take_toggle_maximized() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
+        if self.rt.take_toggle_maximized() && let Some(w) = self.shown_win() {
             chrome::toggle_maximized(&w.window);
         }
-        if self.rt.take_toggle_full_screen() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
+        if self.rt.take_toggle_full_screen() && let Some(w) = self.shown_win() {
             chrome::toggle_full_screen(&w.window);
         }
-        if let Some(menu) = self.rt.take_window_menu() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
-            chrome::window_menu(&w.window, menu);
+        if let Some(menu) = self.rt.take_window_menu() && let Some(w) = self.shown_win() {
+            chrome::window_menu(&w.window, menu, None);
         }
         // A new `Cx::set_titlebar` or `Cx::titlebar_height` resizes the caption buttons and the band
         // the frame hit-tests, and moves the traffic lights.
         if self.rt.take_titlebar_changed() && let Some(w) = &self.win {
             sync_chrome(&mut self.rt, w, self.chrome, self.titlebar);
-            if self.rt.stale() { w.window.request_redraw(); }
+            if self.rt.stale() { w.request_redraw(); }
         }
         for _ in 0..8 {
             let minimize = std::mem::take(&mut self.rt.minimize_request);
             match self.rt.shell_request.take() {
-                Some(Shell::Quit) => {
+                Some(shell @ (Shell::Quit | Shell::Relaunch)) => {
+                    let after = shell.after().unwrap_or(crate::quit::After::Exit);
+                    let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
                     self.popup.cancel(&mut self.rt);
                     self.file_dialog.cancel(&mut self.rt);
                     event_loop.exit();
@@ -210,21 +301,20 @@ impl<S: 'static> Host<S> {
                 None if minimize => self.minimize(),
                 None => {}
             }
-            if self.finished || event_loop.exiting() {
+            if self.life.finished() || event_loop.exiting() {
                 self.popup.cancel(&mut self.rt);
                 self.file_dialog.cancel(&mut self.rt);
                 return;
             }
-            let shown = self.win.as_ref().filter(|w| w.visible);
-            let paints = shown.is_some_and(|w| !w.occluded && !w.minimized());
+            let paints = self.shown_win().is_some_and(|w| !self.life.covered() && !w.minimized());
             // A painting macOS window moves its frame over its next frames (`redraw`).
             if self.rt.window_frame.is_some() && !(paints && cfg!(target_os = "macos")) {
                 self.take_frame_request(self.frame_secs(Instant::now()), false);
             }
-            let shown = self.win.as_ref().filter(|w| w.visible);
+            let shown = self.win.as_ref().filter(|_| self.life.shown());
             let window = shown.map(|w| &w.window);
-            if self.popup.open(&mut self.rt, window, paints) && let Some(w) = window { w.request_redraw(); }
-            if self.file_dialog.open(&mut self.rt, window.map(|w| &**w)) && let Some(w) = window { w.request_redraw(); }
+            if self.popup.open(&mut self.rt, window, paints) && let Some(w) = shown { w.request_redraw(); }
+            if self.file_dialog.open(&mut self.rt, window.map(|w| &**w)) && let Some(w) = shown { w.request_redraw(); }
             // A callback that ran (a menu that couldn't open) may have asked to close, quit or
             // minimize.
             if self.rt.shell_request.is_none() && !self.rt.minimize_request { return; }
@@ -236,7 +326,7 @@ impl<S: 'static> Host<S> {
         if let Some(w) = &mut self.win {
             w.first_frame.hide();
             #[cfg(target_os = "macos")]
-            { w.native.prime = 0; }
+            { w.native.prime.stop(); }
         }
         self.secure_input.set(false);
         if !self.closes() { return; }
@@ -244,7 +334,10 @@ impl<S: 'static> Host<S> {
         self.rt.set_live_visible(false);
         // While the window still shows its last frames.
         if let Some(trace) = &mut self.trace { trace.settle_presents(crate::frame::present_time::SETTLE); }
-        if self.rt.shell_request.take() == Some(Shell::Quit) {
+        if let Some(after) = self.rt.shell_request.take().and_then(Shell::after) {
+            if after == crate::quit::After::Relaunch {
+                let _ = crate::quit::send(crate::quit::Event::Start { ending: false, after });
+            }
             self.popup.cancel(&mut self.rt);
             self.file_dialog.cancel(&mut self.rt);
             event_loop.exit();
@@ -256,14 +349,14 @@ impl<S: 'static> Host<S> {
             self.rt.cancel_pointer();
             self.files = FileDrop::default();
             if let Some(w) = &mut self.win { w.apply_cursor(&self.rt, false); w.hide(); }
-            self.finished = true;
+            self.life.finish();
             return;
         }
         self.hide(event_loop);
     }
 
-    /// Whether a close runs `on_close`: a window is shown, or hidden without `keep_running`.
-    pub(super) fn closes(&self) -> bool { self.win.as_ref().is_some_and(|w| w.visible || !self.keep_running) }
+    /// Whether a close runs `on_close` (`Life::closes`).
+    pub(super) fn closes(&self) -> bool { self.life.closes(self.keep_running, self.win.is_some()) }
 
     pub(super) fn close_hook(&mut self) {
         if let Some(f) = self.on_close {
@@ -274,7 +367,7 @@ impl<S: 'static> Host<S> {
     }
 
     pub(super) fn hide(&mut self, event_loop: &ActiveEventLoop) {
-        if self.win.as_ref().is_some_and(|w| w.visible) { self.hidden_at = Some(crate::platform::reopen::stamp()); }
+        self.life.hide(crate::platform::reopen::stamp);
         self.rt.minimize_request = false;
         self.land_frame();
         // Before the window can go: a hide need not report a blur. `about_to_wait` delivers it,
@@ -285,7 +378,7 @@ impl<S: 'static> Host<S> {
         if let Some(w) = &mut self.win {
             w.first_frame.hide();
             #[cfg(target_os = "macos")]
-            { w.native.prime = 0; }
+            { w.native.prime.stop(); }
         }
         self.secure_input.set(false);
         self.ime_allowed = false;
@@ -314,72 +407,11 @@ impl<S: 'static> Host<S> {
             self.native_handle.native.number.store(0, Ordering::Release);
         } else if let Some(w) = self.win.as_mut() {
             w.stop_pacing();
-            w.visible = false;
             w.retry = None;
             w.presented = None;
             // Its hidden frame delivers the focus loss.
-            if launcher { w.window.request_redraw(); }
+            if launcher { w.request_redraw(); }
         }
-    }
-
-    pub(super) fn open(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
-        if self.launcher() { self.reveal_launcher(event_loop); return; }
-        // A minimized window drew nothing either, so it comes back as a hidden one does.
-        let restoring = self.win.as_ref().is_some_and(|w| w.window.is_minimized() == Some(true));
-        let built = self.win.as_ref().is_some_and(|w| !w.visible || restoring) && self.build_for_show();
-        self.apply_placement(event_loop);
-        // The launcher's startup token belongs to the first window only.
-        #[allow(unused_mut)]
-        let mut from_env = None;
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if !self.shown {
-            use winit::platform::startup_notify::{EventLoopExtStartupNotify, reset_activation_token_env};
-            from_env = event_loop.read_token_from_env().map(|t| t.into_raw());
-            reset_activation_token_env();
-        }
-        let token = token.or(from_env);
-        let Some(w) = self.win.as_mut() else {
-            self.create(event_loop, token, true);
-            // On macOS a new window becomes key without activating the app, so activate it
-            // like a reopen does. The launch open leaves activation to the platform.
-            #[cfg(target_os = "macos")]
-            if self.started && let Some(w) = self.win.as_ref().filter(|w| w.visible) { w.focus(); }
-            return;
-        };
-        if !w.visible {
-            w.show(false);
-            w.visible = true;
-            if !built { self.rt.settle_all(); }
-            self.idle = true;
-        }
-        if restoring {
-            w.window.set_minimized(false);
-            if !built { self.rt.settle_all(); }
-        }
-        w.occluded = false;
-        self.rt.set_live_visible(true);
-        self.rt.cancel_timer_frame();
-        self.native_handle.native.number.store(native_window_number(&w.window).unwrap_or(0), Ordering::Release);
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if is_wayland(event_loop) {
-            match token {
-                Some(token) => {
-                    if w.native.activator.is_none() {
-                        w.native.activator = crate::platform::activation::Activator::new(&w.window);
-                    }
-                    if let Some(a) = w.native.activator.as_mut() {
-                        a.activate(&token);
-                    }
-                }
-                // Without a token the compositor may only mark the window urgent.
-                None => w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational)),
-            }
-            w.window.request_redraw();
-            return;
-        }
-        let _ = token;
-        w.focus();
-        w.window.request_redraw();
     }
 
     /// Creates the window, or records why it can't be and leaves the app windowless; a later

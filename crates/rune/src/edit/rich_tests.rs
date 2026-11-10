@@ -733,7 +733,7 @@ fn undo_group_is_unwind_safe_and_interacts_with_clear_history_paste_and_soft_bre
             panic!("boom");
         });
     }));
-    assert!(e.group.0.is_none(), "unwinding clears the active group");
+    assert!(!e.group.is_open(), "unwinding clears the active group");
     e.insert("?");
     assert_eq!(e.history.undo.len(), 1, "edits after a caught panic record again");
     e.undo();
@@ -810,12 +810,12 @@ fn an_undo_group_leaves_ime_composition_alone() {
     e.set_caret(1);
     e.ime(&Ime::Preedit("に".into(), None));
     e.undo_group(|e| e.ime(&Ime::Commit("日本".into())));
-    assert_eq!((e.text.as_str(), e.preedit.is_none()), ("x日本", true));
+    assert_eq!((e.text.as_str(), e.preedit().is_none()), ("x日本", true));
     undo(&mut e, false);
     assert_eq!(e.text, "x");
     e.ime(&Ime::Preedit("a".into(), None));
     e.undo_group(|e| e.undo());
-    assert!(e.preedit.is_some(), "undo inside a group does nothing");
+    assert!(e.preedit().is_some(), "undo inside a group does nothing");
 }
 
 #[test]
@@ -1046,7 +1046,7 @@ fn pill_edge_cases_words_lines_bidi_and_direct_text_mutation() {
     m.set_caret(0);
     m.toggle_mark(Mark::Pill("x".into()));
     m.set_mark(Mark::Pill("x".into()));
-    assert!(m.pending.is_none());
+    assert_eq!(m.typing, Typing::Inherited);
     m.set_selection(2, 10);
     m.set_mark(Mark::Pill("agent:y".into()));
     assert_eq!(pills_of(&m), [(2..10, "agent:y".to_owned())]);

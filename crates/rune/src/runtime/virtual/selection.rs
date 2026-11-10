@@ -10,7 +10,7 @@ use std::rc::Rc;
 use taffy::style::{Display, FlexDirection};
 
 use super::{
-    Held, SelectedText, Unit, floor_boundary, kept, same_keyed_path, trim_uncopied,
+    Held, SelectedText, Unit, kept, same_keyed_path, trim_uncopied,
 };
 use crate::el::{El, SelectionCopy, TextSpec};
 use crate::runtime::Runtime;
@@ -125,15 +125,15 @@ fn walk_row_el<'a>(
     texts: &mut Vec<OffscreenText>,
     copy_providers: &mut Vec<(String, SelectionCopy)>,
 ) {
-    let inert = parent_inert || el.inert;
-    let group = if el.selection_group { Some(path) } else { parent_group };
+    let inert = parent_inert || el.flags.has(crate::el::ElFlags::INERT);
+    let group = if el.flags.has(crate::el::ElFlags::SELECTION_GROUP) { Some(path) } else { parent_group };
     if !inert && let Some(f) = el.handlers.get().and_then(|h| h.selection_copy.as_ref()) {
         copy_providers.push((path.to_owned(), f.clone()));
     }
     let is_row = el.style.display() == Display::Flex
         && matches!(el.style.flex_direction(), FlexDirection::Row | FlexDirection::RowReverse);
     let mut had_child_text = false;
-    if !inert && el.input.is_none() && let Some(t) = &el.text && t.selectable && !t.redacted {
+    if !inert && el.cold.input.is_none() && let Some(t) = &el.text && t.selectable && !t.redacted {
         let mut spec = TextSpec::clone(t);
         spec.apply_case();
         texts.push(OffscreenText {
@@ -168,25 +168,6 @@ fn walk_row_el<'a>(
     }
 }
 
-/// Appends `piece` to `out` with `sep` before it, truncating on a UTF-8 character boundary if
-/// `cap` is reached. Returns `true` when the byte cap was hit.
-pub(super) fn push_capped(out: &mut String, piece: &str, sep: Option<char>, cap: usize) -> bool {
-    if let Some(c) = sep {
-        if out.len() + c.len_utf8() > cap {
-            return true;
-        }
-        out.push(c);
-    }
-    if out.len() + piece.len() <= cap {
-        out.push_str(piece);
-        false
-    } else {
-        let take = floor_boundary(piece, cap.saturating_sub(out.len()));
-        out.push_str(&piece[..take]);
-        true
-    }
-}
-
 pub(super) fn offscreen_piece(t: &OffscreenText, range: Range<usize>, base: Option<&str>) -> SelectedText {
     let path = match base {
         Some(b) if b == t.path => String::new(),
@@ -201,7 +182,8 @@ pub(super) fn offscreen_piece(t: &OffscreenText, range: Range<usize>, base: Opti
     };
     let whole = !range.is_empty() && len > 0 && range.start <= full_a && range.end >= full_b;
     let text = t.spec.copy_slice(range.start as u32, range.end as u32).unwrap_or_default();
-    SelectedText { path, key: t.key.clone(), range, len, whole, text }
+    let content = t.spec.content.get(range.clone()).unwrap_or_default().to_owned();
+    SelectedText { path, key: t.key.clone(), range, len, whole, text, content }
 }
 
 impl<S: 'static> Runtime<S> {
