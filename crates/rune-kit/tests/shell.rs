@@ -859,3 +859,34 @@ fn select_only_rows_skip_tab_and_keep_an_outside_field_focused() {
     assert_eq!(focused(&rt), ["input"], "selection change never pulls focus from the field");
     assert!(row(&rt, 0).item_selected && !row(&rt, 2).item_selected);
 }
+
+#[test]
+fn a_set_toolbar_height_moves_the_sidebar_band_and_toggle_and_the_divider_takes_no_room() {
+    fn view(s: &S, _: &mut Cx<S>) -> El {
+        let k = Kit::neutral(true);
+        let sidebar = Sidebar::new().label("Sessions");
+        SplitView::new(col().key("body"))
+            .sidebar(&s.sidebar, |s: &mut S| &mut s.sidebar, sidebar.build(&k))
+            .toolbar(Toolbar::new().leading(el().key("lead").size(20.0, 20.0)).height(40.0).divider())
+            .build(&k)
+    }
+    let mut rt = Runtime::new(state(), view, (1000.0, 600.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    let toolbar = find(&rt, "toolbar");
+    assert_eq!(toolbar.rect[3], 40.0);
+    assert_eq!(find(&rt, "sidebar-titlebar").rect[3], 40.0, "the sidebar's band follows the toolbar");
+    let toggle = find(&rt, "sidebar-toggle");
+    assert_eq!(toggle.rect[1] + toggle.rect[3] / 2.0, 20.0, "the toggle centres in the shorter band");
+    let divider = find(&rt, "toolbar-divider");
+    assert_eq!((divider.rect[2], divider.rect[3]), (toolbar.rect[2], 1.0));
+    assert_eq!(divider.rect[1] + 1.0, toolbar.rect[1] + toolbar.rect[3], "it lies on the band's bottom edge");
+    let lead = find(&rt, "lead");
+    assert_eq!(lead.rect[0], toolbar.rect[0] + 12.0, "the hairline is out of flow");
+    assert_eq!(lead.rect[1] + lead.rect[3] / 2.0, toolbar.rect[1] + 20.0);
+
+    let mut plain = runtime(state());
+    plain.frame(1.0 / 60.0);
+    assert_eq!(find(&plain, "toolbar").rect[3], 48.0, "an unset height keeps the default band");
+    assert_eq!(find(&plain, "sidebar-titlebar").rect[3], 48.0);
+    assert!(plain.elements().iter().all(|e| e.key.as_deref() != Some("toolbar-divider")));
+}
