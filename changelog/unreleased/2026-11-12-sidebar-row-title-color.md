@@ -1,0 +1,1 @@
+- **`SidebarRow::title_color` sets the title's colour while the row isn't selected**, for a row that is an aside, such as "Show 18 more" in the faint text colour. A selected row keeps the base text colour.

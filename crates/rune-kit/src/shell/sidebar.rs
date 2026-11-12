@@ -170,6 +170,8 @@ impl Default for Sidebar {
 pub struct SidebarHeader {
     title: String,
     count: Option<String>,
+    count_trailing: bool,
+    height: Option<f32>,
     collapsed: Option<bool>,
     action: Option<El>,
     toggle: Option<Apply>,
@@ -177,7 +179,7 @@ pub struct SidebarHeader {
 
 impl SidebarHeader {
     pub fn new(title: impl Into<String>) -> SidebarHeader {
-        SidebarHeader { title: title.into(), count: None, collapsed: None, action: None, toggle: None }
+        SidebarHeader { title: title.into(), count: None, count_trailing: false, height: None, collapsed: None, action: None, toggle: None }
     }
     /// Shows a disclosure triangle for this state. Without it, or `on_toggle`, the header is
     /// a plain label.
@@ -187,6 +189,18 @@ impl SidebarHeader {
     }
     pub fn count(mut self, n: usize) -> Self {
         self.count = Some(n.to_string());
+        self
+    }
+    /// Puts the count at the header's end, in tabular figures, so the counts of a list's
+    /// sections form a column. By default it follows the title.
+    pub fn count_trailing(mut self) -> Self {
+        self.count_trailing = true;
+        self
+    }
+    /// The header's height (default [`ROW_HEIGHT`], with its text set 4 points low so it sits
+    /// nearer its rows). A set height centres the text.
+    pub fn height(mut self, points: f32) -> Self {
+        self.height = Some(points);
         self
     }
     /// A trailing element, such as a small "+" icon button.
@@ -209,9 +223,10 @@ impl SidebarHeader {
             .shrink()
             .child(text(self.title.clone()).font(k.ty.text_xsmall_medium).color(c.text_muted).truncate().shrink());
         let counted = self.count.as_ref().map(|n| format!("{n} items")).unwrap_or_default();
-        if let Some(n) = self.count {
-            title = title.child(text(n).key("count").font(k.ty.text_xsmall_medium).color(c.text_faint));
-        }
+        let figures = if self.count_trailing { k.ty.text_xsmall_medium.features("'tnum' 1") } else { k.ty.text_xsmall_medium };
+        let count = self.count.map(|n| text(n).key("count").font(figures).color(c.text_faint));
+        let (beside, trailing) = if self.count_trailing { (None, count) } else { (count, None) };
+        title = title.children(beside);
         if let Some(collapsed) = self.collapsed {
             let glyph = if collapsed { k.glyph.triangle_right } else { k.glyph.triangle_down };
             title = title.child(icon(glyph, 12.0).key("disclosure").color(c.icon_faint));
@@ -222,13 +237,14 @@ impl SidebarHeader {
             .label(self.title)
             .description(counted)
             .w_full()
-            .h(ROW_HEIGHT)
-            .pt(4.0)
+            .h(self.height.unwrap_or(ROW_HEIGHT))
+            .pt(if self.height.is_some() { 0.0 } else { 4.0 })
             .px(INSET)
             .center_y()
             .radius(k.radius.md)
             .child(title.a11y_hidden())
-            .child(el().key("spacer").grow(1.0).a11y_hidden());
+            .child(el().key("spacer").grow(1.0).a11y_hidden())
+            .children(trailing.map(El::a11y_hidden));
         if let Some(a) = self.action {
             header = header.child(a);
         }
@@ -268,6 +284,16 @@ impl SidebarSection {
     }
     pub fn count(mut self, n: usize) -> Self {
         self.header = self.header.count(n);
+        self
+    }
+    /// See [`SidebarHeader::count_trailing`].
+    pub fn count_trailing(mut self) -> Self {
+        self.header = self.header.count_trailing();
+        self
+    }
+    /// See [`SidebarHeader::height`].
+    pub fn header_height(mut self, points: f32) -> Self {
+        self.header = self.header.height(points);
         self
     }
     pub fn action(mut self, e: El) -> Self {
@@ -340,6 +366,7 @@ pub struct SidebarRow {
     depth: u8,
     height: Option<f32>,
     title_style: Option<TextStyle>,
+    title_color: Option<Color>,
     subtitle_style: Option<TextStyle>,
     subtitle_color: Option<Color>,
     select_only: bool,
@@ -364,6 +391,7 @@ impl SidebarRow {
             depth: 0,
             height: None,
             title_style: None,
+            title_color: None,
             subtitle_style: None,
             subtitle_color: None,
             select_only: false,
@@ -395,6 +423,13 @@ impl SidebarRow {
         self
     }
     /// The subtitle's type, in place of the default (the kit's `caption`).
+    /// The title's colour while the row isn't selected (default the theme's muted text): a
+    /// fainter one for a row that is an aside, such as "Show 18 more". A selected row keeps
+    /// the base text colour.
+    pub fn title_color(mut self, color: Color) -> Self {
+        self.title_color = Some(color);
+        self
+    }
     pub fn subtitle_style(mut self, style: TextStyle) -> Self {
         self.subtitle_style = Some(style);
         self
@@ -541,7 +576,7 @@ impl SidebarRow {
     pub fn build(self, k: &Kit) -> El {
         let c = &k.c;
         let renaming = self.rename.is_some();
-        let (ink, glyph) = if self.selected { (c.text_base, c.icon_base) } else { (c.text_muted, c.icon_muted) };
+        let (ink, glyph) = if self.selected { (c.text_base, c.icon_base) } else { (self.title_color.unwrap_or(c.text_muted), c.icon_muted) };
         let two_lines = self.subtitle.is_some();
         let height = self.height.unwrap_or(if two_lines { TWO_LINE_ROW_HEIGHT } else { ROW_HEIGHT });
         let font = self.title_style.unwrap_or(if two_lines {

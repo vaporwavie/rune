@@ -890,3 +890,47 @@ fn a_set_toolbar_height_moves_the_sidebar_band_and_toggle_and_the_divider_takes_
     assert_eq!(find(&plain, "sidebar-titlebar").rect[3], 48.0);
     assert!(plain.elements().iter().all(|e| e.key.as_deref() != Some("toolbar-divider")));
 }
+
+#[test]
+fn a_section_header_takes_a_height_and_a_trailing_count_and_a_row_takes_a_title_colour() {
+    fn view(_: &(), _: &mut Cx<()>) -> El {
+        let k = Kit::neutral(true);
+        let faint = k.c.text_faint;
+        col().w(240.0)
+            .child(
+                SidebarSection::new("Short")
+                    .count(4)
+                    .count_trailing()
+                    .header_height(24.0)
+                    .row(SidebarRow::new("More").title_color(faint).build(&k).key("aside"))
+                    .row(SidebarRow::new("Picked").title_color(faint).selected(true).build(&k).key("picked"))
+                    .build(&k),
+            )
+            .child(SidebarSection::new("Plain").count(4).row(SidebarRow::new("Row").build(&k).key("plain-row")).build(&k))
+    }
+    let k = Kit::neutral(true);
+    let mut rt = Runtime::new((), view, (240.0, 300.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    let elements = rt.elements();
+    let under = |section: &str, key: &str| {
+        elements
+            .iter()
+            .find(|e| e.path.contains(&format!("{section}/")) && e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no {key} in {section}"))
+            .clone()
+    };
+    let (header, count) = (under("Short", "section-header"), under("Short", "count"));
+    assert_eq!(header.rect[3], 24.0);
+    assert_eq!(count.rect[0] + count.rect[2], header.rect[0] + header.rect[2] - 8.0, "the count ends the header");
+    assert!((count.rect[1] + count.rect[3] / 2.0 - header.rect[1] - 12.0).abs() <= 0.5, "a set height centres the text");
+    assert_eq!(header.label.as_deref(), Some("Short"), "the header is still named and counted for a reader");
+
+    let (plain, beside) = (under("Plain", "section-header"), under("Plain", "count"));
+    assert_eq!(plain.rect[3], 28.0, "an unset height keeps the row height");
+    assert!(beside.rect[0] + beside.rect[2] < plain.rect[0] + plain.rect[2] / 2.0, "by default the count follows the title");
+
+    let ink = |row: &str| under(row, "label").text_color;
+    assert_eq!(ink("aside"), Some(k.c.text_faint));
+    assert_eq!(ink("picked"), Some(k.c.text_base), "a selected row keeps the base ink");
+    assert_eq!(ink("plain-row"), Some(k.c.text_muted));
+}
