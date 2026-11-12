@@ -1,6 +1,6 @@
 //! A window's toolbar: leading, centre and trailing slots in a band the window drags by.
 
-use rune::{El, SystemMaterial, row, text};
+use rune::{El, SystemMaterial, el, row, text};
 
 use crate::Kit;
 
@@ -19,12 +19,14 @@ pub struct Toolbar {
     title: Option<String>,
     trailing: Vec<El>,
     pad: Option<f32>,
+    height: Option<f32>,
+    divider: bool,
     material: Option<SystemMaterial>,
 }
 
 impl Toolbar {
     pub fn new() -> Toolbar {
-        Toolbar { leading: Vec::new(), center: None, title: None, trailing: Vec::new(), pad: None, material: None }
+        Toolbar { leading: Vec::new(), center: None, title: None, trailing: Vec::new(), pad: None, height: None, divider: false, material: None }
     }
     pub fn leading(mut self, e: El) -> Self {
         self.leading.push(e);
@@ -46,6 +48,19 @@ impl Toolbar {
         self.center = None;
         self
     }
+    /// The band's height (default [`TOOLBAR_HEIGHT`]). A `SplitView` gives its sidebar's title
+    /// bar row the same height and centres the sidebar toggle in it. The traffic lights are
+    /// the window's: an app that changes the height moves them in its `Chrome` to match.
+    pub fn height(mut self, points: f32) -> Self {
+        self.height = Some(points);
+        self
+    }
+    /// A hairline along the band's bottom edge, for a band over content that scrolls under it.
+    /// It is drawn inside the band and takes no room.
+    pub fn divider(mut self) -> Self {
+        self.divider = true;
+        self
+    }
     /// Backs the band with a system material (macOS blurs what's behind a transparent
     /// window). Elsewhere, and headless, the kit's base background draws instead.
     pub fn material(mut self, m: SystemMaterial) -> Self {
@@ -59,11 +74,16 @@ impl Toolbar {
         self
     }
 
+    pub(super) fn band_height(&self) -> f32 {
+        self.height.unwrap_or(TOOLBAR_HEIGHT)
+    }
+
     pub fn build(self, k: &Kit) -> El {
         let c = &k.c;
         let pl = self.pad.unwrap_or(PAD);
+        let height = self.band_height();
         let mut band =
-            row().key("toolbar").role("toolbar").w_full().h(TOOLBAR_HEIGHT).pl(pl).pr(PAD).gap(8.0).center_y().window_drag();
+            row().key("toolbar").role("toolbar").w_full().h(height).pl(pl).pr(PAD).gap(8.0).center_y().window_drag();
         if let Some(t) = &self.title {
             band = band.label(t.clone());
         }
@@ -85,6 +105,10 @@ impl Toolbar {
             .child(row().key("leading").gap(4.0).center_y().shrink().min_w(0.0).children(self.leading))
             .child(row().key("spacer").grow(1.0).a11y_hidden())
             .child(row().key("trailing").gap(4.0).center_y().children(self.trailing));
+        if self.divider {
+            band = band
+                .child(el().key("toolbar-divider").pin(Some(0.0), None, Some(0.0), Some(0.0)).h(1.0).fill(c.border_muted).a11y_hidden());
+        }
         if let Some(m) = self.material {
             band = band.system_material(m).fill(c.bg_base);
         }

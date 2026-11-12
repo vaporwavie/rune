@@ -251,6 +251,7 @@ impl SplitView {
         let t = self.toggle;
         let side = t.side();
         let top = if self.in_panel { self.frame } else { 0.0 };
+        let band_height = self.toolbar.as_ref().map_or(TOOLBAR_HEIGHT, Toolbar::band_height);
         let sidebar_state = self.sidebar.as_ref().map(|p| p.state);
         let sidebar_open = sidebar_state.is_some_and(|s| s.is_open());
         let inspector_state = self.inspector.as_ref().map(|p| p.state);
@@ -293,7 +294,7 @@ impl SplitView {
                     button = button.child(dot.absolute(side - 5.0, -2.0).opacity(if open { 0.0 } else { 1.0 }).opacity_motion(fade));
                 }
                 let x = if open && t.in_header { s.width() - self.padding[1] - side } else { lights };
-                let mut b = tg(button).key("sidebar-toggle").absolute(x, top + (TOOLBAR_HEIGHT - side) / 2.0).motion(spring);
+                let mut b = tg(button).key("sidebar-toggle").absolute(x, top + (band_height - side) / 2.0).motion(spring);
                 if let (Some(pk), Some(h)) = (peek, &hover)
                     && !open
                 {
@@ -310,7 +311,7 @@ impl SplitView {
                     let hold = el().key("sidebar-peek-hold").pin(Some(0.0), Some(0.0), None, Some(0.0)).w(s.width() + pk.margin);
                     zones.push(h(hold.transition(instant), Duration::ZERO, pk.grace, false));
                 } else if !open && !s.is_resizing() {
-                    let below = pk.below.unwrap_or(top + TOOLBAR_HEIGHT);
+                    let below = pk.below.unwrap_or(top + band_height);
                     let edge = el().key("sidebar-peek-edge").pin(Some(0.0), Some(below), None, Some(0.0)).w(self.frame + pk.edge);
                     zones.push(h(edge.transition(instant), pk.edge_delay, Duration::ZERO, true));
                 }
@@ -327,7 +328,7 @@ impl SplitView {
             let mut band = row()
                 .key("sidebar-titlebar")
                 .w_full()
-                .h(top + TOOLBAR_HEIGHT)
+                .h(top + band_height)
                 .pt(top)
                 .center_y()
                 .window_drag()
