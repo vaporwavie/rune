@@ -1,0 +1,1 @@
+- **`SidebarHeader::height` and `SidebarHeader::count_trailing`**, with `SidebarSection::header_height` and `SidebarSection::count_trailing` passing them through. A set height centres the header's text, where the default 28 point header sets it 4 points low. A trailing count sits at the header's end in tabular figures, so the counts of a list's sections form a column.
