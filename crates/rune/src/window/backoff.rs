@@ -37,7 +37,8 @@ pub(crate) enum BackoffEvent {
     /// own deadline retries it, which the window waits on once rather than twice.
     HiddenMissed { preparing: bool, now: Instant },
     /// The window is tried again at `at` for a reason with no backoff of its own: a surface being
-    /// replaced, or a timer pacing motion no display link drives (macOS).
+    /// replaced, a timer pacing motion no display link drives, or a frame carrying input that
+    /// draws half a refresh after the last one (macOS, `DisplayLink::input_at`).
     At(Instant),
     /// The wait ran out, or the window takes the frame anyway: nothing waits now. Both waits keep
     /// their backoff: nothing has shown that the surface can draw.

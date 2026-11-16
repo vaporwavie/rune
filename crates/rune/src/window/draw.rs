@@ -152,7 +152,14 @@ impl<S: 'static> Host<S> {
             if l.native.prime.presumes() && !pacing.running() {
                 None
             } else {
-                let Some(target) = pacing.next_frame().target() else { return };
+                let input = self.rt.input_queued();
+                let next = pacing.next_frame(input);
+                let Some(target) = next.target() else {
+                    // Input on a surface no tick paces draws half a refresh after the last frame,
+                    // rather than on the first tick of the link it just started.
+                    if let Some(at) = pacing.input_at().filter(|_| input) { l.backoff_step(BackoffEvent::At(at)); }
+                    return;
+                };
                 target
             }
         } else { None };
@@ -231,7 +238,7 @@ impl<S: 'static> Host<S> {
         };
         // It draws: the link starts, and still says draw at once.
         #[cfg(target_os = "macos")]
-        if deferred && let Some(pacing) = &mut l.native.pacing { let _ = pacing.next_frame(); }
+        if deferred && let Some(pacing) = &mut l.native.pacing { let _ = pacing.next_frame(false); }
         #[cfg(feature = "frame-profile")]
         let fp_start = crate::frame::live_log::on().then(crate::frame::live_log::Stamp::now);
         let Some(surface) = l.surface.as_ref() else { return };

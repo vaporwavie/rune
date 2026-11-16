@@ -1,6 +1,8 @@
 //! One drawable submission per display tick. Metal's drawable pool is not a frame clock:
-//! acquisition may return immediately even with FIFO presentation enabled. The exception is a
-//! frame after rest, such as the first after a key press: it draws at once (`rested`).
+//! acquisition may return immediately even with FIFO presentation enabled. The exceptions are a
+//! frame after rest, such as the first after a key press: it draws at once (`rested`); and a frame
+//! carrying input on a surface no tick is drawing, such as one an opacity cycle steps at 30 fps:
+//! it draws half a refresh after the last (`prompt`), not on the tick of a link it has to start.
 //!
 //! Low Power Mode caps a ProMotion panel at 60 Hz while CVDisplayLink, CADisplayLink and
 //! NSScreen all still report 120 Hz. Submitting on every tick then fills the drawable queue
@@ -29,6 +31,9 @@ pub(crate) struct DisplayLink {
     callback: Box<Callback>,
     last_present: Option<Instant>,
     last_target: Option<Instant>,
+    /// Whether the last frame drew on a tick: the surface is paced by the display, and a frame
+    /// carrying input waits for the next tick like any other.
+    last_tick: bool,
     display: Option<u32>,
     capped: bool,
     running: bool,
@@ -122,7 +127,7 @@ impl DisplayLink {
         });
         let status = unsafe { link.set_output_callback(Some(tick), (&mut *callback as *mut Callback).cast()) };
         if status != 0 { eprintln!("display link callback failed: {status}"); return None; }
-        let mut pacing = Self { link, callback, last_present: None, last_target: None, display: None, capped: false, running: false };
+        let mut pacing = Self { link, callback, last_present: None, last_target: None, last_tick: false, display: None, capped: false, running: false };
         pacing.update_display(window);
         Some(pacing)
     }
@@ -157,20 +162,29 @@ impl DisplayLink {
     }
 
     /// Claims one display opportunity: a tick and its target presentation time, or at once
-    /// when the surface has rested (`rested`). Consume before rendering so a tick arriving
-    /// during rendering can queue the next opportunity.
-    pub(crate) fn next_frame(&mut self) -> Opportunity {
+    /// when the surface has rested (`rested`), or when `input` waits and no tick paces the
+    /// surface (`prompt`). Consume before rendering so a tick arriving during rendering can queue
+    /// the next opportunity.
+    pub(crate) fn next_frame(&mut self, input: bool) -> Opportunity {
         if !self.start() { return Opportunity::Now; }
         let host_target = self.callback.target.swap(0, Ordering::Acquire);
         let now = Instant::now();
         let tick = (host_target != 0).then(|| target_time(now, CVGetCurrentHostTime(), host_target, self.callback.host_frequency));
-        let next = opportunity(tick, self.last_present, self.last_target, now, self.frame_period());
+        let next = opportunity(tick, self.last_present, self.last_target, now, self.frame_period(), input && !self.last_tick);
         match next {
-            Opportunity::Tick(target) => self.last_target = Some(target),
-            Opportunity::Now => self.last_target = Some(now),
+            Opportunity::Tick(target) => (self.last_target, self.last_tick) = (Some(target), true),
+            Opportunity::Now => (self.last_target, self.last_tick) = (Some(now), false),
             Opportunity::Wait => {}
         }
         next
+    }
+
+    /// When a frame carrying input that got `Wait` may draw at once: half a refresh after the last
+    /// frame, when no tick paces the surface. A link that was stopped takes a refresh or two to
+    /// tick after it starts, so the window draws then instead.
+    pub(crate) fn input_at(&self) -> Option<Instant> {
+        if self.last_tick { return None; }
+        self.last_present.map(|last| last + self.frame_period() / 2)
     }
 
     /// Whether a frame that may draw nothing (a timer's, on a resting surface) can decide that
@@ -226,13 +240,15 @@ impl Opportunity {
 }
 
 /// A fresh tick wins. Without one, a surface that has rested draws at once rather than wait
-/// for the link to start or tick, which after idle took one to two refreshes.
-fn opportunity(tick: Option<Instant>, last: Option<Instant>, last_target: Option<Instant>, now: Instant, period: Duration) -> Opportunity {
+/// for the link to start or tick, which after idle took one to two refreshes; so does `input` on
+/// a surface no tick paces, once `prompt` allows.
+fn opportunity(tick: Option<Instant>, last: Option<Instant>, last_target: Option<Instant>, now: Instant, period: Duration, input: bool) -> Opportunity {
     // A late render followed by an on-time tick must skip, not submit two frames
     // together. Also discard stale callbacks after main-thread stalls.
     match tick {
         Some(target) if permits(last, last_target, target, now, period) => Opportunity::Tick(target),
         _ if rested(last, last_target, now, period) => Opportunity::Now,
+        _ if input && prompt(last, last_target, now, period) => Opportunity::Now,
         _ => Opportunity::Wait,
     }
 }
@@ -249,6 +265,15 @@ fn permits(last: Option<Instant>, last_target: Option<Instant>, target: Instant,
 fn rested(last: Option<Instant>, last_target: Option<Instant>, now: Instant, period: Duration) -> bool {
     last_target.is_none_or(|target| target <= now)
         && last.is_none_or(|last| now.saturating_duration_since(last) >= period * 3 / 2)
+}
+
+/// Whether a frame carrying input may draw at once on a surface no tick paces (its last frame
+/// drew at once, as a timer's or an opacity cycle's step does): the last frame aimed at no later
+/// refresh, and half of one has gone by since it was submitted. At most two frames then reach
+/// one refresh, and the input's shows on the next one instead of after the link's first tick.
+fn prompt(last: Option<Instant>, last_target: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last_target.is_none_or(|target| target <= now)
+        && last.is_none_or(|last| now.saturating_duration_since(last) >= period / 2)
 }
 
 /// A stopped link has no tick waiting (`stop` clears it), so a rested surface's next frame is
@@ -269,7 +294,7 @@ mod tests {
         // A timer 33 ms after the last frame: whenever it starts the link, it draws at once.
         assert!(defers_start(false, Some(ms(100)), Some(ms(104)), ms(133), period));
         for later in [133, 134, 150, 500] {
-            assert_eq!(opportunity(None, Some(ms(100)), Some(ms(104)), ms(later), period), Opportunity::Now);
+            assert_eq!(opportunity(None, Some(ms(100)), Some(ms(104)), ms(later), period, false), Opportunity::Now);
         }
         assert!(defers_start(false, None, None, ms(0), period));
         // The last frame may still be queued: start the link now and wait for its tick.
@@ -309,12 +334,31 @@ mod tests {
         let ms = |n| t + Duration::from_millis(n);
         let period = Duration::from_millis(8);
         // The link just started after idle: no tick yet, the last frame long gone.
-        assert_eq!(opportunity(None, Some(ms(0)), Some(ms(8)), ms(500), period), Opportunity::Now);
-        assert_eq!(opportunity(None, None, None, ms(0), period), Opportunity::Now);
+        assert_eq!(opportunity(None, Some(ms(0)), Some(ms(8)), ms(500), period, false), Opportunity::Now);
+        assert_eq!(opportunity(None, None, None, ms(0), period, false), Opportunity::Now);
         // A stale tick after a stall doesn't hold a rested surface either.
-        assert_eq!(opportunity(Some(ms(400)), Some(ms(0)), Some(ms(8)), ms(500), period), Opportunity::Now);
+        assert_eq!(opportunity(Some(ms(400)), Some(ms(0)), Some(ms(8)), ms(500), period, false), Opportunity::Now);
         // A fresh tick keeps its target.
-        assert_eq!(opportunity(Some(ms(510)), Some(ms(0)), Some(ms(8)), ms(500), period), Opportunity::Tick(ms(510)));
+        assert_eq!(opportunity(Some(ms(510)), Some(ms(0)), Some(ms(8)), ms(500), period, false), Opportunity::Tick(ms(510)));
+    }
+
+    #[test]
+    fn input_on_a_surface_no_tick_paces_draws_half_a_refresh_after_the_last_frame() {
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let period = Duration::from_millis(16);
+        // An opacity cycle's step drew at once at 100, with the link stopped after it.
+        let key = |now, input| opportunity(None, Some(ms(100)), Some(ms(100)), ms(now), period, input);
+        assert_eq!(key(104, true), Opportunity::Wait, "right after the step, it may still be on its way");
+        assert_eq!(key(108, true), Opportunity::Now, "half a refresh on, the key's frame draws");
+        assert_eq!(key(108, false), Opportunity::Wait, "a frame with no input still waits out the rest");
+        assert_eq!(key(124, false), Opportunity::Now);
+        // A frame aimed at a later refresh is still queued: input waits for the tick after it.
+        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(132)), ms(120), period, true), Opportunity::Wait);
+        // A fresh tick still wins, with its target.
+        assert_eq!(opportunity(Some(ms(140)), Some(ms(100)), Some(ms(100)), ms(120), period, true), Opportunity::Tick(ms(140)));
+        // Two keys in one refresh draw two frames at most.
+        assert_eq!(opportunity(None, Some(ms(108)), Some(ms(108)), ms(112), period, true), Opportunity::Wait);
     }
 
     #[test]
@@ -323,13 +367,13 @@ mod tests {
         let ms = |n| t + Duration::from_millis(n);
         let period = Duration::from_millis(8);
         // Submitted under a refresh and a half ago: it may still be queued.
-        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(111), period), Opportunity::Wait);
-        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(112), period), Opportunity::Now);
+        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(111), period, false), Opportunity::Wait);
+        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(112), period, false), Opportunity::Now);
         // Its target hasn't passed.
-        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(130)), ms(120), period), Opportunity::Wait);
+        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(130)), ms(120), period, false), Opportunity::Wait);
         // A Low Power cap stretches the period, and with it the rest.
-        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(118), Duration::from_millis(16)), Opportunity::Wait);
+        assert_eq!(opportunity(None, Some(ms(100)), Some(ms(100)), ms(118), Duration::from_millis(16), false), Opportunity::Wait);
         // While moving, a rejected tick right after a frame waits for the next one.
-        assert_eq!(opportunity(Some(ms(116)), Some(ms(100)), Some(ms(108)), ms(102), period), Opportunity::Wait);
+        assert_eq!(opportunity(Some(ms(116)), Some(ms(100)), Some(ms(108)), ms(102), period, false), Opportunity::Wait);
     }
 }

@@ -117,6 +117,11 @@ impl<S: 'static> Runtime<S> {
         self.queue.iter().any(|a| matches!(a, Action::Physical(..) | Action::Key { .. } | Action::KeyUp(_) | Action::WindowFocus(_) | Action::Files(_) | Action::FileDialog(..)))
     }
 
+    /// The user's input (a key, a press, the pointer, the wheel, text) waits for the next frame's
+    /// handlers, as `Tx::input_waiting` tells `poll`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn input_queued(&self) -> bool { self.queue.has_input() }
+
     /// The last committed frame is out of date: state changed (an update, poll or handler), or
     /// one asked for a scroll or text flight that waits for the next frame.
     pub(crate) fn needs_commit(&self) -> bool {

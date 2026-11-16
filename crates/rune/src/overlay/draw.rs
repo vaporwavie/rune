@@ -159,7 +159,7 @@ impl<T: 'static> Overlay<T> {
         };
         #[cfg(target_os = "macos")]
         let target = {
-            let opportunity = if prewarm { None } else { live.pacing.as_mut().map(|p| p.next_frame()) };
+            let opportunity = if prewarm { None } else { live.pacing.as_mut().map(|p| p.next_frame(false)) };
             let Some(target) = frame::claim(opportunity, || live.settle()) else { return false };
             target
         };
