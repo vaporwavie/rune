@@ -91,11 +91,14 @@ impl<S: 'static> Runtime<S> {
         // would wake the host again every frame interval.
         let due = self.wake_deadlines.partition_point(|t| *t <= self.clock);
         self.wake_deadlines.drain(..due);
+        // A glyph mask cache write that came due while nothing draws (`mask_cache`).
+        let _ = self.text.mask_cache_frame(false);
         let patched = self.patch_pending();
         let Some(poll) = self.poll else { return patched };
         let mut one = self.transaction();
         let changed = self.idle_meter.polled(crate::tooling::perf_warn::timed("poll", || app_call!(poll, &mut self.state, self.clock, &mut one)));
         self.dirty |= changed;
+        self.pending.polled_change |= changed;
         let asks_frame = one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.smoothing) || self.changes_families(&one) || (one.blur && self.focus.path().is_some());
         self.latch_requests(&mut one);
         let stale = changed || one.frame_work() || patched || asks_frame;
@@ -114,7 +117,8 @@ impl<S: 'static> Runtime<S> {
         if !self.rests() { return None; }
         let stale = self.poll_alone();
         let steps = self.pending.wakes.iter().any(|d| d.is_zero());
-        Some(stale || self.window_frame.is_some() || steps)
+        // A starved fill's wake draws the frame that resumes it; the poll alone never does.
+        Some(stale || self.window_frame.is_some() || steps || self.virtual_fill.resuming(self.clock))
     }
 
     /// Whether the host asked for a frame after `resting_wake`. That frame doesn't poll again
@@ -140,9 +144,14 @@ impl<S: 'static> Runtime<S> {
 
     /// Nothing but a timer asks this runtime for a frame.
     pub(crate) fn rests(&self) -> bool {
+        self.loop_wake.is_none() && self.rests_except_loop()
+    }
+
+    /// `rests`, apart from a loop's own wake (`paint_cycle_tick`).
+    pub(super) fn rests_except_loop(&self) -> bool {
         #[cfg(feature = "hot")]
         if self.hot.is_some() { return false; }
-        !self.animating && !self.stale() && !self.settle && self.loop_wake.is_none() && self.window_frame.is_none()
+        !self.animating && !self.stale() && !self.settle && self.window_frame.is_none()
             && !self.hover_delays.waiting() && !self.tooltip_waiting() && !self.press_repeat_waiting() && !self.drag_ends_pending()
             && self.drag_out_request.is_none() && !self.files_held() && !self.live_pending()
             && self.surfaces.is_empty() && !self.steps_frames()

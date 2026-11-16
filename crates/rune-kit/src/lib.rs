@@ -31,6 +31,7 @@ mod grip;
 pub mod image_zoom;
 mod keybind;
 pub mod kit;
+pub mod line_selection;
 mod list;
 #[cfg(feature = "markdown")]
 pub mod markdown;
@@ -47,6 +48,7 @@ mod popup_list;
 mod radio;
 mod rolling_text;
 mod scroll_bar;
+pub mod search;
 mod segmented;
 mod select;
 pub mod shell;

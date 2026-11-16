@@ -8,6 +8,7 @@ impl<S: 'static> AnyHost for Host<S> {
     }
     fn finished(&self) -> bool { self.life.finished() }
     fn keeps_loop(&self) -> bool { self.keeps_loop }
+    fn closing_ends_app(&mut self) { self.ends_app = true; }
     fn key(&self) -> Option<&str> { Some(self.native_handle.key()) }
     fn reopen_candidate(&self) -> crate::platform::reopen::Candidate {
         let shown = self.shown_win();
@@ -27,20 +28,34 @@ impl<S: 'static> AnyHost for Host<S> {
         // running link, a timer due sooner than a frame waits a frame (`timer_deadline`).
         let now = Instant::now();
         let win = self.win.as_ref();
-        let runtime = timer_deadline(&self.rt).filter(|_| !win.is_some_and(Win::paced));
+        // A frame waiting for room in the swap chain comes when there is (`slot`): its timers
+        // would turn the loop at once until then.
+        let runtime = timer_deadline(&self.rt).filter(|_| !win.is_some_and(|w| w.paced() || w.waits_for_slot()));
         // A due timer whose frame is still on its way takes the frame's bound instead
         // (`TimerFrame`), so the loop sleeps rather than waking at once for a frame that can't
         // come.
         let shown = self.shown_win();
         let runtime = shown.map_or(runtime, |w| w.timer_frame.wait(runtime, now));
+        #[cfg(target_os = "windows")]
+        let handover = win.and_then(|w| w.handover_deadline(now));
+        #[cfg(not(target_os = "windows"))]
+        let handover = None;
+        #[cfg(target_os = "windows")]
+        let covered_draw = win.and_then(|w| w.covered_draw.deadline());
+        #[cfg(not(target_os = "windows"))]
+        let covered_draw = None;
         runtime.into_iter()
+            .chain(handover)
+            .chain(covered_draw)
             .chain(win.and_then(|w| w.first_frame.deadline().map(|(retry, _)| retry)))
             .chain(win.and_then(|w| w.first_frame.ready_deadline()))
             .chain(win.and_then(Win::cloak_deadline))
-            .chain(win.and_then(|w| w.retry))
+            .chain(win.and_then(|w| w.backoff.deadline()))
             .chain(win.filter(|_| shown.is_none()).and_then(|w| w.hidden_pace.deadline()))
+            .chain(look_deadline(win))
             .chain(self.files.pointer.as_ref().filter(|_| shown.is_some()).map(|_| now + DROP_SAMPLE))
             .chain(shown.and_then(|w| w.cursor.reassert_at(now)))
+            .chain(self.rest.deadline())
             .min()
     }
 
@@ -49,6 +64,9 @@ impl<S: 'static> AnyHost for Host<S> {
     // What reaches the app's state runs in its turn scope (`App::turn_scope`).
     fn terminate(&mut self) { self.in_turn(Self::terminate_in_turn) }
     fn quit_hook(&mut self) { self.in_turn(Self::quit_hook_in_turn) }
+    fn vanish(&mut self) {
+        if let Some(w) = self.shown_win() { w.hide(); }
+    }
     fn cancel_menus(&mut self) { self.in_turn(Self::cancel_menus_in_turn) }
     fn reopen_hook(&mut self, event_loop: &ActiveEventLoop, has_visible_windows: bool) -> bool {
         self.in_turn(|h| h.reopen_hook_in_turn(event_loop, has_visible_windows))
@@ -157,6 +175,13 @@ impl<S: 'static> Host<S> {
         if matches!(cause, StartCause::ResumeTimeReached { .. }) && let Some(w) = &self.win { w.cursor.reassert(); }
         #[cfg(target_os = "windows")]
         if let Some(w) = &self.win { w.native.cloak.lift_if_due(&w.window, Instant::now()); }
+        #[cfg(target_os = "windows")]
+        self.watch_handover(Instant::now());
+        #[cfg(target_os = "windows")]
+        if let Some(w) = &mut self.win && w.covered_draw.due(Instant::now()) {
+            w.covered_draw = w.covered_draw.step(CoveredDrawEvent::Due);
+            w.request_redraw();
+        }
         if let Some(w) = &mut self.win && let Some((retry, until)) = w.first_frame.deadline() && retry <= Instant::now() {
             if until <= Instant::now() {
                 let notified = w.first_frame.notified();
@@ -176,17 +201,25 @@ impl<S: 'static> Host<S> {
             }
         }
         let launcher = self.launcher();
-        if let Some(w) = &mut self.win && w.retry.is_some_and(|retry| retry <= Instant::now()) {
-            w.retry = None;
+        if let Some(w) = &mut self.win && w.backoff.deadline().is_some_and(|at| at <= Instant::now()) {
+            w.backoff_step(BackoffEvent::Lapsed);
             // A missed frame marked it occluded; look at the surface again.
-            self.life.cover(false);
+            self.life.cover(Cover::Surface, false);
             if launcher || self.life.shown() { w.request_redraw(); }
         }
+        self.rest_step(RestEvent::Woke { now: Instant::now() });
         if let Some(w) = &mut self.win && !self.life.shown() && w.hidden_pace.take_due(Instant::now()) {
             w.request_redraw();
         }
+        // A covered window with motion on screen looks again whether it's still covered (`look`),
+        // without a frame: asked for while covered, one would draw (`CoveredDraw`) for no one.
+        #[cfg(target_os = "windows")]
+        if self.win.as_ref().is_some_and(|w| look_deadline(Some(w)).is_some_and(|at| at <= Instant::now())) && self.life.covered() {
+            self.look();
+        }
         if matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
             && timer_deadline(&self.rt).is_some_and(|deadline| deadline <= Instant::now())
+            && !self.win.as_ref().is_some_and(Win::waits_for_slot)
         {
             let hidden = self.shown_win().is_none();
             if hidden && !(launcher && self.hidden_launcher_renders()) {
@@ -206,8 +239,7 @@ impl<S: 'static> Host<S> {
                 // the next frame it asks for the stall bound afresh.
                 if self.win.as_ref().is_some_and(|w| w.timer_frame.stalled(now)) {
                     if let Some(w) = &mut self.win {
-                        w.timer_frame.drawn();
-                        w.timer_frame.asked(now);
+                        w.timer_frame.stalled_again(now);
                     }
                     covered_step(&mut self.rt);
                     self.clipboard.flush(&mut self.rt);
@@ -227,8 +259,7 @@ impl<S: 'static> Host<S> {
                         None => true,
                     };
                     if frame && let Some(w) = &mut self.win {
-                        w.quiet = true;
-                        w.timer_frame.asked(now);
+                        w.timer_frame.asked_quiet(now);
                         w.request_redraw();
                     }
                 }
@@ -253,6 +284,11 @@ impl<S: 'static> Host<S> {
         }
         self.hidden_input(event_loop);
         self.a11y_turn();
+        // After the first frame: its on_ready, hooks, the GPU's start and the accessibility
+        // adapter, one a turn, none while input waits; the loop turns again while some are owed.
+        #[cfg(target_os = "windows")]
+        return self.post_frame_turn();
+        #[cfg(not(target_os = "windows"))]
         false
     }
 
@@ -262,14 +298,30 @@ impl<S: 'static> Host<S> {
     }
 
     fn user_event_in_turn(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
+        #[cfg(feature = "frame-profile")]
+        let logged = Some(crate::frame::live_log::now());
         self.meter.waited();
         self.handle_user_event(event_loop, event);
         self.publish();
+        #[cfg(feature = "frame-profile")]
+        if let Some(start) = logged { crate::frame::live_log::wake(start); }
     }
 
     fn window_event_in_turn(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(feature = "frame-profile")]
+        let logged = (!matches!(event, WindowEvent::RedrawRequested)).then(crate::frame::live_log::now);
         if !matches!(event, WindowEvent::RedrawRequested) { self.meter.waited(); }
         self.handle_window_event(event_loop, id, event);
         self.publish();
+        #[cfg(feature = "frame-profile")]
+        if let Some(start) = logged { crate::frame::live_log::input(start); }
     }
+}
+
+/// When a covered window looks again whether it's still covered (`look`).
+fn look_deadline(win: Option<&Win>) -> Option<Instant> {
+    #[cfg(target_os = "windows")]
+    return win.and_then(|w| w.native.look.deadline());
+    #[cfg(not(target_os = "windows"))]
+    { let _ = win; None }
 }

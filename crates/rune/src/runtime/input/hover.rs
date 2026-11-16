@@ -59,10 +59,10 @@ struct Flip { i: usize, id: NodeId, on: bool, anim: Anim, changed: bool, now: bo
 /// and those of them entering.
 type Within = (Vec<String>, Vec<usize>);
 
-/// Viewport `s` moves content under a still pointer on its own: a glide, an app's instant
-/// scrolls frame after frame (a glide it steps itself), or slack letting rows down.
-fn scroll_carries(s: &ScrollState) -> bool {
-    s.glide().is_some() || s.x.glide.is_some() || s.nudged > 0 || s.slack.moving()
+/// Viewport `s` moves content under a still pointer on its own at `now`: a glide, an app's
+/// instant scrolls frame after frame (a glide it steps itself), or slack letting rows down.
+fn scroll_carries(s: &ScrollState, now: f64) -> bool {
+    s.glide().is_some() || s.x.glide.is_some() || s.hold_at(now) || s.slack.moving()
 }
 
 /// `inner` is `outer` or inside it.
@@ -193,7 +193,9 @@ impl<S: 'static> Runtime<S> {
         let heard = if n.handlers.hover_delay == [0.0; 2] { inside } else { shown };
         let Some(f) = n.handlers.on_hover_change.clone().filter(|_| heard) else { return };
         self.hover_gone.push((n.path.clone(), f));
+        let queued = self.queue.len();
         self.queue.push(Action::HoverChange(n.path.clone(), false));
+        self.queue.observe_since(queued);
     }
 
     /// The pointer moved or pressed, or a hand scrolled: hover follows the pointer through the
@@ -221,7 +223,7 @@ impl<S: 'static> Runtime<S> {
             let id = self.nodes[k].id;
             if store.is_animating(id, prop::FRAME) || store.is_animating(id, prop::OFFSET) || store.is_animating(id, prop::TRAVEL)
                 || self.stacks.get(&id).is_some_and(|s| s.moving) || self.grows.get(&id).is_some_and(|g| g.moving())
-                || self.scrolls.get(&id).is_some_and(scroll_carries)
+                || self.scrolls.get(&id).is_some_and(|s| scroll_carries(s, self.clock))
             {
                 return true;
             }
@@ -238,7 +240,7 @@ impl<S: 'static> Runtime<S> {
         !self.flying.is_empty()
             || self.stacks.values().any(|s| s.moving)
             || self.grows.values().any(|g| g.moving())
-            || self.scrolls.values().any(scroll_carries)
+            || self.scrolls.values().any(|s| scroll_carries(s, self.clock))
             || self.scene.store().active().any(|(_, p)| layout.contains(&p))
     }
 
@@ -269,13 +271,20 @@ impl<S: 'static> Runtime<S> {
             .max_by_key(|&i| self.nodes[i].path.len())
     }
 
-    /// The `hover_group_shared` keys of the elements under the pointer.
+    /// Keyboard focus shows on node `i` or inside it (CSS `:has(:focus-visible)`): a hover group
+    /// lights for it as for the pointer, so the controls it reveals (a row's actions, a tab's
+    /// close button) show when Tab reaches them rather than taking focus unseen.
+    fn keyboard_within(&self, i: usize) -> bool {
+        self.focus.keyboard() && self.focus_within(i)
+    }
+
+    /// The `hover_group_shared` keys of the elements under the pointer or holding keyboard focus.
     fn shared_hovered(&self) -> Vec<Rc<str>> {
-        let Some((x, y)) = self.pointer else { return Vec::new() };
+        let (x, y) = self.pointer.unwrap_or((f32::NAN, f32::NAN));
         (0..self.nodes.len())
             .filter_map(|i| {
                 let key = self.nodes[i].vis.hover_share.as_ref()?;
-                (!self.is_exiting(self.nodes[i].id) && self.allowed(i) && self.node_contains(i, x, y)).then(|| key.clone())
+                (!self.is_exiting(self.nodes[i].id) && self.allowed(i) && (self.node_contains(i, x, y) || self.keyboard_within(i))).then(|| key.clone())
             })
             .collect()
     }
@@ -288,7 +297,7 @@ impl<S: 'static> Runtime<S> {
         if !(n.vis.hover().a > 0.0 || n.vis_flags.hover_group()) || self.is_exiting(n.id) { return None; }
         let inside = self.pointer.is_some_and(|(x, y)| self.node_contains(i, x, y))
             || n.vis.hover_share.as_ref().is_some_and(|k| shared.contains(k))
-            || (n.vis.hover_focus && self.focus.keyboard() && self.focus_within(i));
+            || (n.vis_flags.hover_group() && self.keyboard_within(i));
         let capture_inside = if self.secondary.is_held() { inside } else { self.press.inside() };
         let held = captured == Some(n.path.as_str()) && capture_inside;
         let allowed = self.allowed(i);
@@ -324,7 +333,7 @@ impl<S: 'static> Runtime<S> {
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             let press_scale = n.handlers.get().and_then(|h| h.press_scale);
-            if n.vis.hover().a <= 0.0 && !n.vis_flags.hover_group() && n.vis.press().a <= 0.0 && press_scale.is_none() { continue; }
+            if n.vis.hover().a <= 0.0 && !n.vis_flags.hover_group() && !n.vis.tracks_press() && press_scale.is_none() { continue; }
             if self.is_exiting(n.id) { continue; }
             match self.hover_flip(i, captured, alone, &shared) {
                 Some(f) if f.changed => flips.push(f),
@@ -339,14 +348,17 @@ impl<S: 'static> Runtime<S> {
                 Some(_) => {}
                 None => {}
             }
-            if n.vis.press().a <= 0.0 && press_scale.is_none() { continue; }
+            if !n.vis.tracks_press() && press_scale.is_none() { continue; }
             let capture_inside = if self.secondary.is_held() {
                 self.pointer.is_some_and(|(x, y)| self.node_contains(i, x, y))
             } else {
                 self.press.inside()
             };
-            let down = self.allowed(i) && captured == Some(n.path.as_str()) && capture_inside;
-            let pressed = down && n.vis.press().a > 0.0;
+            // The middle or secondary button shows pressed what it went down on while it's over
+            // it, as the primary does.
+            let tinted = self.tint.path() == Some(n.path.as_str()) && self.pointer.is_some_and(|(x, y)| self.node_contains(i, x, y));
+            let down = self.allowed(i) && ((captured == Some(n.path.as_str()) && capture_inside) || tinted);
+            let pressed = down && n.vis.tracks_press();
             let id = n.id;
             changed |= self.scene.store().target(id, P_PRESS).unwrap_or(0.0) != pressed as u8 as f32;
             if paint_tracks::ready_from_rest(&mut self.scene, id, P_PRESS, 0.0, pressed as u8 as f32) {

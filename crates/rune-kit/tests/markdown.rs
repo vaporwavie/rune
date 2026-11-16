@@ -44,6 +44,21 @@ fn parses_each_block_type() {
     assert!(matches!(&b[7], Block::Code(c) if c == "fn main() {}"));
 }
 
+/// Code that ends a line drops all of its closing padding, its isolate's end too, so the line
+/// is the start of the same line with more after the code (as a stream needs) and copies clean.
+#[test]
+fn code_ending_a_line_leaves_no_isolate_end() {
+    let b = parse("Run `cargo test`\n\n- item `two`\n\n| `c` |\n|---|\n| `d ` |\n");
+    let Block::Para(p) = &b[0] else { panic!("{b:?}") };
+    assert_eq!(p.text, "Run \u{202f}\u{202f}\u{2066}cargo test");
+    assert_eq!(p.spans.iter().map(|s| s.2).collect::<Vec<_>>(), [Style::CodePad, Style::Code]);
+    let Block::List { items, .. } = &b[1] else { panic!("{b:?}") };
+    assert!(matches!(&items[0][0], Block::Para(i) if i.text == "item \u{202f}\u{202f}\u{2066}two"), "{items:?}");
+    let Block::Table(t) = &b[2] else { panic!("{b:?}") };
+    assert_eq!(t.head[0].text, "\u{202f}\u{202f}\u{2066}c");
+    assert_eq!(t.rows[0][0].text, "\u{202f}\u{202f}\u{2066}d", "the code's own trailing space goes too, as before");
+}
+
 #[test]
 fn an_unclosed_fence_is_a_growing_code_block() {
     let b = parse("Look:\n\n```ts\nconst a = 1\n");
@@ -122,7 +137,7 @@ fn every_streaming_prefix_parses_like_before() {
             h = h.wrapping_mul(0x100_0000_01b3);
         }
     }
-    assert_eq!(h, 11_559_275_952_329_967_701, "golden hash");
+    assert_eq!(h, 16_905_672_743_507_968_518, "golden hash");
 }
 
 #[test]
@@ -353,7 +368,10 @@ fn table_options_drop_the_outline_dim_the_header_and_line_up_figures() {
         let w = |t: &str, f| rune::text::measure(t, &[], f, None).0;
         assert_eq!(w("1111", tnum), w("0000", tnum), "{family:?}");
         assert_ne!(w("1111", plain), w("0000", plain), "{family:?}'s default figures are proportional");
-        assert_eq!(w("draft cursor, updatedAt", tnum), w("draft cursor, updatedAt", plain), "{family:?}");
+        // Words only: Inter's tabular set also covers the space and the comma, as Chromium
+        // measures it ("draft cursor, updatedAt" at 14 px: 153.0625 plain, 153.296875 with 'tnum'),
+        // which widths rounded up to whole points hid until #934.
+        assert_eq!(w("draftCursorUpdatedAt", tnum), w("draftCursorUpdatedAt", plain), "{family:?}");
     }
 }
 
@@ -466,7 +484,11 @@ fn diffs_tint_whole_lines_and_dim_hunk_headers() {
     assert_eq!((fill("l2"), fill("l3")), (remove, add));
     assert_ne!(fill("l1"), add);
     let block = by_key(&rt, "b0");
-    assert_eq!(by_key(&rt, "l3").rect[2], block.rect[2], "tints run edge to edge");
+    let border = 1.0 / rt.env.scale; // The hairline takes one device pixel per side.
+    for key in ["l2", "l3"] {
+        let tint = by_key(&rt, key).rect;
+        assert_eq!((tint[0], tint[2]), (block.rect[0] + border, block.rect[2] - 2.0 * border), "{key} fills the width inside the border");
+    }
     let header = rt.elements().into_iter().find(|e| e.text.as_deref() == Some("@@ -1,2 +1,2 @@")).unwrap();
     assert_eq!(header.text_color, Some(hunk));
     let line_color = |rt: &Runtime<String>, t: &str| rt.elements().into_iter().find(|e| e.text.as_deref() == Some(t)).unwrap().text_color.unwrap();
@@ -553,7 +575,8 @@ fn scroll_wide_keeps_code_lines_whole_and_scrolls_them_sideways() {
     rt.wheel_xy(x, y, -100_000.0, 0.0);
     rt.frame(1.0 / 60.0);
     let end = code(&rt).rect;
-    assert!((end[0] + end[2] + 12.0 - 480.0).abs() < 1.0, "the line's end and its padding reach the right edge: {end:?}");
+    let inside_right = viewport[0] + viewport[2];
+    assert!((end[0] + end[2] + 12.0 - inside_right).abs() < 1.0, "the line's end and its padding reach the inner border edge: {end:?}");
 }
 
 #[test]

@@ -15,11 +15,13 @@ use crate::color::Color;
 use crate::text::Link;
 
 mod caret_motion;
+use caret_motion::Column;
 mod display;
 mod history;
 mod html;
 mod ime;
-pub use ime::Ime;
+pub use ime::{Clause, Ime};
+pub(crate) use ime::ImeText;
 mod input;
 mod keys;
 pub use keys::{Key, KeyEvent, KeySide, Modifier, Mods};
@@ -31,6 +33,9 @@ pub(crate) use secure::{MULTILINE_SECURE_MASK, Masking};
 use secure::LineMode;
 mod typing;
 use typing::Typing;
+mod direction_keys;
+use direction_keys::FieldDir;
+pub(crate) use direction_keys::{DirChord, step_dir_chord};
 pub(crate) use history::History;
 use history::{EditKind, EditedTag, Group};
 
@@ -65,6 +70,14 @@ pub struct TextEdit {
     allowed_blocks: Option<u8>,
     /// Whether a user has edited the value since `replace_text`.
     edited_tag: EditedTag,
+    /// The column a run of Up and Down keeps.
+    column: Column,
+    /// Which side of `focus` the caret is drawn on where two runs of different direction meet:
+    /// a byte there has a place at the end of one run and at the start of the other. Arrows
+    /// and presses set it; anything else puts it before the byte that follows.
+    pub(crate) affinity: parley::Affinity,
+    /// The direction Ctrl+Left Shift or Ctrl+Right Shift set (`direction_keys`).
+    dir: FieldDir,
 }
 
 impl std::fmt::Debug for TextEdit {
@@ -109,13 +122,58 @@ impl std::hash::Hash for TextEdit {
         self.secure.hash(h);
         self.revealed.hash(h);
         self.is_single_line().hash(h);
+        self.dir.hash(h);
     }
 }
 
 impl Drop for TextEdit {
     fn drop(&mut self) {
-        self.text.zeroize();
+        wipe(&mut self.text);
         self.cancel_composition();
+    }
+}
+
+/// Overwrites every byte `s` holds, its spare capacity too, with zeros the compiler can't leave
+/// out (volatile writes and a fence, as `zeroize`), then empties it. Eight bytes a write, not
+/// one: a 1.7 MB draft's copy goes in a tenth of a millisecond, where a byte at a time was most
+/// of one on every frame a long draft's field was built.
+pub(crate) fn wipe(s: &mut String) {
+    // SAFETY: only zeros are written, inside the allocation (`capacity` bytes from its start),
+    // each at an address aligned for what's written there; the length is reset to 0 after.
+    unsafe {
+        let v = s.as_mut_vec();
+        let (p, cap) = (v.as_mut_ptr(), v.capacity());
+        let head = p.align_offset(8).min(cap);
+        let mut i = 0;
+        while i < head { std::ptr::write_volatile(p.add(i), 0u8); i += 1; }
+        while i + 8 <= cap { std::ptr::write_volatile(p.add(i).cast::<u64>(), 0); i += 8; }
+        while i < cap { std::ptr::write_volatile(p.add(i), 0u8); i += 1; }
+        v.set_len(0);
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Document text kept aside (an undo step's, a snapshot's): wiped when it goes, as the field's
+/// own text is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Wiped(pub(crate) String);
+
+impl std::ops::Deref for Wiped {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Wiped {
+    fn deref_mut(&mut self) -> &mut String {
+        &mut self.0
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
     }
 }
 
@@ -132,6 +190,22 @@ pub struct EditOutcome {
 fn prev_char(s: &str, i: usize) -> usize {
     use unicode_segmentation::UnicodeSegmentation;
     s[..i].grapheme_indices(true).next_back().map_or(0, |(j, _)| j)
+}
+
+/// Where Backspace deletes back to from `i`, as Chromium's `BackspaceStateMachine` and native
+/// fields do: one code point (a combining accent, a Thai or Indic vowel sign, the last jamo of
+/// a decomposed syllable), so a typist fixes the last thing they typed without retyping the
+/// cluster; but a CR LF and an emoji sequence (a variation selector, a skin tone, a keycap, a
+/// flag's pair, a tag sequence, a ZWJ sequence of emoji) go whole.
+fn prev_backspace(s: &str, i: usize) -> usize {
+    let start = prev_char(s, i);
+    let cluster = &s[start..i];
+    let emoji = cluster.chars().any(|c| matches!(c as u32, 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF | 0xE0020..=0xE007F))
+        || (cluster.contains('\u{200D}') && cluster.chars().any(crate::text::is_pictographic));
+    if cluster == "\r\n" || emoji {
+        return start;
+    }
+    s[..i].char_indices().next_back().map_or(0, |(j, _)| j)
 }
 
 fn next_char(s: &str, i: usize) -> usize {
@@ -163,6 +237,9 @@ impl TextEdit {
             allowed_marks: None,
             allowed_blocks: None,
             edited_tag: EditedTag::default(),
+            column: Column::Free,
+            affinity: parley::Affinity::Downstream,
+            dir: FieldDir::Natural,
         }
     }
 
@@ -380,9 +457,53 @@ impl TextEdit {
         self.composition != ime::Composition::Idle
     }
 
-    /// Ends the input method's composition without committing it, as a blur does.
+    /// The clause the input method is converting, a byte range of the preedit, when it marks
+    /// one.
+    pub fn preedit_target(&self) -> Option<(usize, usize)> {
+        self.composition.target()
+    }
+
+    /// The composition's clauses, each a byte range of the preedit, the one being converted
+    /// marked (one clause over the whole preedit when the input method gives none). Empty when
+    /// not composing.
+    pub fn preedit_clauses(&self) -> Vec<Clause> {
+        self.composition.clauses()
+    }
+
+    /// The text around the selection for the platform's input method to read (reconversion,
+    /// document feed); none for a secret or mid-composition.
+    pub(crate) fn ime_text(&self) -> Option<ImeText> {
+        if self.secure || self.is_composing() { return None; }
+        let (a, b) = self.range();
+        let t = &self.text;
+        let mut start = t[..a].rfind('\n').map_or(0, |i| i + 1).max(a.saturating_sub(1024));
+        while !t.is_char_boundary(start) { start += 1; }
+        let mut end = t[b..].find('\n').map_or(t.len(), |i| b + i).min(b + 1024);
+        while !t.is_char_boundary(end) { end -= 1; }
+        Some(ImeText { text: t[start..end].to_owned(), start, selection: a - start..b - start })
+    }
+
+    /// Ends the input method's composition without writing it, as an edit replacing the text
+    /// under it does.
     pub fn cancel_composition(&mut self) {
-        self.composition.cancel();
+        let _ = ime::step(&mut self.composition, ime::Event::Cancel);
+    }
+
+    /// Writes what the composition shows into the text and ends it, as a field that loses
+    /// focus or the window mid-composition keeps it (a browser's field and an `NSTextView`
+    /// do). True when there was one. The runtime tells the platform's input method to drop its
+    /// own copy.
+    pub fn finish_composition(&mut self) -> bool {
+        if self.secure { self.cancel_composition(); return false; }
+        let mut finished = false;
+        for effect in ime::step(&mut self.composition, ime::Event::Finish) {
+            if let ime::Effect::Commit(mut s) = effect {
+                self.commit_composed(&s);
+                s.zeroize();
+                finished = true;
+            }
+        }
+        finished
     }
 
     pub(crate) fn clear_typing_style(&mut self) {
@@ -392,7 +513,7 @@ impl TextEdit {
     /// Replace the whole draft and discard its history, preserving focus and password mode.
     pub fn replace_text(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.text.zeroize();
+        wipe(&mut self.text);
         let line_count = if self.secure { 0 } else { 1 + count_newlines(text.as_bytes()) };
         self.text = text;
         self.anchor = self.text.len();
@@ -461,6 +582,8 @@ impl TextEdit {
         self.focus = b;
         self.snap_to_pills();
         self.typing = Typing::Inherited;
+        self.column = Column::Free;
+        self.affinity = parley::Affinity::Downstream;
     }
 
     /// Set the selection `anchor` and `focus` byte indices (clamped to character boundaries of
@@ -471,6 +594,8 @@ impl TextEdit {
         self.focus = Self::clamp_char_boundary(&self.text, focus);
         self.snap_to_pills();
         self.typing = Typing::Inherited;
+        self.column = Column::Free;
+        self.affinity = parley::Affinity::Downstream;
     }
 
     /// The [`Mark::Pill`]s in `self.text`, in order, with their byte ranges and ids.
@@ -491,56 +616,6 @@ impl TextEdit {
     /// The end of the pill that starts at or contains `j`, when `j` is before its end.
     fn pill_after(&self, j: usize) -> Option<usize> {
         self.marks.iter().find(|m| m.mark.is_pill() && m.start <= j && j < m.end).map(|m| m.end)
-    }
-
-    fn prev_word(&self, i: usize) -> usize {
-        if self.is_masked() {
-            return 0;
-        }
-        let s = &self.text;
-        let b = s.as_bytes();
-        let mut j = i.min(b.len());
-        loop {
-            if let Some(start) = self.pill_before(j) {
-                return start;
-            }
-            if j == 0 || !b[j - 1].is_ascii_whitespace() {
-                break;
-            }
-            j -= 1;
-        }
-        while j > 0 && !b[j - 1].is_ascii_whitespace() {
-            if self.marks.iter().any(|m| m.mark.is_pill() && m.end == j) {
-                break;
-            }
-            j = prev_char(s, j);
-        }
-        j
-    }
-
-    fn next_word(&self, i: usize) -> usize {
-        if self.is_masked() {
-            return self.text.len();
-        }
-        let s = &self.text;
-        let b = s.as_bytes();
-        let mut j = i.min(b.len());
-        loop {
-            if let Some(end) = self.pill_after(j) {
-                return end;
-            }
-            if j >= b.len() || !b[j].is_ascii_whitespace() {
-                break;
-            }
-            j += 1;
-        }
-        while j < b.len() && !b[j].is_ascii_whitespace() {
-            if self.marks.iter().any(|m| m.mark.is_pill() && m.start == j) {
-                break;
-            }
-            j = next_char(s, j);
-        }
-        j
     }
 
     /// Replace the selection with `label` as one [`Mark::Pill`] carrying `id`, and put the
@@ -655,8 +730,8 @@ impl TextEdit {
     /// fields fold CRLF to LF (and multi-line secure fields also drop control characters other
     /// than `\n` and `\t`). Sized up front so no partial copy of a secret is left behind by a
     /// reallocation.
-    fn sanitize(&self, s: &str) -> Zeroizing<String> {
-        let mut out = Zeroizing::new(String::with_capacity(s.len()));
+    fn sanitize(&self, s: &str) -> Wiped {
+        let mut out = Wiped(String::with_capacity(s.len()));
         if self.is_single_line() {
             out.extend(s.chars().filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}')));
         } else if self.secure {
@@ -672,6 +747,9 @@ impl TextEdit {
                     out.push(c);
                 }
             }
+        } else if !s.contains('\r') {
+            // Most pastes: copied whole, not a character at a time.
+            out.push_str(s);
         } else {
             let mut chars = s.chars().peekable();
             while let Some(c) = chars.next() {
@@ -692,6 +770,8 @@ impl TextEdit {
         mark_new_lines_soft: bool,
     ) {
         // Callers sync first; a second whole-text pass here would show on every keystroke.
+        self.column = Column::Free;
+        self.affinity = parley::Affinity::Downstream;
         let del_len = b - a;
         let ins_len = s.len();
         if self.marks.is_empty()
@@ -865,7 +945,8 @@ impl TextEdit {
             self.mark_edited();
             return;
         }
-        let before = self.snapshot();
+        // Only the bytes this replaces: a keystroke in a long draft copies none of the rest.
+        let before = self.ranged(a, b);
         let inserted_marks: Vec<Mark> = if s.is_empty() {
             self.typing = Typing::Inherited;
             Vec::new()
@@ -888,7 +969,7 @@ impl TextEdit {
         };
 
         self.apply_text_and_attr_replace((a, b), s, &inserted_marks, None, false);
-        self.record_change(before, kind);
+        self.record_ranged(before, s, kind);
     }
 
 }

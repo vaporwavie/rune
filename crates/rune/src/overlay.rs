@@ -38,6 +38,8 @@ use crate::runtime::{Cx, Env, Runtime, Waker};
 use crate::text::TextSystem;
 use crate::tooling::AppSpec;
 use crate::window::{AnyHost, WakeEvent};
+#[cfg(target_os = "windows")]
+use crate::window::slot::{Slot, Take};
 use crate::{ConfiguredOverlay, DisplayTarget, KeyPolicy, OverlayInput, OverlayOptions, OverlayPlacement, OverlaySupport};
 
 #[path = "overlay/draw.rs"]
@@ -279,7 +281,7 @@ impl<T: 'static> OverlayHandle<T> {
 
 /// An overlay before the event loop runs: the shell gives it a wake-up and the GPU pool.
 pub(crate) trait PendingOverlay: AnyHost {
-    fn connect(&mut self, wake: Waker, frame_wake: Waker, gpu: Rc<RefCell<Weak<Gpu>>>);
+    fn connect(&mut self, wake: Waker, frame_wake: Waker, slot_wake: Waker, gpu: Rc<RefCell<Weak<Gpu>>>);
 }
 
 enum Backing {
@@ -307,6 +309,10 @@ struct Live {
     /// Fn presses, which winit doesn't send, while the overlay wants modifier keys.
     #[cfg(target_os = "macos")]
     fn_key: Option<crate::input::fn_key::FnKey>,
+    /// Whether the swap chain can take the next frame, and the wait when it can't
+    /// (`window::slot`). Before the surface so an outstanding wait goes first.
+    #[cfg(target_os = "windows")]
+    slot: Slot,
     alpha: Option<crate::render::surface_alpha::AlphaSurface>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -316,8 +322,6 @@ struct Live {
 
 pub(crate) struct Overlay<T: 'static> {
     on_created: Option<Box<dyn FnMut(crate::OverlayCreated)>>,
-    /// `on_created` heard of the current native window; a released one is announced again.
-    announced: bool,
     setup: Option<fn(&mut T, Waker)>,
     pending_input: Option<OverlayInput>,
     presence: Presence,
@@ -345,10 +349,7 @@ pub(crate) struct Overlay<T: 'static> {
     native: Option<crate::platform::win32::OverlayWindow>,
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     x11: Option<crate::platform::x11::overlay::InputWindow>,
-    live: Option<Live>,
-    /// The native window while it has no GPU surface: just made, or hidden with
-    /// `release_gpu_when_hidden`. Windows and X11 only.
-    parked: Option<Backing>,
+    surface: surface::Surface,
     /// `ConfiguredOverlay::release_gpu_when_hidden` or `release_gpu_after`.
     release: Release,
     cursor: Option<crate::cursor::os::OsCursor>,
@@ -367,14 +368,15 @@ pub(crate) struct Overlay<T: 'static> {
     #[cfg(target_os = "macos")]
     occlusion_read: bool,
     /// When to try a frame again that had no drawable, or the next frame of motion with no
-    /// display link to pace it.
-    retry: Option<Instant>,
-    /// The next occluded re-check's wait, backing off while the surface stays occluded.
-    occluded_wait: Duration,
+    /// display link to pace it, and the waits behind it (`window::Backoff`).
+    backoff: crate::window::Backoff,
     /// When a hidden retained overlay commits the changes it hasn't yet.
     hidden_pace: crate::window::HiddenPace,
     #[cfg(target_os = "macos")]
     frame_wake: Option<Waker>,
+    /// Windows: asks the loop for the frame whose swap chain has room (`WakeEvent::FrameSlot`).
+    #[cfg(target_os = "windows")]
+    slot_wake: Option<Waker>,
     meter: crate::frame::surface_stats::SurfaceMeter,
     /// The display `refollow_pointer` last found the pointer on, away from the overlay's.
     refollow_away: Option<winit::monitor::MonitorHandle>,
@@ -408,7 +410,6 @@ impl<T: 'static> Overlay<T> {
         }));
         let overlay = Overlay {
             on_created,
-            announced: false,
             setup,
             pending_input: None,
             presence: Presence::default(),
@@ -425,8 +426,7 @@ impl<T: 'static> Overlay<T> {
             clipboard: Default::default(),
             popup: Default::default(),
             compositor,
-            live: None,
-            parked: None,
+            surface: Default::default(),
             release: Release::new(release_after),
             cursor: None,
             #[cfg(target_os = "macos")]
@@ -447,11 +447,12 @@ impl<T: 'static> Overlay<T> {
             clock: FrameClock::new(Instant::now()),
             #[cfg(target_os = "macos")]
             occlusion_read: false,
-            retry: None,
-            occluded_wait: crate::window::OCCLUDED_RETRY,
+            backoff: Default::default(),
             hidden_pace: Default::default(),
             #[cfg(target_os = "macos")]
             frame_wake: None,
+            #[cfg(target_os = "windows")]
+            slot_wake: None,
             meter,
             refollow_away: None,
         };
@@ -515,7 +516,7 @@ impl<T: 'static> Overlay<T> {
     }
 
     fn sync_live_origin(&mut self) {
-        let Some(Backing::Window(window)) = self.live.as_ref().map(|l| &l.backing) else { return };
+        let Some(Backing::Window(window)) = self.surface.live().map(|l| &l.backing) else { return };
         let window = window.clone();
         self.sync_origin(&window);
     }
@@ -568,12 +569,12 @@ impl<T: 'static> Overlay<T> {
 
     fn resized(&mut self, event_loop: &ActiveEventLoop) {
         // A parked window takes the size now; its surface is made at it.
-        if let Some(Backing::Window(w)) = &self.parked {
+        if let Some(Backing::Window(w)) = self.surface.parked() {
             let w = w.clone();
             let _ = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
             return self.place_window(event_loop, &w);
         }
-        let Some(live) = self.live.as_mut() else { return };
+        let Some(live) = self.surface.live_mut() else { return };
         match &mut live.backing {
             Backing::Window(w) => {
                 let _ = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
@@ -591,7 +592,7 @@ impl<T: 'static> Overlay<T> {
             live.scale = 0.0;
             self.rescale(&gpu, scale);
         }
-        if let Some(Backing::Window(w)) = self.live.as_ref().map(|l| &l.backing) {
+        if let Some(Backing::Window(w)) = self.surface.live().map(|l| &l.backing) {
             let w = w.clone();
             self.place_window(event_loop, &w);
             if let Some(gpu) = self.gpu.clone() { self.rescale(&gpu, crate::window::backing_scale(&w)); }
@@ -639,7 +640,7 @@ impl<T: 'static> Overlay<T> {
     /// The display containing `point` when a window-backed `UnderPointer` overlay isn't on it.
     fn pointer_display_away(&self, event_loop: &ActiveEventLoop, point: (i32, i32)) -> Option<winit::monitor::MonitorHandle> {
         if self.options.display != DisplayTarget::UnderPointer { return None; }
-        let Some(Backing::Window(window)) = self.live.as_ref().map(|l| &l.backing) else { return None };
+        let Some(Backing::Window(window)) = self.surface.live().map(|l| &l.backing) else { return None };
         event_loop.available_monitors().find(|m| {
             let (p, s) = (m.position(), m.size());
             point.0 >= p.x && point.1 >= p.y && i64::from(point.0) < i64::from(p.x) + i64::from(s.width)
@@ -679,6 +680,14 @@ mod surface;
 #[cfg(test)]
 #[path = "overlay/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "overlay/state_walk_tests.rs"]
+mod state_walk_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "overlay/lost_release_tests.rs"]
+mod lost_release_tests;
 
 /// A Windows overlay's alpha (255 opaque) at `now`, fading out linearly over `length` until `end`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]

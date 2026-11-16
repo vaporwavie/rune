@@ -23,7 +23,10 @@ use crate::Kit;
 use crate::grip::Grip;
 
 mod press;
+mod visibility;
+
 use press::BarPress;
+use visibility::{BarState, Event as BarEvent, Follow, Opacity};
 
 /// The strip along the right edge that takes presses: wider than the thumb, for an easier aim,
 /// and wide enough for the thumb under the pointer (wider still for a wider styled thumb).
@@ -46,11 +49,6 @@ const ENTER: Spring = Spring::new(0.14, 0.0);
 const LEAVE: Spring = Spring::new(0.28, 0.0);
 /// The thumb widening and changing colour under the pointer, and gliding to a new length when the content's changes.
 const WIDEN: Spring = Spring::new(0.12, 0.0);
-/// How long after a pulse's hold its fade-out has run.
-const FADE_TAIL: f64 = 0.35;
-/// How long a length glide runs, through which the scrolls that follow it (a feed keeping to its
-/// end) glide too rather than cutting it short.
-const GLIDE_SPAN: f64 = 0.5;
 /// How long a held track press waits before paging again, then how often it pages.
 const PAGE_DELAY: Duration = Duration::from_millis(300);
 const PAGE_EVERY: Duration = Duration::from_millis(60);
@@ -92,6 +90,8 @@ struct Track {
     gutter: bool,
     /// Along the viewport's bottom edge, for a viewport that scrolls sideways.
     x: bool,
+    /// ScrollView and MenuScroll install a pointer handler on the thumb, not the track.
+    thumb_only: bool,
     /// The pointer anywhere over the area shows an overlay bar, not only near its edge; only
     /// over the thumb does it take the hover colour.
     area_reveals: bool,
@@ -108,6 +108,8 @@ struct Track {
     enter: Spring,
     leave: Spring,
     tint: Spring,
+    /// Device pixels per point the thumb is sized and placed in whole pixels of, or 0 for none.
+    pixels: f32,
 }
 
 const KIT_TRACK: Track = Track {
@@ -119,6 +121,7 @@ const KIT_TRACK: Track = Track {
     overlay: false,
     gutter: false,
     x: false,
+    thumb_only: false,
     area_reveals: false,
     targeted: false,
     scroll_only: false,
@@ -128,6 +131,7 @@ const KIT_TRACK: Track = Track {
     enter: ENTER,
     leave: LEAVE,
     tint: WIDEN,
+    pixels: 0.0,
 };
 
 /// `@opencode/ui` ScrollView (`scroll-view.css`, `scroll-view.tsx`): a 12 point strip with a 4
@@ -142,6 +146,7 @@ const SCROLL_VIEW_TRACK: Track = Track {
     overlay: true,
     gutter: false,
     x: false,
+    thumb_only: true,
     area_reveals: true,
     targeted: false,
     scroll_only: false,
@@ -151,6 +156,7 @@ const SCROLL_VIEW_TRACK: Track = Track {
     enter: Spring::new(0.2, 0.0),
     leave: Spring::new(0.2, 0.0),
     tint: Spring::new(0.15, 0.0),
+    pixels: 0.0,
 };
 
 /// `@opencode/ui`'s `scrollbar.css`, which every plain `overflow: auto` container gets: an 8
@@ -167,6 +173,7 @@ const NATIVE_TRACK: Track = Track {
     overlay: true,
     gutter: true,
     x: false,
+    thumb_only: false,
     area_reveals: true,
     targeted: false,
     scroll_only: false,
@@ -176,6 +183,7 @@ const NATIVE_TRACK: Track = Track {
     enter: Spring::NONE,
     leave: Spring::NONE,
     tint: Spring::NONE,
+    pixels: 0.0,
 };
 
 /// `@opencode/ui`'s MenuScroll (`menu-scroll.tsx`, `menu-scroll.css`), a menu's or dialog list's
@@ -196,11 +204,6 @@ impl Track {
     /// The index of the axis the thumb runs along in a point or size: 0 sideways, 1 down.
     fn along(&self) -> usize {
         usize::from(!self.x)
-    }
-
-    /// How long after a scroll an overlay bar's pulse has faded out.
-    fn pulse_span(&self) -> f64 {
-        self.hold.as_secs_f64() + FADE_TAIL
     }
 
     /// The drawn part of a thumb at `top`, `len` long on the track: less its clear border.
@@ -313,6 +316,38 @@ impl ScrollBarStyle {
         self
     }
 
+    /// The sizes a `::-webkit-scrollbar` look sets, for a [`Self::native`] bar that copies another
+    /// page's: the bar `size` wide (its `width`), the thumb drawn inside a clear `thumb_border`
+    /// all round (`border: Npx solid transparent; background-clip: content-box`), so as wide as
+    /// `size` less two borders, and the track `track_margin` in from each end
+    /// (`::-webkit-scrollbar-track { margin }`). [`Self::native`] is `(8.0, 2.0, 4.0)`.
+    pub fn webkit_parts(mut self, size: f32, thumb_border: f32, track_margin: f32) -> Self {
+        let (size, thumb_border) = (size.max(1.0), thumb_border.max(0.0));
+        let width = (size - 2.0 * thumb_border).max(1.0);
+        self.track.strip = size;
+        self.track.edge = thumb_border;
+        self.track.border = thumb_border;
+        self.track.inset = track_margin.max(0.0);
+        (self.width, self.hover_width) = (width, width);
+        self
+    }
+
+    /// The thumb is never shorter than `len` points, its clear border included (a browser's
+    /// least thumb length for the look).
+    pub fn min_thumb(mut self, len: f32) -> Self {
+        self.track.min_thumb = len.max(0.0);
+        self
+    }
+
+    /// Sizes and places the thumb in whole device pixels, `scale` of them to a point, as Chromium
+    /// does a native scroll bar's (its length rounded, its place truncated): for a look that copies
+    /// one ([`Self::native`]), so the thumb lands on the browser's pixels at every offset. 0, the
+    /// default, leaves both unrounded.
+    pub fn device_pixels(mut self, scale: f32) -> Self {
+        self.track.pixels = scale.max(0.0);
+        self
+    }
+
     /// The widest the thumb gets.
     fn widest(&self) -> f32 {
         self.width.max(self.hover_width)
@@ -322,14 +357,6 @@ impl ScrollBarStyle {
     fn track(&self) -> f32 {
         self.track.strip.max(self.widest() + 2.0 * self.track.edge)
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BarState {
-    Uninit,
-    NoOverflow,
-    Always,
-    Overlay,
 }
 
 /// What one scroll bar keeps across rebuilds: where its viewport stands, its visibility state,
@@ -347,8 +374,6 @@ struct Bar {
     over: Cell<bool>,
     /// The pointer is over the element marked [`ScrollBar::scroll_bar_hover`].
     target: Cell<bool>,
-    pulse_until: Cell<f64>,
-    glide_until: Cell<f64>,
     /// The style the last view built the bar with; `None` until the first.
     style: Cell<Option<ScrollBarStyle>>,
     last_now: Cell<f64>,
@@ -382,8 +407,6 @@ fn kept(area: &str) -> Rc<Bar> {
                     near: Cell::new(false),
                     over: Cell::new(false),
                     target: Cell::new(false),
-                    pulse_until: Cell::new(-1.0),
-                    glide_until: Cell::new(-1.0),
                     style: Cell::new(None),
                     last_now: Cell::new(0.0),
                     track: Live::new([0.0; 4]),
@@ -406,12 +429,22 @@ fn thumb(at: ScrollPos, track: f32) -> (f32, f32) {
 /// [`thumb`] never shorter than `min`.
 #[cfg(test)]
 fn thumb_on(at: ScrollPos, track: f32, min: f32) -> (f32, f32) {
-    thumb_along(at, track, min, 1)
+    thumb_along(at, track, min, 1, 0.0)
 }
 
-/// [`thumb_on`] along axis `a` (0 sideways, 1 down).
-fn thumb_along(at: ScrollPos, track: f32, min: f32, a: usize) -> (f32, f32) {
+/// [`thumb_on`] along axis `a` (0 sideways, 1 down), in whole device pixels at `px` of them per
+/// point ([`ScrollBarStyle::device_pixels`]) when `px` isn't 0.
+fn thumb_along(at: ScrollPos, track: f32, min: f32, a: usize, px: f32) -> (f32, f32) {
     let (shown, max) = (at.viewport[a], at.max[a]);
+    // Chromium's (`ScrollbarTheme::ThumbLength`, `ThumbPosition`): the length rounded, the place
+    // truncated, and a thumb that has left the start by less than a pixel one pixel in.
+    if px > 0.0 {
+        let track = (track * px).round();
+        let len = (track * shown / (shown + max).max(1.0)).round().max((min * px).round()).min(track);
+        let pos = if max > 0.0 { (track - len) * (at.offset[a] / max).clamp(0.0, 1.0) } else { 0.0 };
+        let pos = if pos > 0.0 && pos < 1.0 { 1.0 } else { pos.trunc() };
+        return (pos / px, len / px);
+    }
     let len = (track * shown / (shown + max).max(1.0)).max(min).min(track);
     let top = if max > 0.0 { (track - len) * (at.offset[a] / max).clamp(0.0, 1.0) } else { 0.0 };
     (top, len)
@@ -426,12 +459,12 @@ fn offset_at(at: ScrollPos, track: f32, top: f32) -> f32 {
 /// [`offset_at`] for a thumb never shorter than `min`.
 #[cfg(test)]
 fn offset_on(at: ScrollPos, track: f32, top: f32, min: f32) -> f32 {
-    offset_along(at, track, top, min, 1)
+    offset_along(at, track, top, min, 1, 0.0)
 }
 
 /// [`offset_on`] along axis `a`.
-fn offset_along(at: ScrollPos, track: f32, top: f32, min: f32, a: usize) -> f32 {
-    let travel = track - thumb_along(at, track, min, a).1;
+fn offset_along(at: ScrollPos, track: f32, top: f32, min: f32, a: usize, px: f32) -> f32 {
+    let travel = track - thumb_along(at, track, min, a, px).1;
     if travel <= 0.0 {
         return at.offset[a];
     }
@@ -464,7 +497,8 @@ impl Bar {
     fn thumb_rect(&self, h: f32) -> [f32; 4] {
         let style = self.style();
         let w = if self.wide() { style.hover_width } else { style.width };
-        self.flowed(turned(&style.track, [style.widest() - w, 0.0, w, h]), if style.track.x { h } else { style.widest() })
+        let (slot, end) = if style.track.thumb_only { (style.track(), style.track.edge) } else { (style.widest(), 0.0) };
+        self.flowed(turned(&style.track, [slot - end - w, 0.0, w, h]), if style.track.x { h } else { slot })
     }
 
     /// Whether the viewport runs right to left, which puts its bar on its left and starts a
@@ -514,7 +548,7 @@ impl Bar {
         self.fill.snap(self.thumb_fill());
         let at = self.pos.get();
         let (len, shows) = track_len(at, &style.track);
-        let (top, h) = style.track.pill(thumb_along(at, len.max(0.0), style.track.min_thumb, style.track.along()));
+        let (top, h) = style.track.pill(thumb_along(at, len.max(0.0), style.track.min_thumb, style.track.along(), style.track.pixels));
         let h = if shows { h } else { 0.0 };
         self.track.snap(self.track_rect(at, if shows { len } else { 0.0 }));
         self.slot.snap(self.slot_rect(top, h));
@@ -526,29 +560,56 @@ impl Bar {
         let style = self.style();
         let t = style.track;
         let within = if t.x { track_len(self.pos.get(), &t).0.max(0.0) } else { style.track() };
-        self.flowed(turned(&t, [style.track() - t.edge - style.widest(), top, style.widest(), h]), within)
+        let (start, width) = if t.thumb_only { (0.0, style.track()) } else { (style.track() - t.edge - style.widest(), style.widest()) };
+        self.flowed(turned(&t, [start, top, width, h]), within)
     }
 
     /// An overlay bar stays up while the thumb is held or the pointer is at its edge.
     fn hold(&self) {
-        if self.state.get() == BarState::Overlay {
-            self.opacity.set(1.0);
-            self.pulse_until.set(f64::INFINITY);
-        }
+        self.visibility(BarEvent::Hold);
     }
 
     /// Once neither holds it, an overlay bar fades out after [`HOLD`] (the look's own). One the
     /// whole area reveals fades as the pointer leaves, as a ScrollView's thumb does.
     fn let_go(&self) {
-        if self.state.get() == BarState::Overlay && !self.pressed() && !self.revealed() {
-            let t = self.style().track;
-            if t.area_reveals {
-                self.opacity.set(0.0);
-                self.pulse_until.set(-1.0);
-                return;
+        let t = self.style().track;
+        self.visibility(BarEvent::LetGo {
+            pressed: self.pressed(),
+            revealed: self.revealed(),
+            area_reveals: t.area_reveals,
+            now: self.last_now.get(),
+            hold: t.hold,
+        });
+    }
+
+    /// Steps what the bar shows, carrying out the step's effects: says whether the thumb glides
+    /// to its new length, and whether a glide it was in was cut.
+    fn visibility(&self, event: BarEvent) -> (bool, bool) {
+        let mut state = self.state.get();
+        let effects = visibility::step(&mut state, event);
+        self.state.set(state);
+        let (mut glides, mut cut) = (false, false);
+        for effect in effects {
+            match effect {
+                visibility::Effect::Glide { glides: g, cut: c } => (glides, cut) = (g, c),
+                visibility::Effect::Opacity(change) => self.fade(change),
             }
-            self.opacity.pulse(1.0, 0.0, t.hold);
-            self.pulse_until.set(self.last_now.get() + t.pulse_span());
+        }
+        (glides, cut)
+    }
+
+    /// Sets the bar's opacity at once, eases it, or pulses it up and back down after a hold.
+    fn fade(&self, change: Opacity) {
+        match change {
+            Opacity::Set(o) => {
+                self.opacity.set(o);
+            }
+            Opacity::Snap(o) => {
+                self.opacity.snap(o);
+            }
+            Opacity::Pulse { hold } => {
+                self.opacity.pulse(1.0, 0.0, hold);
+            }
         }
     }
 
@@ -569,7 +630,7 @@ impl Bar {
         // Measured from the viewport's start edge, its right when it runs right to left.
         let p = p.map(|p| (if self.rtl() { at.viewport[0] - p.x } else { p.x }, p.y));
         let p = p.map(|(x, y)| if t.x { (y, x) } else { (x, y) });
-        let (top, h) = thumb_along(at, len.max(0.0), t.min_thumb, a);
+        let (top, h) = thumb_along(at, len.max(0.0), t.min_thumb, a, t.pixels);
         let in_strip = |across: f32, along: f32| (bar_end - track..=bar_end).contains(&across) && (lo..=lo + len).contains(&along);
         let on_thumb = |(across, along): (f32, f32)| in_strip(across, along) && (!t.area_reveals || (lo + top..=lo + top + h).contains(&along));
         // A bar its hover target reveals shows here only under the pointer on its thumb, which
@@ -577,7 +638,7 @@ impl Bar {
         let near = shows
             && p.is_some_and(|(across, along)| match (t.targeted || t.scroll_only, t.area_reveals) {
                 // A scroll-only thumb holds while the pointer is on it as it shows.
-                _ if t.scroll_only => on_thumb((across, along)) && (self.near.get() || self.last_now.get() < self.pulse_until.get()),
+                _ if t.scroll_only => on_thumb((across, along)) && (self.near.get() || self.last_now.get() < self.state.get().pulse_until()),
                 (true, _) => on_thumb((across, along)),
                 (false, true) => (0.0..=w + gutter).contains(&across) && (0.0..=h_all).contains(&along),
                 (false, false) => across >= bar_end - REVEAL.max(track) && across <= bar_end && (lo..=lo + len).contains(&along),
@@ -622,91 +683,31 @@ impl Bar {
         let (len, shows) = track_len(at, &t);
         let a = t.along();
         self.track.set(self.track_rect(at, if shows { len } else { 0.0 }));
-        let (top, h) = t.pill(thumb_along(at, len.max(0.0), style.track.min_thumb, a));
+        let (top, h) = t.pill(thumb_along(at, len.max(0.0), style.track.min_thumb, a, t.pixels));
         let h = if shows { h } else { 0.0 };
-        let (state, opacity, pulse_until) = (&self.state, &self.opacity, &self.pulse_until);
-        let prev = state.get();
-        // A shown bar glides when its content changes length; the hand, an instant change, a
-        // resize or a bar appearing moves it at once, and so does a hidden overlay bar, whose
-        // glide nobody would see.
         let resized = (prev_at.viewport[a] - at.viewport[a]).abs() > 0.5;
         let lengthened = !resized && (prev_at.max[a] - at.max[a]).abs() > 0.5;
-        let gliding = now < self.glide_until.get();
-        let seen = match prev {
-            BarState::Always => true,
-            BarState::Overlay => now < self.pulse_until.get(),
-            _ => false,
-        };
-        let glides = shows && !scrolled && !instant && !resized && (lengthened || gliding) && seen;
-        if glides && lengthened {
-            self.glide_until.set(now + GLIDE_SPAN);
-        }
-        let cut = gliding && !glides;
-        if cut {
-            self.glide_until.set(-1.0);
-        }
+        let extent_changed =
+            (prev_at.max[a] - at.max[a]).abs() > 0.5 || (prev_at.viewport[a] - at.viewport[a]).abs() > 0.5;
+        let (glides, cut) = self.visibility(BarEvent::Follow(Follow {
+            shows,
+            overlay,
+            scrolled,
+            instant,
+            resized,
+            lengthened,
+            extent_changed,
+            pressed: self.pressed(),
+            revealed: self.revealed(),
+            now,
+            hold: t.hold,
+        }));
         let slot = self.slot_rect(top, h);
         let to = |live: &Live<[f32; 4]>, rect| if glides { live.set(rect) } else { live.snap(rect) };
         to(&self.slot, slot);
         // A scroll leaves the thumb's width alone, so it doesn't cut a widening short.
         if cut || self.thumb_len() != h {
             to(&self.thumb, self.thumb_rect(h));
-        }
-
-        if !shows {
-            if prev != BarState::NoOverflow || pulse_until.get() >= 0.0 {
-                opacity.snap(1.0);
-                pulse_until.set(-1.0);
-                state.set(BarState::NoOverflow);
-            }
-            return;
-        }
-        if !overlay {
-            if prev == BarState::Overlay && !instant {
-                opacity.set(1.0);
-            } else if prev != BarState::Always {
-                opacity.snap(1.0);
-            }
-            pulse_until.set(-1.0);
-            state.set(BarState::Always);
-            return;
-        }
-        state.set(BarState::Overlay);
-        if self.pressed() || self.revealed() {
-            self.hold();
-            return;
-        }
-        if prev == BarState::Always {
-            if scrolled && !instant {
-                opacity.pulse(1.0, 0.0, t.hold);
-                pulse_until.set(now + t.pulse_span());
-            } else if instant {
-                opacity.snap(0.0);
-                pulse_until.set(-1.0);
-            } else {
-                opacity.set(0.0);
-                pulse_until.set(-1.0);
-            }
-            return;
-        }
-        if prev != BarState::Overlay {
-            if scrolled && !instant {
-                opacity.pulse(1.0, 0.0, t.hold);
-                pulse_until.set(now + t.pulse_span());
-            } else {
-                opacity.snap(0.0);
-                pulse_until.set(-1.0);
-            }
-            return;
-        }
-        let extent_changed =
-            (prev_at.max[a] - at.max[a]).abs() > 0.5 || (prev_at.viewport[a] - at.viewport[a]).abs() > 0.5;
-        if scrolled && !instant {
-            opacity.pulse(1.0, 0.0, t.hold);
-            pulse_until.set(now + t.pulse_span());
-        } else if (scrolled || extent_changed) && instant && now < pulse_until.get() {
-            opacity.pulse(1.0, 0.0, t.hold);
-            pulse_until.set(now + t.pulse_span());
         }
     }
 }
@@ -783,6 +784,16 @@ fn attach(style: ScrollBarStyle, area: &str, key: &str, outer: El, viewport: El)
     bar.restyle(style);
     let target = format!("{area}/{key}");
     let (watch, moved, left, drag) = (bar.clone(), bar.clone(), bar.clone(), bar.clone());
+    let on_drag = move |d: &mut rune::Drag, tx: &mut rune::Tx| drag.drag(&target, jumps, d, tx);
+    let slot = el().key("thumb-slot").absolute(0.0, 0.0).live_rect(bar.slot.smooth(style.track.tint)).child(
+        el().key("thumb").absolute(0.0, 0.0).live_rect(bar.thumb.smooth(style.track.tint))
+            .radius(style.widest() / 2.0).live_fill(bar.fill.smooth(style.track.tint)),
+    );
+    let track = el().key("scroll-bar").absolute(0.0, 0.0).live_rect(&bar.track)
+        .live_opacity(bar.opacity.smooth(style.track.enter).rest(style.track.leave)).a11y_hidden();
+    // The transparent area beyond a ScrollView/MenuScroll thumb belongs to the viewport. A
+    // press there must not capture a drag, swallow a row's click, page or start a repeat timer.
+    let track = if style.track.thumb_only { track.child(slot.on_drag_any(on_drag)) } else { track.on_drag_any(on_drag).child(slot) };
     outer
         .on_pointer_move_any(move |p, tx| {
             tx.live_only();
@@ -795,24 +806,7 @@ fn attach(style: ScrollBarStyle, area: &str, key: &str, outer: El, viewport: El)
             }
         })
         .child(viewport.chain_scroll_offset(move |at| watch.follow(at, overlay)))
-        .child(
-            el().key("scroll-bar")
-                .absolute(0.0, 0.0)
-                .live_rect(&bar.track)
-                .live_opacity(bar.opacity.smooth(style.track.enter).rest(style.track.leave))
-                .on_drag_any(move |d, tx| drag.drag(&target, jumps, d, tx))
-                // The scroll view it drags already scrolls for assistive technology.
-                .a11y_hidden()
-                .child(
-                    el().key("thumb-slot").absolute(0.0, 0.0).live_rect(bar.slot.smooth(style.track.tint)).child(
-                        el().key("thumb")
-                            .absolute(0.0, 0.0)
-                            .live_rect(bar.thumb.smooth(style.track.tint))
-                            .radius(style.widest() / 2.0)
-                            .live_fill(bar.fill.smooth(style.track.tint)),
-                    ),
-                ),
-        )
+        .child(track)
 }
 
 #[cfg(test)]

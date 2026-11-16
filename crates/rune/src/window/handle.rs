@@ -46,6 +46,7 @@ impl WindowHandle {
     }
 
     /// A headless run never binds a host; it takes the queued requests instead.
+    #[cfg_attr(not(any(feature = "tooling", debug_assertions)), allow(dead_code))]
     pub(crate) fn take_headless(&self) -> Vec<WakeEvent> {
         let queued = match &mut *self.native.route.lock().unwrap() {
             Route::Unbound { queued } => std::mem::take(queued),
@@ -54,6 +55,7 @@ impl WindowHandle {
         queued.into_iter().map(|request| request(0)).collect()
     }
 
+    #[cfg_attr(not(any(feature = "tooling", debug_assertions)), allow(dead_code))]
     pub(crate) fn headless_pending(&self) -> bool {
         matches!(&*self.native.route.lock().unwrap(), Route::Unbound { queued } if !queued.is_empty())
     }
@@ -88,15 +90,43 @@ impl WindowHandle {
         let window = self.window().ok()?;
         let (outer, inner) = (window.outer_position().ok()?, window.inner_position().ok()?);
         let size = window.inner_size();
+        let (maximized, minimized, full_screen) = (window.is_maximized(), window.is_minimized().unwrap_or(false), window.fullscreen().is_some());
+        #[cfg(target_os = "windows")]
+        let restore = ((maximized || minimized) && !full_screen).then(|| crate::platform::win32::restore_frame(&window)).flatten();
+        #[cfg(not(target_os = "windows"))]
+        let restore = None;
         Some(crate::windows::WindowPlacement {
             position: (outer.x, outer.y),
             content_position: (inner.x, inner.y),
             content_size: (size.width, size.height),
             scale: window.scale_factor(),
-            maximized: window.is_maximized(),
-            minimized: window.is_minimized().unwrap_or(false),
-            full_screen: window.fullscreen().is_some(),
+            maximized,
+            minimized,
+            full_screen,
+            restore,
+            display: window.current_monitor().map(|m| ((m.position().x, m.position().y), (m.size().width, m.size().height))),
         })
+    }
+    /// Shows `state` on the window's taskbar button: a progress bar and a count badge (see
+    /// [`crate::Taskbar`]). macOS shows the count on the Dock icon, summed over the app's windows
+    /// (the Dock has no progress bar of its own). Call it on the UI thread.
+    pub fn set_taskbar(&self, state: crate::Taskbar) {
+        #[cfg(target_os = "windows")]
+        if let Ok(window) = self.window() { crate::platform::win32::taskbar::set(&window, state); }
+        #[cfg(target_os = "macos")]
+        if let Ok(window) = self.window() { crate::platform::macos::dock_badge(&window, state.count()); }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = state;
+    }
+    /// Flashes the window's taskbar button twice and leaves it lit until the window comes to the
+    /// front, for something that needs the person; `false` stops it once that's handled. A
+    /// window in front, or Focus Assist holding notifications back, flashes nothing. Windows
+    /// only for now. Call it on the UI thread.
+    pub fn flash(&self, on: bool) {
+        #[cfg(target_os = "windows")]
+        if let Ok(window) = self.window() { crate::platform::win32::taskbar::flash(&window, on); }
+        #[cfg(not(target_os = "windows"))]
+        let _ = on;
     }
     pub fn set_click_through(&self, click_through: bool) -> Result<(), String> {
         self.window()?.set_cursor_hittest(!click_through).map_err(|e| e.to_string())

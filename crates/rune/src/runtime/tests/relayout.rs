@@ -47,7 +47,7 @@ fn content<S>(rt: &Runtime<S>, key: &str) -> String {
 
 /// Every node's path, layout rect and text line count.
 fn layout<S>(rt: &Runtime<S>) -> Vec<(String, [f32; 4], usize)> {
-    rt.nodes.iter().map(|n| (n.path.clone(), n.target, n.text_layout.as_ref().map_or(0, |l| l.len()))).collect()
+    rt.nodes.iter().map(|n| (n.path.clone(), n.target, n.text_layout.as_ref().and_then(crate::text::TextLayout::single).map_or(0, |l| l.len()))).collect()
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn a_resize_alone_lays_the_tree_out_again_without_the_view_as_a_full_commit_woul
         full.invalidate();
         assert_eq!(resize(&mut full, w, 2.0), 1);
         assert_eq!(layout(&rt), layout(&full), "at {w}");
-        if w == 300.0 { assert!(node(&rt, "t0").text_layout.as_ref().unwrap().len() > 1, "the narrow window wrapped the text"); }
+        if w == 300.0 { assert!(node(&rt, "t0").text_layout.as_ref().and_then(crate::text::TextLayout::single).unwrap().len() > 1, "the narrow window wrapped the text"); }
     }
 }
 
@@ -419,7 +419,7 @@ fn a_resize_moves_nodes_keeps_inputs_and_restores_on_virtual_window_fallback() {
 fn a_commit_picks_its_kind_once_from_what_changed() {
     use crate::runtime::relayout::CommitKind;
     let mut rt = scrolled_transcript(false);
-    let (tx, settle) = (Tx::default(), Tx { settle: true, ..Tx::default() });
+    let (tx, settle) = (Tx::default(), Tx { commit: Commit::SettleAnimated, ..Tx::default() });
     rt.state_unchanged = true;
     assert_eq!(rt.commit_kind(&tx), CommitKind::Remount);
     rt.relayout = true;

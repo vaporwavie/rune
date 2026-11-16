@@ -58,7 +58,7 @@ return {
   element keeps (`ui.text("{1} / {2}", VALUE, read, write)`). Props: `key`, `w`/`h` (points or `"full"`), `minW`..`maxH`, `grow`, `shrink`, `pad`,
   `px`..`pl`, `m`..`ml`, `gap`, `align`, `justify`, `center`, `wrap`, `fill`, `hover`, `press`,
   `border`, `borderWidth`, `radius`, `clip`, `scrollY`, `scrollX`, `opacity`, `role`, `label`,
-  `help`, `helpSide`, `dir` (`"ltr"`, `"rtl"` or `"auto"`), `pin`, `corners`, `shadow`, `selected`, `focusable`, `disabled`, `hoverTransition`, `hoverGroup`, `hoverGroupColor`, `revealOnHover`, `onPress`, `onHover`, and for text `size`, `weight`, `lineHeight`, `tracking`, `color`, `mono`,
+  `help`, `helpSide`, `dir` (`"ltr"`, `"rtl"` or `"auto"`), `pin`, `corners`, `shadow`, `selected`, `focusable`, `disabled`, `hoverTransition`, `hoverGroup`, `hoverGroupColor`, `revealOnHover`, `onPress`, `onMiddlePress` (a middle click: a `middle-press` event), `onHover`, and for text `size`, `weight`, `lineHeight`, `tracking`, `color`, `mono`,
   `tabular`, `noWrap`, `truncate`, `fadeOut`, `selectable`, `textAlign`. Colours are palette names or
   `ui.hex("#rrggbb")`.
 - **`view:Memo(key, version, build)`** reuses the subtree while `version` (a string, number or
@@ -83,8 +83,8 @@ return {
   `luau-lsp` agree. `init.luau` stands for its folder: from it, `require("@self/x")` is `x.luau`
   and `require("./x")` would be beside the folder. `.luaurc` aliases apply, including the one
   above the folder (`Sources::parent_config`). Nothing outside the folder resolves; a cycle is an
-  error naming the chain. A module that starts with `--!native` compiles to native code where
-  the platform allows.
+  error naming the chain. A module that starts with `--!native` compiles to native code with
+  the `native-code` feature (Windows and Linux).
 
 ## Errors
 
@@ -94,8 +94,10 @@ safepoint, and that script carries on with its next call.
 
 ## Platforms
 
-Luau's native code generation (`luau-jit`) runs on Windows and Linux (x86-64, arm64); macOS,
-iOS and the web run its interpreter. On `wasm32-unknown-unknown`, Luau's C++ builds with
+Scripts run in Luau's interpreter. The `native-code` feature adds Luau's native code generation
+for modules that open with `--!native`, on Windows and Linux (x86-64, arm64) only: enable it for
+those targets alone. It costs every VM a 4 MiB committed code block as the VM starts, whether a
+native module ever loads or not. On `wasm32-unknown-unknown`, Luau's C++ builds with
 [WASI SDK](https://github.com/WebAssembly/wasi-sdk) 33 or newer and WebAssembly exception
 handling: set `WASI_SDK_PATH` and `scripts/web-build.sh` sets the compilers up; this crate links
 the SDK's C runtime and defines the few WASI calls it makes, so the page needs nothing extra.

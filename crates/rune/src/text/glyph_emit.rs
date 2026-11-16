@@ -102,18 +102,30 @@ impl TextSystem {
     /// `origin` (device px). Only that grapheme's glyphs are visited. `_scale` is unused (the
     /// run holds its scale); it stays for source compatibility.
     pub fn glyphs_in(&mut self, run: &RunLayout, at: usize, _scale: f32, origin: [f32; 2], out: &mut Vec<GlyphQuad>) {
+        self.glyphs_in_scaled(run, at, origin, 1.0, out);
+    }
+
+    /// [`Self::glyphs_in`] with the run magnified `k` times about `origin`: pen positions scale
+    /// and each glyph rasterizes at `k` times its size, as [`Self::glyphs_in_band`] does for a
+    /// paragraph, so a cell under a zoom draws as crisply as the words beside it.
+    pub(crate) fn glyphs_in_scaled(&mut self, run: &RunLayout, at: usize, origin: [f32; 2], k: f32, out: &mut Vec<GlyphQuad>) {
         let Some(i) = run.grapheme(at) else { return };
         let glyphs = run.graphemes[i].2 as usize..run.graphemes[i + 1].2 as usize;
         for g in &run.glyphs[glyphs] {
             let face = &run.faces[g.face as usize];
-            let baseline = (origin[1] + face.face.baseline).round();
-            self.push_glyph(&face.face, &face.coords, g.id, [origin[0] + g.x, baseline + g.y], 1.0, at as u32, out);
+            let baseline = (origin[1] + face.face.baseline * k).round();
+            let pen = if k == 1.0 { [origin[0] + g.x, baseline + g.y] } else { [origin[0] + g.x * k, baseline + g.y * k] };
+            self.push_glyph(&face.face, &face.coords, g.id, pen, k, at as u32, out);
         }
     }
 
     /// Rasterizes (once) and appends one glyph at device position `at`, `k` times its size.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_glyph(&mut self, face: &Face, coords: &[i16], glyph: u32, at: [f32; 2], k: f32, byte: u32, out: &mut Vec<GlyphQuad>) -> Placed {
+        #[cfg(target_arch = "wasm32")]
+        if super::platform_face::is(&face.font) {
+            return self.push_platform_glyph(face, glyph, at, k, byte, out);
+        }
         if self.emit == outline::Emit::Outline && let Some(placed) = self.push_outline(face, coords, glyph, at, k, byte, out) {
             return placed;
         }
@@ -138,6 +150,9 @@ impl TextSystem {
             skew,
             bold: face.bold,
         };
+        let miss = crate::marks::counting() && !self.atlas.map.contains_key(&key);
+        if miss { crate::marks::add("text.glyphs", 1); }
+        let _raster = crate::marks::Timed::start("text.raster_ns", miss);
         let entry = match self.atlas.map.get(&key) {
             Some(e) => {
                 let mask = e.mask();
@@ -154,9 +169,27 @@ impl TextSystem {
                     out.push(c.quad(gx, gy, glide, ink, byte));
                     return Placed::Other;
                 }
+                let landed = |placed: Rasterized, out: &mut Vec<GlyphQuad>| match placed {
+                    Rasterized::Placed(a) => {
+                        out.push(atlas_quad(a, fx, fy, ink, byte));
+                        Placed::Atlas(a, [subpx, subpy])
+                    }
+                    Rasterized::Empty => Placed::Empty([subpx, subpy]),
+                    Rasterized::Unplaced => { crate::marks::text_missed(); Placed::Other }
+                };
+                // A mask an earlier launch saved: no colour check, outline or fill.
+                if windfoil && let Some(placed) = self.cached_mask(&key, face) {
+                    return landed(placed, out);
+                }
                 let Some(font_ref) = FontRef::from_index(font.data.as_ref(), font.index as usize) else {
                     return Placed::Other;
                 };
+                // A colour glyph an earlier launch saved: no paint.
+                let color_font = [*b"COLR", *b"CBDT", *b"sbix"].iter().any(|t| font_ref.table(swash::tag_from_bytes(t)).is_some());
+                if color_font && let Some((pixels, at)) = self.cached_color(&color_key, face) {
+                    out.push(self.add_color_glyph(color_key, face, pixels, at).quad(gx, gy, glide, ink, byte));
+                    return Placed::Other;
+                }
                 let mut scaler = self
                     .scale_cx
                     .builder(font_ref)
@@ -164,25 +197,18 @@ impl TextSystem {
                     .hint(false)
                     .normalized_coords(coords.iter().copied())
                     .build();
-                if let Some((pixels, at)) = rasterize_color(&mut scaler, glyph as u16) {
-                    self.color_bytes = self.color_bytes.saturating_add((at.width as usize) * (at.height as usize) * 4);
-                    self.color_pixels.push(pixels);
-                    let index = self.color_pixels.len() as u32;
-                    let c = ColorGlyph { index, used: true, left: at.left, top: at.top, w: at.width, h: at.height };
-                    self.color_glyphs.insert(color_key, c);
-                    out.push(c.quad(gx, gy, glide, ink, byte));
+                // COLR v1 first (Windows 11's emoji, COLR v1 Noto Color Emoji), then swash's COLR v0 and bitmaps.
+                let v1 = if scaler.has_color_outlines() { super::colr::rasterize(font.data.as_ref(), font.index, glyph, font_size, coords) } else { None };
+                if let Some((pixels, at)) = v1.or_else(|| rasterize_color(&mut scaler, glyph as u16)) {
+                    out.push(self.add_color_glyph(color_key, face, pixels, at).quad(gx, gy, glide, ink, byte));
                     return Placed::Other;
                 }
                 // Windfoil masks place their own entries (GPU-filled ones are queued, not uploaded).
-                if windfoil && let Some(placed) = self.windfoil_mask(key, face, coords, font_size, [subpx, subpy]) {
-                    return match placed {
-                        Rasterized::Placed(a) => {
-                            out.push(atlas_quad(a, fx, fy, ink, byte));
-                            Placed::Atlas(a, [subpx, subpy])
-                        }
-                        Rasterized::Empty => Placed::Empty([subpx, subpy]),
-                        Rasterized::Unplaced => Placed::Other,
-                    };
+                if windfoil {
+                    self.note_mask_font(face);
+                    if let Some(placed) = self.windfoil_mask(key, face, coords, font_size, [subpx, subpy]) {
+                        return landed(placed, out);
+                    }
                 }
                 let (phase_x, shift_y) = (subpx as f32 / coretext_match::PHASES, subpy as f32 / GLIDE_PHASES as f32);
                 #[cfg(target_os = "windows")]
@@ -225,7 +251,7 @@ impl TextSystem {
                         self.atlas.map.insert(key, Residency::Blank);
                         None
                     }
-                    Rasterized::Unplaced => return Placed::Other,
+                    Rasterized::Unplaced => { crate::marks::text_missed(); return Placed::Other }
                 }
             }
         };
@@ -236,6 +262,68 @@ impl TextSystem {
             }
             None => Placed::Empty([subpx, subpy]),
         }
+    }
+
+    /// Keeps colour glyph `key`'s image, painted now or saved by an earlier launch, and notes its
+    /// font so the cross-launch cache can name it by its bytes.
+    fn add_color_glyph(&mut self, key: GlyphKey, face: &Face, pixels: crate::pixels::Pixels, at: swash::zeno::Placement) -> ColorGlyph {
+        self.note_mask_font(face);
+        self.color_bytes = self.color_bytes.saturating_add((at.width as usize) * (at.height as usize) * 4);
+        self.color_pixels.push(pixels);
+        self.color_placed += 1;
+        let index = self.color_pixels.len() as u32;
+        let c = ColorGlyph { index, used: true, left: at.left, top: at.top, w: at.width, h: at.height };
+        self.color_glyphs.insert(key, c);
+        c
+    }
+
+    /// A glyph of the browser's face (`platform_face`): the unit it carries drawn on the page's
+    /// canvas once per size and quarter-pixel phase, into the atlas (text) or as a colour image
+    /// (emoji). Asked for again each frame, as the glyph cache's phases are CoreGraphics'.
+    #[cfg(target_arch = "wasm32")]
+    fn push_platform_glyph(&mut self, face: &Face, glyph: u32, at: [f32; 2], k: f32, byte: u32, out: &mut Vec<GlyphQuad>) -> Placed {
+        let size = face.size * k;
+        let quarters = (at[0] * 4.0).round();
+        let fx = (quarters / 4.0).floor();
+        let phase = (quarters - fx * 4.0) as u8;
+        let fy = at[1].round();
+        let key = GlyphKey { font: face.font.data.id(), index: face.font.index, glyph, size: size.to_bits(), coords: 0,
+            subpx: phase, subpy: 0, dilation: 0, apple: 0, skew: 0, bold: false };
+        if let Some(c) = self.color_glyphs.get_mut(&key) {
+            c.used = true;
+            out.push(c.quad(fx, fy, self.glide, face.ink, byte));
+            return Placed::Other;
+        }
+        if let Some(entry) = self.atlas.map.get(&key) {
+            if let Some(a) = entry.mask() {
+                self.atlas.touch(a.page, a.w * a.h);
+                out.push(atlas_quad(a, fx, fy, face.ink, byte));
+            }
+            return Placed::Other;
+        }
+        let Some(image) = super::platform_face::image(glyph, size, f32::from(phase) / 4.0) else {
+            self.atlas.map.insert(key, Residency::Blank);
+            return Placed::Other;
+        };
+        if image.color {
+            self.color_bytes = self.color_bytes.saturating_add(image.data.len());
+            let pixels = crate::pixels::Pixels::new();
+            pixels.set(image.w, image.h, image.data);
+            self.color_pixels.push(pixels);
+            self.color_placed += 1;
+            let c = ColorGlyph { index: self.color_pixels.len() as u32, used: true, left: image.left, top: image.top, w: image.w, h: image.h };
+            self.color_glyphs.insert(key, c);
+            out.push(c.quad(fx, fy, self.glide, face.ink, byte));
+            return Placed::Other;
+        }
+        match self.atlas.put(image.w, image.h, &image.data, image.left, image.top) {
+            Some(a) => {
+                self.atlas.map.insert(key, Residency::Uploaded(a));
+                out.push(atlas_quad(a, fx, fy, face.ink, byte));
+            }
+            None => crate::marks::text_missed(),
+        }
+        Placed::Other
     }
 
     /// Moves the glyphs placed from here on by `glide` device px (`[x, y]`, each within half a

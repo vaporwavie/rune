@@ -12,7 +12,7 @@
 //! Where the tooltip is in its life is one [`Tip`], stepped by [`step`] once a frame with what
 //! the pointer is over, and on a dismissal; it mirrors `@opencode/ui`'s tooltip machine
 //! (`ui/src/overlays/tooltip/machine.ts`) with Kobalte's open and skip delays. A press on the
-//! element keeps its tooltip, as there; a popup or modal over the element suppresses it until
+//! element dismisses its tooltip; a popup or modal over the element suppresses it until
 //! the pointer leaves. The look's fade (`HelpLook::fade`) plays as the tooltip opens and
 //! closes, the closing one fading out under the next.
 use crate::machine::Effects;
@@ -23,7 +23,7 @@ use super::*;
 pub(super) struct HelpState {
     /// This frame's help elements: (node, visible rect in points, `hits.len()` before it, the
     /// link of its text when the help is that link's).
-    hits: Vec<(NodeId, [f32; 4], usize, Option<usize>)>,
+    pub(crate) hits: Vec<(NodeId, [f32; 4], usize, Option<usize>)>,
     state: Tip,
     /// The tooltip showing this frame: its text and box in points.
     tip: Option<(String, [f32; 4])>,
@@ -55,7 +55,7 @@ enum Tip {
     Waiting { target: Target, since: f64 },
     /// `target`'s tooltip shows, fading in from `since`.
     Open { target: Target, since: f64 },
-    /// A press elsewhere, a scroll or key, or a popup over `target` hid its tooltip until the
+    /// A press, a scroll or key, or a popup over `target` hid its tooltip until the
     /// pointer leaves it.
     Suppressed { target: Target },
 }
@@ -84,7 +84,7 @@ enum Over {
 #[derive(Debug, PartialEq)]
 enum Event {
     Frame { over: Over, now: f64 },
-    /// A press away from the open tooltip's element, a scroll or a key.
+    /// A press, a scroll or a key.
     Dismiss,
 }
 
@@ -163,13 +163,13 @@ fn suppress(tip: &mut Tip) -> Effects<Effect> {
     }
 }
 
-/// A tooltip as drawn: its text, the box it hangs from (window points, x0 y0 x1 y1), whether
-/// it sits above that box, and its opacity.
+/// A tooltip as drawn: its text, the box it hangs from (window points, x0 y0 x1 y1), the side
+/// of that box it asks for (None: under it), and its opacity.
 #[derive(Clone, Debug)]
 struct Drawn {
     text: String,
     anchor: [f32; 4],
-    above: bool,
+    side: Option<crate::Side>,
     alpha: f32,
     scale: f32,
 }
@@ -266,10 +266,10 @@ impl<S: 'static> Runtime<S> {
     /// `rect` and clipped to `clip` (points, x0 y0 x1 y1), after the first `seq` hits.
     pub(super) fn push_link_help_hits(&mut self, i: usize, rect: [f32; 4], clip: [f32; 4], seq: usize) {
         let Some(t) = self.nodes[i].text.as_ref() else { return };
-        if !t.links.iter().any(|l| l.help.is_some()) { return; }
+        if !t.cold.links.iter().any(|l| l.help.is_some()) { return; }
         let id = self.nodes[i].id;
         for (k, r) in self.link_boxes(i, rect) {
-            if self.nodes[i].text.as_ref().and_then(|t| t.links.get(k)).is_none_or(|l| l.help.is_none()) { continue; }
+            if self.nodes[i].text.as_ref().and_then(|t| t.cold.links.get(k)).is_none_or(|l| l.help.is_none()) { continue; }
             let c = [r[0].max(clip[0]), r[1].max(clip[1]), r[2].min(clip[2]), r[3].min(clip[3])];
             if c[2] > c[0] && c[3] > c[1] { self.help.hits.push((id, c, seq, Some(k))); }
         }
@@ -278,7 +278,7 @@ impl<S: 'static> Runtime<S> {
     /// The help text of node `i`, or of its link `link`.
     fn help_text(&self, i: usize, link: Option<usize>) -> Option<&String> {
         match link {
-            Some(k) => self.nodes[i].text.as_ref()?.links.get(k)?.help.as_ref(),
+            Some(k) => self.nodes[i].text.as_ref()?.cold.links.get(k)?.help.as_ref(),
             None => self.nodes[i].help.as_ref(),
         }
     }
@@ -288,16 +288,6 @@ impl<S: 'static> Runtime<S> {
     /// A scroll or key: hide the tooltip until the pointer leaves its element.
     pub(super) fn dismiss_help(&mut self) {
         if self.help.state.target().is_some() { self.step_help(Event::Dismiss); }
-    }
-
-    /// A press at (x, y): on the open tooltip's element it keeps the tooltip, as a web
-    /// tooltip's trigger does through its click; anywhere else it dismisses it.
-    pub(super) fn press_help(&mut self, x: f32, y: f32) {
-        let on_open = match &self.help.state {
-            Tip::Open { target, .. } => self.help_at(x, y).is_some_and(|(i, k)| self.nodes[i].path == target.path && k == target.link),
-            _ => false,
-        };
-        if !on_open || self.defaults.help.is_none() { self.dismiss_help(); }
     }
 
     /// The help element under (x, y): the topmost one, unless something interactive drawn over
@@ -343,8 +333,7 @@ impl<S: 'static> Runtime<S> {
         }
         let Some((i, link, reaches)) = self.help_under(x, y) else { return (Over::Nothing, None) };
         let at = target(i, link);
-        // A press holds the pointer: it keeps its own element's tooltip, and a drag across
-        // other elements starts none.
+        // A press holds the pointer: a drag across other elements starts no tooltip.
         if self.pointer_captured() && self.help.state.target() != Some(&at) {
             return (Over::Nothing, None);
         }
@@ -408,10 +397,10 @@ impl<S: 'static> Runtime<S> {
                 let e = self.drawn_box(i);
                 let anchor = link.and_then(|k| self.link_boxes(i, e).into_iter().filter(|(j, _)| *j == k).map(|(_, r)| r)
                     .reduce(|u, r| [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])]));
-                let above = link.is_none() && self.nodes[i].cold.get().is_some_and(|c| c.help_above);
+                let side = link.is_none().then(|| self.nodes[i].cold.get().and_then(|c| c.help_side)).flatten();
                 let t = if motion && look.fade[0] > 0.0 { ((self.clock - since) / look.fade[0]) as f32 } else { 1.0 };
                 let e_in = rune_motion::Easing::EASE_OUT.eval(t.clamp(0.0, 1.0));
-                let d = Drawn { text, anchor: anchor.unwrap_or(e), above, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
+                let d = Drawn { text, anchor: anchor.unwrap_or(e), side, alpha: e_in, scale: look.fade_scale + (1.0 - look.fade_scale) * e_in };
                 let [x, y, w, h] = self.draw_tooltip(&d);
                 self.help.tip = Some((crate::el::help_words(&d.text).into_owned(), [x, y, w, h]));
                 self.help.drawn = Some(d);
@@ -421,12 +410,12 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Draws `d`'s text (and its keycaps) in a tooltip in the current look under its box
-    /// (above it when there's no room below), or above it (under it when there's no room
-    /// above) when it says so, kept inside the window. Returns the tooltip's box at full size
+    /// (above it when there's no room below), or on the side it asks for (the opposite one when
+    /// there's no room there), kept inside the window. Returns the tooltip's box at full size
     /// (window points, x y w h); it draws at `d.alpha`, scaled by `d.scale` about the middle
     /// of the edge that faces its box.
     fn draw_tooltip(&mut self, d: &Drawn) -> [f32; 4] {
-        let (e, above) = (d.anchor, d.above);
+        let e = d.anchor;
         let s = self.env.scale;
         let look = self.help_look();
         let key = look.key;
@@ -457,18 +446,38 @@ impl<S: 'static> Runtime<S> {
         let w = rows.iter().map(|r| r.tw + r.keys_w).fold(0.0, f32::max) + 2.0 * pad_x;
         let h = rows.iter().map(|r| r.ch).sum::<f32>() + gaps + 2.0 * pad_y;
         let [below, over] = look.gap;
-        let mut y = e[3] + below;
-        if above && e[1] - over - h >= margin {
-            y = e[1] - over - h;
-        } else if y + h > vh - margin && e[1] - below - h >= margin {
-            y = e[1] - below - h;
-        }
-        let x = ((e[0] + e[2] - w) * 0.5).clamp(margin, (vw - w - margin).max(margin));
+        let (x, y) = match d.side {
+            // Beside it, centred down it: right of it unless only the left has room, and the
+            // other way round (`placement="right"` / `"left"`).
+            Some(side @ (crate::Side::Left | crate::Side::Right)) => {
+                let (left, right) = (e[0] - over - w, e[2] + over);
+                let (fits_left, fits_right) = (left >= margin, right + w <= vw - margin);
+                let on_left = if side == crate::Side::Left { fits_left || !fits_right } else { fits_left && !fits_right };
+                let x = if on_left { left } else { right };
+                (x, (e[1] + e[3] - h) * 0.5)
+            }
+            side => {
+                let mut y = e[3] + below;
+                if side == Some(crate::Side::Top) && e[1] - over - h >= margin {
+                    y = e[1] - over - h;
+                } else if y + h > vh - margin && e[1] - below - h >= margin {
+                    y = e[1] - below - h;
+                }
+                ((e[0] + e[2] - w) * 0.5, y)
+            }
+        };
+        let x = x.clamp(margin, (vw - w - margin).max(margin));
         let y = y.clamp(margin, (vh - h - margin).max(margin));
         let full = [x * s, y * s, w * s, h * s].map(|v| v.round());
         // Scales about the middle of the edge facing the element (Kobalte's transform origin).
         let (k, alpha) = (d.scale, d.alpha);
-        let pivot = [((e[0] + e[2]) * 0.5 * s).clamp(full[0], full[0] + full[2]), if y >= e[3] { full[1] } else { full[1] + full[3] }];
+        let pivot = if x >= e[2] {
+            [full[0], ((e[1] + e[3]) * 0.5 * s).clamp(full[1], full[1] + full[3])]
+        } else if x + w <= e[0] {
+            [full[0] + full[2], ((e[1] + e[3]) * 0.5 * s).clamp(full[1], full[1] + full[3])]
+        } else {
+            [((e[0] + e[2]) * 0.5 * s).clamp(full[0], full[0] + full[2]), if y >= e[3] { full[1] } else { full[1] + full[3] }]
+        };
         let at_k = |p: [f32; 2]| [pivot[0] + (p[0] - pivot[0]) * k, pivot[1] + (p[1] - pivot[1]) * k];
         let rect_k = |r: [f32; 4]| { let [x, y] = at_k([r[0], r[1]]); [x, y, r[2] * k, r[3] * k] };
         let r = rect_k(full);
@@ -493,12 +502,20 @@ impl<S: 'static> Runtime<S> {
             fade: crate::render::pack_fade([0.0; 4], NO_CLIP, NO_CLIP),
         });
         let mut top = full[1] + pad_y * s;
+        // In a right-to-left app a row reads from the right: its words, then its keycaps to their
+        // left, as the mirrored tooltip of a browser in Arabic or Hebrew does.
+        let rtl = crate::labels::rtl();
         for row in &rows {
             let mut at = full[0] + pad_x * s;
+            let words_at = if rtl { full[0] + full[2] - pad_x * s - row.tw * s } else { at };
             if row.words {
-                self.draw_tip_text(&row.layout, at_k([at, top + ((row.ch - row.th) * 0.5 * s).round()]), k, look.ink, alpha);
-                at += (row.tw + key.lead) * s;
+                // Right-to-left words align to the right of the width they broke at: back into the box.
+                let shift = if row.layout.is_rtl() { (wrap - row.keys_w).max(1.0) * s - row.layout.full_width() } else { 0.0 };
+                self.draw_tip_text(&row.layout, at_k([words_at - shift, top + ((row.ch - row.th) * 0.5 * s).round()]), k, look.ink, alpha);
+                if !rtl { at += (row.tw + key.lead) * s; }
             }
+            // Right to left, the keycaps end the lead short of the words (`keys_w` holds it).
+            if rtl { at = words_at - row.keys_w * s; }
             for (l, cw) in &row.caps {
                 let cap = [at, top + ((row.ch - key.height) * 0.5 * s).round(), cw * s, key.height * s].map(|v| v.round());
                 self.instances.push(Instance {

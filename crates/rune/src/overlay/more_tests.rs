@@ -63,6 +63,155 @@ fn overlay_input_switch_waits_for_owned_drag_release() {
     assert!(!overlay.rt.pointer_captured());
 }
 
+#[cfg(target_os = "macos")]
+fn lost_release_overlay() -> Overlay<Vec<(crate::Phase, bool)>> {
+    type State = Vec<(crate::Phase, bool)>;
+    fn view(_: &State, _: &mut Cx<State>) -> El {
+        crate::el().w_full().h_full().hit().on_drag(|s: &mut State, drag, _| s.push((drag.phase, drag.cancelled())))
+    }
+    let app = AppSpec {
+        title: "lost release", size: (100.0, 100.0), min_size: None, init: Vec::new, view,
+        scenes: &[], fonts: &[], families: ("sans-serif", "monospace"), setup: None, poll: None, on_key: None,
+    };
+    let spec = OverlaySpec::new("lost release", app.size, view).options(OverlayOptions { input: OverlayInput::All, ..Default::default() });
+    let (mut overlay, _) = Overlay::new(spec, Vec::new(), &app);
+    overlay.rt.frame(0.0);
+    overlay
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_late_up_after_a_lost_release_is_no_drop() {
+    let mut overlay = lost_release_overlay();
+    overlay.left_edge(None, true, Some((10.0, 10.0)));
+    overlay.left_edge(Some((30.0, 10.0)), false, None);
+    overlay.rt.frame(0.0);
+    let ups: Vec<_> = overlay.rt.state.iter().filter(|d| d.0 == crate::Phase::Up).map(|d| d.1).collect();
+    assert_eq!(ups, [true], "the recovery lands before the late Up");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_press_that_beats_a_lost_release_ends_the_old_drag_first() {
+    let mut overlay = lost_release_overlay();
+    overlay.left_edge(None, true, Some((10.0, 10.0)));
+    overlay.left_edge(Some((30.0, 10.0)), true, Some((50.0, 10.0)));
+    overlay.left_edge(None, false, Some((50.0, 10.0)));
+    overlay.rt.frame(0.0);
+    let ups: Vec<_> = overlay.rt.state.iter().filter(|d| d.0 == crate::Phase::Up).map(|d| d.1).collect();
+    assert_eq!(ups, [true, false], "the old drag is cancelled, the new one ends normally");
+    assert!(!overlay.rt.state.iter().any(|d| d.0 == crate::Phase::Move), "the old drag never hears the new press's point");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_cursor_move_for_the_next_press_cancels_the_old_drag_first() {
+    let mut overlay = lost_release_overlay();
+    let pointer = crate::platform::macos::PointerState::new(OverlayInput::All, false);
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_left(&pointer, true);
+    pointer.read(0, Instant::now(), (12.0, 10.0), true, false);
+    pointer.record_click(true, 50.0, 10.0);
+    overlay.native_moved(&pointer, 50.0, 10.0); // winit reports the click's position just before the click
+    overlay.native_left(&pointer, true);
+    overlay.rt.frame(0.0);
+    assert_eq!(overlay.rt.state.iter().filter(|d| d.0 == crate::Phase::Up).map(|d| d.1).collect::<Vec<_>>(), [true]);
+    assert!(!overlay.rt.state.iter().any(|d| d.0 == crate::Phase::Move), "the old drag never hears the new press's point");
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DragOutCount { starts: u32 }
+
+#[cfg(target_os = "macos")]
+fn drag_out_overlay() -> Overlay<DragOutCount> {
+    fn view(_: &DragOutCount, _: &mut Cx<DragOutCount>) -> El {
+        crate::el().w_full().h_full().hit()
+            .drag_out(|_: &DragOutCount| Some(crate::DragItem::new().file("/Applications/Example.app")))
+            .on_drag_start(|s: &mut DragOutCount, _| s.starts += 1)
+    }
+    let app = AppSpec {
+        title: "drag out", size: (200.0, 100.0), min_size: None, init: DragOutCount::default, view,
+        scenes: &[], fonts: &[], families: ("sans-serif", "monospace"), setup: None, poll: None, on_key: None,
+    };
+    let spec = OverlaySpec::new("drag out", app.size, view).options(OverlayOptions { input: OverlayInput::All, ..Default::default() });
+    let (mut overlay, _) = Overlay::new(spec, DragOutCount::default(), &app);
+    overlay.rt.frame(0.0);
+    overlay
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_release_past_the_drag_threshold_starts_no_os_drag() {
+    let mut overlay = drag_out_overlay();
+    let pointer = crate::platform::macos::PointerState::new(OverlayInput::All, false);
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_moved(&pointer, 10.0, 10.0);
+    overlay.native_left(&pointer, true);
+    // A quick flick: no drag event reaches the view before the Up, whose position is far off.
+    pointer.record_click(false, 60.0, 10.0);
+    overlay.native_moved(&pointer, 60.0, 10.0);
+    overlay.native_left(&pointer, false);
+    pointer.released();
+    overlay.rt.frame(0.0);
+    assert_eq!(overlay.rt.state.starts, 0, "the button was up: no OS drag");
+    assert!(!overlay.rt.pointer_captured());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_a_stale_up_ahead_of_an_unmatched_press_leaves_its_drag_out_armed() {
+    let mut overlay = drag_out_overlay();
+    let pointer = crate::platform::macos::PointerState::new(OverlayInput::All, false);
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_moved(&pointer, 10.0, 10.0);
+    overlay.native_left(&pointer, true);
+    // A's Up is seen but winit never delivers it, so it stays queued ahead of B's Down.
+    pointer.record_click(false, 12.0, 10.0);
+    pointer.record_click(true, 12.0, 10.0);
+    overlay.native_moved(&pointer, 12.0, 10.0);
+    overlay.native_left(&pointer, true);
+    assert!(overlay.rt.pointer_captured(), "B is held, unmatched");
+    overlay.native_moved(&pointer, 60.0, 10.0);
+    overlay.rt.frame(0.0);
+    assert_eq!(overlay.rt.state.starts, 1, "A's stale Up says nothing about B's button: B's drag starts, as on dev");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_a_stale_click_taken_for_the_next_press_leaves_its_drag_out_armed() {
+    let mut overlay = drag_out_overlay();
+    let pointer = crate::platform::macos::PointerState::new(OverlayInput::All, false);
+    let click = |overlay: &mut Overlay<DragOutCount>, down: bool| {
+        pointer.record_click(down, 10.0, 10.0);
+        overlay.native_moved(&pointer, 10.0, 10.0);
+        overlay.native_left(&pointer, down);
+        if !down { pointer.released(); }
+    };
+    click(&mut overlay, true); // A
+    pointer.record_click(false, 10.0, 10.0); // A's Up is swallowed: seen, never delivered
+    click(&mut overlay, true); // B, unmatched behind A's Up
+    click(&mut overlay, false); // B's Up takes A's queued Up, leaving B's Down and Up queued
+    click(&mut overlay, true); // C takes B's stale Down
+    assert!(overlay.rt.pointer_captured(), "C is held");
+    overlay.native_moved(&pointer, 60.0, 10.0);
+    overlay.rt.frame(0.0);
+    assert_eq!(overlay.rt.state.starts, 1, "B's stale Up says nothing about C's button: C's drag starts, as on dev");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlay_drag_past_the_threshold_with_the_button_down_starts_an_os_drag() {
+    let mut overlay = drag_out_overlay();
+    let pointer = crate::platform::macos::PointerState::new(OverlayInput::All, false);
+    pointer.record_click(true, 10.0, 10.0);
+    overlay.native_moved(&pointer, 10.0, 10.0);
+    overlay.native_left(&pointer, true);
+    overlay.native_moved(&pointer, 60.0, 10.0);
+    overlay.rt.frame(0.0);
+    assert_eq!(overlay.rt.state.starts, 1);
+}
+
 #[test]
 fn handle_requests_collapse_and_updates_keep_their_order() {
     let shared = Arc::new(Shared::<u32> { native: Mutex::default(), requests: Mutex::default(), availability: AtomicU8::new(0), failure: Mutex::default(), surface: Mutex::default(), wake: Mutex::new(None), stats: Arc::default() });
@@ -118,7 +267,7 @@ fn hidden_overlay_update_wakes_once_without_a_surface() {
     overlay.wake_due(Instant::now());
     assert!(!overlay.draw(), "hidden overlays do not acquire or animate a surface");
     assert_eq!(overlay.rt.state.len(), 2, "no polling after the one wake");
-    assert!(overlay.live.is_none() && overlay.gpu.is_none());
+    assert!(overlay.surface.live().is_none() && overlay.gpu.is_none());
 }
 
 thread_local! { static BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
@@ -321,8 +470,7 @@ fn overlay_occluded_runs_due_timers_without_frames() {
     overlay.missed(Missed::Occluded, false, false);
     assert_eq!(overlay.rt.state.polls, 1);
     assert_eq!(overlay.rt.wake_deadline(), Some(0.25));
-    overlay.retry = None;
-    overlay.occluded_wait = OCCLUDED_RETRY;
+    overlay.backoff = Default::default();
     let start = Instant::now() - Duration::from_millis(251);
     overlay.rt.wall_start = Some(start);
     assert!(overlay.wake_deadline().is_some_and(|at| at <= Instant::now()), "the timer stays armed while occluded");
@@ -338,23 +486,60 @@ fn overlay_occluded_runs_due_timers_without_frames() {
     for _ in 0..6 {
         let before = Instant::now();
         overlay.missed(Missed::Occluded, false, false);
-        let retry = overlay.retry.expect("an occluded miss re-checks later");
+        let retry = overlay.backoff.deadline().expect("an occluded miss re-checks later");
         assert_eq!(overlay.wake_deadline(), Some(retry));
         waits.push(retry - before);
     }
     assert!(waits[0] >= OCCLUDED_RETRY && waits.windows(2).all(|w| w[1] + Duration::from_millis(1) >= w[0]), "{waits:?}");
     assert!(waits[5] >= OCCLUDED_MAX && waits.iter().all(|&w| w <= OCCLUDED_MAX + Duration::from_millis(50)), "{waits:?}");
     overlay.missed(Missed::Timeout, true, false);
-    assert_eq!(overlay.retry, None);
+    assert_eq!(overlay.backoff.deadline(), None);
     overlay.occluded(false);
     assert!(overlay.dirty, "uncovered, it redraws once");
-    assert_eq!(overlay.occluded_wait, OCCLUDED_RETRY);
+    let now = Instant::now();
+    let mut probe = overlay.backoff;
+    probe.step(crate::window::BackoffEvent::Missed { missed: Missed::Occluded, paced: false, now });
+    assert_eq!(probe.deadline(), Some(now + OCCLUDED_RETRY), "uncovered, the wait starts over");
 
     // An update arriving while it is covered arms its timer at once, not on a later retry.
     overlay.occluded(true);
     overlay.apply_wake(false, vec![Box::new(|_: &mut State, tx: &mut Tx| { tx.wake_after(Duration::from_secs(5)); true })]);
     let deadline = overlay.wake_deadline().expect("the update's timer is armed while occluded");
     assert!(deadline > Instant::now() + Duration::from_secs(4), "{:?}", deadline - Instant::now());
+}
+
+/// Uncovering an overlay keeps the retry a missed frame already asked for: the wait was set for
+/// a frame nobody could draw, and being uncovered doesn't show that the surface can. Only the
+/// wait after it starts over.
+#[cfg(target_os = "macos")]
+#[test]
+fn uncovering_an_overlay_keeps_its_outstanding_retry() {
+    use crate::window::{Missed, OCCLUDED_RETRY};
+    #[derive(Default)]
+    struct State { polls: usize }
+    fn view(_: &State, _: &mut Cx<State>) -> El { crate::el() }
+    fn poll(_: &mut State, _: f64, _: &mut Tx) -> bool { false }
+    let app = AppSpec { poll: Some(poll), ..AppSpec::new("uncovered", (30.0, 20.0), State::default, view) };
+    let (mut overlay, _handle) = Overlay::new(OverlaySpec::new("uncovered", app.size, view), State::default(), &app);
+    overlay.presence = Presence::Shown { occluded: false };
+    overlay.rt.wall_start = None;
+    overlay.occluded(true);
+    // Two covered misses: the second waits longer than the first.
+    overlay.missed(Missed::Occluded, false, false);
+    let first = overlay.backoff.deadline().expect("a covered miss re-checks later");
+    overlay.missed(Missed::Occluded, false, false);
+    let retry = overlay.backoff.deadline().expect("so does the next");
+    assert!(retry > first, "the covered wait doubles while it stays covered");
+    assert_eq!(overlay.wake_deadline(), Some(retry), "frames wait for that re-check");
+    // Uncovered, the retry the missed frame set stands...
+    overlay.occluded(false);
+    assert_eq!(overlay.backoff.deadline(), Some(retry), "uncovering keeps the outstanding retry");
+    assert_eq!(overlay.wake_deadline(), Some(retry), "and the re-check it asks for is still due");
+    // ...and the wait after it starts over at the shortest occluded retry.
+    let now = Instant::now();
+    overlay.missed(Missed::Occluded, false, false);
+    let next = overlay.backoff.deadline().expect("a covered miss waits again");
+    assert!(next >= now + OCCLUDED_RETRY && next < now + OCCLUDED_RETRY * 2, "{:?}", next - now);
 }
 
 /// Any miss that sets a retry backs off: frames wait for it, a fading-out overlay's too,
@@ -378,11 +563,11 @@ fn overlay_misses_back_off_until_their_retry() {
     let now = Instant::now();
     overlay.missed(Missed::Timeout, false, false);
     assert_eq!(overlay.rt.state.polls, 1, "the missed frame still polls");
-    assert!(overlay.retry.is_some_and(|at| at >= now + TIMEOUT_RETRY));
+    assert!(overlay.backoff.deadline().is_some_and(|at| at >= now + TIMEOUT_RETRY));
     assert!(overlay.backing_off(Instant::now()), "an unpaced timeout waits for its retry");
     overlay.missed(Missed::Outdated, true, true);
     assert_eq!(overlay.rt.state.polls, 1, "a frame that already stepped doesn't step again");
-    assert!(overlay.retry.is_some_and(|at| at >= now + OCCLUDED_RETRY) && overlay.backing_off(Instant::now()),
+    assert!(overlay.backoff.deadline().is_some_and(|at| at >= now + OCCLUDED_RETRY) && overlay.backing_off(Instant::now()),
         "an outdated surface waits even while a display link runs");
 
     // A timer comes due while it backs off: it runs now, and the next deadline is a frame on.
@@ -395,10 +580,10 @@ fn overlay_misses_back_off_until_their_retry() {
 
     // Fading out, an occluded miss can't mark it occluded, yet it still waits.
     overlay.presence = Presence::FadingOut { until: Instant::now() + Duration::from_secs(1), length: Duration::from_secs(1), occluded: false };
-    overlay.retry = None;
+    overlay.backoff = Default::default();
     overlay.missed(Missed::Occluded, false, false);
     assert!(overlay.presence.drawing() && overlay.backing_off(Instant::now()));
-    overlay.retry = Some(Instant::now());
+    overlay.backoff_step(crate::window::BackoffEvent::At(Instant::now()));
     assert!(!overlay.backing_off(Instant::now() + Duration::from_millis(1)), "a due retry draws");
 }
 
@@ -414,7 +599,7 @@ fn a_live_edit_patch_wakes_a_hidden_overlay_and_its_next_frame_rebuilds_the_view
     let (mut overlay, _) = Overlay::new(OverlaySpec::new("hot", app.size, view).options(Default::default()), 0u8, &app);
     overlay.rt.wall_start = None;
     let (tx, rx) = std::sync::mpsc::channel();
-    overlay.connect(Arc::new(move || { let _ = tx.send(()); }), Arc::new(|| {}), Rc::default());
+    overlay.connect(Arc::new(move || { let _ = tx.send(()); }), Arc::new(|| {}), Arc::new(|| {}), Rc::default());
     let hub: &'static crate::hot::Hub = Box::leak(Box::default());
     overlay.rt.hot.as_mut().expect("connect attaches the overlay to live edits").move_to(hub);
     while rx.try_recv().is_ok() {}
@@ -457,8 +642,8 @@ fn overlay_setup_runs_once_with_a_waker_that_redraws_the_overlay() {
     let (tx, rx) = std::sync::mpsc::channel();
     let counter = loop_wakes.clone();
     let wake: Waker = Arc::new(move || { counter.fetch_add(1, Ordering::SeqCst); let _ = tx.send(()); });
-    overlay.connect(wake.clone(), Arc::new(|| {}), Rc::default());
-    overlay.connect(wake, Arc::new(|| {}), Rc::default());
+    overlay.connect(wake.clone(), Arc::new(|| {}), Arc::new(|| {}), Rc::default());
+    overlay.connect(wake, Arc::new(|| {}), Arc::new(|| {}), Rc::default());
     assert_eq!(overlay.rt.state.setups, 1, "setup runs once");
     while rx.try_recv().is_ok() {}
     let take = |overlay: &mut Overlay<State>| std::mem::take(&mut *overlay.shared.requests.lock().unwrap());

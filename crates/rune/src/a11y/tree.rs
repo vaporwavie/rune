@@ -16,6 +16,8 @@ use super::*;
 pub(crate) const ROOT: AkId = AkId(1);
 /// The help tooltip Rune draws, when one shows.
 const TOOLTIP: AkId = AkId(2);
+/// `Tx::announce`'s live region.
+const ANNOUNCER: AkId = AkId(3);
 /// Bits under an element's id for the nodes it owns: its text's lines and links.
 const SUB: u32 = 16;
 const LINK_BASE: u64 = 0x8000;
@@ -38,6 +40,7 @@ struct Stamp {
     viewport: (u32, u32, u32),
     name: u64,
     tooltip: u64,
+    announced: u32,
 }
 
 /// An activated tree: what the platform adapter holds, to diff the next update against.
@@ -53,6 +56,10 @@ pub(crate) struct A11yTree {
     stamp: Option<Stamp>,
     /// The next update must hold the whole tree (activation, or the adapter asked again).
     full: bool,
+    /// The last whole tree held back the announcer's words: an adapter raises no events for the
+    /// tree it starts from, so words said as a reader attached (a request arriving as it starts)
+    /// would never be spoken. The next update sends them as a change.
+    held: bool,
     /// The root's name when the runtime has no window title (an overlay's name).
     pub(crate) name: String,
     /// What the last update changed, beyond what AccessKit announces itself.
@@ -154,7 +161,7 @@ impl<S: 'static> Runtime<S> {
         if self.a11y.is_none() || self.drawn.len() != self.nodes.len() || self.nodes.is_empty() { return None; }
         let stamp = self.a11y_stamp();
         let tree = self.a11y.as_ref()?;
-        if !tree.full && tree.stamp.as_ref() == Some(&stamp) { return None; }
+        if !tree.full && !tree.held && tree.stamp.as_ref() == Some(&stamp) { return None; }
         // Only scrolled: the rows keep their bounds in their viewport's content space, so only
         // the viewports' offsets change. Sticky elements move against the content; they don't.
         let scrolled_only = !tree.full && !self.has_sticky
@@ -163,11 +170,17 @@ impl<S: 'static> Runtime<S> {
         let found = self.a11y_walk();
         let tree = self.a11y.as_ref()?;
         let full = tree.full;
-        let changed: Vec<bool> = found.slots.iter().map(|s| full || tree.sent.get(&s.id.0).is_none_or(|old| old.print != s.print)).collect();
-        let nodes = self.a11y_build(&found, &changed, &tree.name);
+        let hold = full && self.announcement.recent();
+        // Held words go out with the root, whose node carries the announcer.
+        let held = tree.held;
+        let changed: Vec<bool> = found.slots.iter().enumerate()
+            .map(|(k, s)| full || (held && k == 0) || tree.sent.get(&s.id.0).is_none_or(|old| old.print != s.print)).collect();
+        let nodes = self.a11y_build(&found, &changed, &tree.name, hold);
+        if hold { self.dirty = true; }
         let tree = self.a11y.as_mut()?;
         tree.stamp = Some(stamp);
         tree.full = false;
+        tree.held = hold;
         tree.pass = tree.pass.wrapping_add(1);
         let pass = tree.pass;
         for s in &found.slots {
@@ -253,7 +266,7 @@ impl<S: 'static> Runtime<S> {
     fn a11y_focus_now(&self) -> AkId {
         let Some(i) = self.focused_index() else { return ROOT };
         let n = &self.nodes[i];
-        let id = self.link_focus().filter(|&k| n.text.as_ref().is_some_and(|t| k < t.links.len()))
+        let id = self.link_focus().filter(|&k| n.text.as_ref().is_some_and(|t| k < t.cold.links.len()))
             .map_or(element_id(n.id), |k| link_id(n.id, k));
         let sent = self.a11y.as_ref().is_some_and(|t| t.sent.contains_key(&id.0));
         if sent { id } else { ROOT }
@@ -263,7 +276,7 @@ impl<S: 'static> Runtime<S> {
     pub fn accessibility_tree(&self) -> TreeUpdate {
         let found = self.a11y_walk();
         let name = self.a11y.as_ref().map_or("", |t| t.name.as_str());
-        let nodes = self.a11y_build(&found, &vec![true; found.slots.len()], name).into_iter().map(|(id, n, _)| (id, n)).collect();
+        let nodes = self.a11y_build(&found, &vec![true; found.slots.len()], name, false).into_iter().map(|(id, n, _)| (id, n)).collect();
         TreeUpdate { nodes, tree: Some(self.a11y_info()), tree_id: TreeId::ROOT, focus: found.focus }
     }
 
@@ -281,7 +294,7 @@ impl<S: 'static> Runtime<S> {
     fn a11y_stamp(&self) -> Stamp {
         let mut scrolls = 0u64;
         for (id, s) in &self.scrolls {
-            scrolls = scrolls.wrapping_add(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (s.drawn[0].to_bits() as u64) << 32 ^ s.drawn[1].to_bits() as u64);
+            scrolls = scrolls.wrapping_add(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (s.drawn_x.to_bits() as u64) << 32 ^ s.drawn.y().to_bits() as u64);
         }
         let focus = self.focus.path().map_or(0, hash_str) ^ self.link_focus().map_or(0, |k| k as u64 + 1) << 48;
         Stamp {
@@ -292,6 +305,7 @@ impl<S: 'static> Runtime<S> {
             viewport: (self.viewport.0.to_bits(), self.viewport.1.to_bits(), self.env.scale.to_bits()),
             name: self.window_title.current().map_or(0, hash_str),
             tooltip: self.help_tooltip().map_or(0, |(t, r)| mix(hash_str(t), r[0].to_bits() as u64 ^ (r[1].to_bits() as u64) << 32)),
+            announced: self.announcement.said(),
         }
     }
 
@@ -324,7 +338,7 @@ impl<S: 'static> Runtime<S> {
             let up = n.parent.map(|p| walk[p]).unwrap_or_default();
             let mut w = Walk { slot: up.slot, gone: up.gone, shift: up.shift, scrolled: up.scrolled };
             if let Some(p) = n.parent && let Some(st) = self.scrolls.get(&self.nodes[p].id) {
-                let [x, y] = self.content_to_window(p, st.drawn);
+                let [x, y] = self.content_to_window(p, [st.drawn_x, st.drawn.y()]);
                 w.shift = [w.shift[0] + x, w.shift[1] + y];
                 w.scrolled = true;
             }
@@ -340,7 +354,7 @@ impl<S: 'static> Runtime<S> {
                 if let Some((_, size)) = n.a11y.more.as_ref().and_then(|m| m.set) { slots[w.slot].set_size = Some(size); }
                 kids.push((w.slot, id));
                 if focused == Some(i) {
-                    focus = self.link_focus().filter(|&k| n.text.as_ref().is_some_and(|t| k < t.links.len()))
+                    focus = self.link_focus().filter(|&k| n.text.as_ref().is_some_and(|t| k < t.cold.links.len()))
                         .map_or(id, |k| link_id(n.id, k));
                 }
                 slots.push(Slot { id, element: Some(i), walk: w, role, print, set_size: None });
@@ -351,7 +365,8 @@ impl<S: 'static> Runtime<S> {
         // The root: its title, size, scale and the tooltip showing.
         let tip = self.help_tooltip().map_or(0, |(t, r)| mix(hash_str(t), r.iter().fold(0, |h, v| mix(h, v.to_bits() as u64))));
         let title = self.window_title.current().map_or(0, hash_str);
-        slots[0].print = [self.viewport.0.to_bits() as u64, self.viewport.1.to_bits() as u64, self.env.scale.to_bits() as u64, tip, title]
+        let said = u64::from(self.announcement.said());
+        slots[0].print = [self.viewport.0.to_bits() as u64, self.viewport.1.to_bits() as u64, self.env.scale.to_bits() as u64, tip, title, said]
             .into_iter().fold(0, mix);
         // Each node's children and set size are part of what it shows.
         let mut kid_prints = vec![0u64; slots.len()];
@@ -363,8 +378,8 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// The nodes of `found` whose `changed` flag is set, built, with their lines and links:
-    /// (id, node, fingerprint).
-    fn a11y_build(&self, found: &Found, changed: &[bool], fallback_name: &str) -> Vec<(AkId, AkNode, u64)> {
+    /// (id, node, fingerprint). `hold_words`: the announcer goes without its words for now.
+    fn a11y_build(&self, found: &Found, changed: &[bool], fallback_name: &str, hold_words: bool) -> Vec<(AkId, AkNode, u64)> {
         let mut children: Vec<Vec<AkId>> = vec![Vec::new(); found.slots.len()];
         for &(parent, id) in &found.kids {
             if changed[parent] { children[parent].push(id); }
@@ -386,6 +401,15 @@ impl<S: 'static> Runtime<S> {
                     kids.push(TOOLTIP);
                     out.push((TOOLTIP, node, s.print));
                 }
+                // Always there, so its first words are a change a reader announces, not a node
+                // that appeared.
+                let mut node = AkNode::new(Role::Status);
+                let (words, how) = self.announcement.words().unwrap_or_default();
+                if !words.is_empty() && !hold_words { node.set_label(words); }
+                node.set_live(if how == crate::LiveRegion::Assertive { accesskit::Live::Assertive } else { accesskit::Live::Polite });
+                node.set_bounds(AkRect { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 });
+                kids.push(ANNOUNCER);
+                out.push((ANNOUNCER, node, s.print));
                 if let Some(size) = s.set_size { root.set_size_of_set(size); }
                 root.set_children(kids);
                 out.push((ROOT, root, s.print));

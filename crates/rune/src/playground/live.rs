@@ -45,12 +45,8 @@ pub(crate) struct Live<S: 'static> {
     pub(super) folds: Folds,
     /// [`Playground::widths`].
     pub(super) widths: Widths,
-    /// The keyboard is on the open story's side controls, which take keys.
-    pub(super) side_active: bool,
     /// The column that has the keyboard.
-    pub(super) region: Region,
-    /// The focused element's path when the region last looked (see [`Live::see_focus`]).
-    pub(super) region_seen: Option<String>,
+    pub(super) keyboard: Keyboard,
     /// Whether the playground shows, and on a scene, that scene's stage.
     pub(super) showing: Showing<S>,
     pub(super) owned: Vec<Option<Box<dyn Any>>>,
@@ -75,6 +71,10 @@ pub(crate) struct Live<S: 'static> {
     /// The time scale the app had when the playground opened, which every new stage starts
     /// from and Back restores.
     pub(crate) app_time_scale: f32,
+    /// `compose` and `apply_requests`, which the runtime reaches through these so that only an app
+    /// that makes a playground (`Live::new`) links the playground's views and requests.
+    compose: fn(&Self, &S, fn(&S, &mut Cx<S>) -> El, &mut Cx<S>, (f32, f32)) -> El,
+    apply_requests: fn(&mut Self, f64, &mut S) -> bool,
 }
 
 impl<S: 'static> Live<S> {
@@ -106,9 +106,7 @@ impl<S: 'static> Live<S> {
             folded: Vec::new(),
             folds,
             widths,
-            side_active: false,
-            region: Region::List,
-            region_seen: None,
+            keyboard: Keyboard::default(),
             showing: Showing::Closed,
             controls,
             dark: None,
@@ -122,6 +120,8 @@ impl<S: 'static> Live<S> {
             generation: 0,
             root: 0,
             app_time_scale: 1.0,
+            compose: Self::compose,
+            apply_requests: Self::apply_requests,
         };
         // Scene names as `find` takes them: a path or a name, matching case if it can.
         let scene = |live: &Self, name: &str| {
@@ -237,8 +237,15 @@ impl<S: 'static> Live<S> {
         self.pending.iter().filter(|r| r.swaps_stage()).all(|r| matches!(r, Request::Replay | Request::Variant(_)))
     }
 
+    /// The window's root: the app's view above the bar, or the playground around its stage.
+    pub(crate) fn view(&self, app: &S, view: fn(&S, &mut Cx<S>) -> El, cx: &mut Cx<S>, viewport: (f32, f32)) -> El {
+        (self.compose)(self, app, view, cx, viewport)
+    }
+
     /// Applies the requests handlers made since the last commit; true when anything changed.
-    pub(crate) fn apply(&mut self, clock: f64, real: &mut S) -> bool {
+    pub(crate) fn apply(&mut self, clock: f64, real: &mut S) -> bool { (self.apply_requests)(self, clock, real) }
+
+    fn apply_requests(&mut self, clock: f64, real: &mut S) -> bool {
         self.now = clock;
         self.load_folds();
         self.load_widths();
@@ -320,7 +327,7 @@ impl<S: 'static> Live<S> {
         self.keep(real);
         self.showing = Showing::Closed;
         self.header = None;
-        self.region = Region::List;
+        self.moved(Moved::Closed);
         self.controls.filter = crate::TextEdit::default();
         self.variant.iter_mut().for_each(|v| *v = 0);
         self.owned.iter_mut().for_each(|o| *o = None);

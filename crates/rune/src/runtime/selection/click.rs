@@ -19,6 +19,8 @@ enum Step {
 #[derive(Clone, Copy)]
 pub(super) struct Hit {
     pub(super) caret: usize,
+    /// The side of `caret` the press was on, where two runs of different direction meet.
+    side: parley::Affinity,
     cluster: usize,
 }
 
@@ -96,20 +98,13 @@ impl InputClick {
     }
 }
 
-pub(super) fn hit(e: &crate::edit::TextEdit, l: &Layout<Ink>, x: f32, y: f32, s: f32, single: bool) -> Hit {
+pub(super) fn hit(e: &crate::edit::TextEdit, l: TextFlow<'_>, x: f32, y: f32, s: f32, single: bool) -> Hit {
     let h = (l.height() - 1e-3).max(0.0);
     let ys = if single || x < 0.0 { (y * s).clamp(0.0, h) } else { (y * s).max(0.0) };
-    let cur = crate::text::cursor_from_point(l, x * s, ys);
-    let caret = e.model_index(cur.index());
-    let cluster = if cur.affinity() == Affinity::Upstream
-        && let Some(cl) = cur.index().checked_sub(1).and_then(|b| parley::Cluster::from_byte_index(l, b))
-        && !cl.is_hard_line_break()
-    {
-        e.model_index(cl.text_range().start)
-    } else {
-        caret
-    };
-    Hit { caret, cluster }
+    let at = l.hit(x * s, ys);
+    let caret = e.model_index(at.index);
+    let cluster = at.before.map_or(caret, |b| e.model_index(b));
+    Hit { caret, side: at.side, cluster }
 }
 
 fn unit_at(e: &crate::edit::TextEdit, h: Hit, unit: Unit) -> (usize, usize) {
@@ -184,6 +179,19 @@ impl<S: 'static> Runtime<S> {
         self.press.hold(capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), down_at, second, None));
     }
 
+    /// Focuses text field `ji` with its caret at (x, y), as a single click does, but holds no
+    /// press: nothing drags from it (Linux's middle-click paste, `primary_selection.rs`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn place_caret(&mut self, ji: usize, x: f32, y: f32) {
+        let [lx, ly] = self.to_local(ji, x, y);
+        let jn = &self.nodes[ji];
+        let path = jn.path.clone();
+        let (ix, iy) = (lx - jn.inset[0], ly - jn.inset[1]);
+        self.input_click.presses.clear();
+        self.input_click.steps.push_back((path.clone(), Step::Down { clicks: 1, shift: false }));
+        self.queue.push(Action::Focus(path, ix, iy));
+    }
+
     pub(super) fn input_drag(&mut self, x: f32, y: f32, drag_move: bool) {
         if !drag_move {
             return;
@@ -223,17 +231,21 @@ impl<S: 'static> Runtime<S> {
         match step {
             Step::Down { clicks, shift } => {
                 self.set_focus(Some(path), false);
+                // A press mid-composition writes it into the text first, as a browser's field
+                // does, then puts the caret where it landed: the layout it hits already shows
+                // the composition in place.
+                self.finish_field_composition(one);
                 let e = access(states!(self));
                 e.set_single_line(single);
                 e.break_history_group();
                 e.clear_typing_style();
                 if e.preedit().is_some() {
                     self.input_click.clear();
-                    one.instant = true;
+                    one.commit = one.commit.instant();
                     return true;
                 }
                 if let Some(l) = layout {
-                    let h = hit(e, &l, x + scroll, y, s, single);
+                    let h = hit(e, l.view(), x + scroll, y, s, single);
                     if shift {
                         let anchor = e.anchor;
                         self.input_click.unit = Unit::Char;
@@ -249,9 +261,11 @@ impl<S: 'static> Runtime<S> {
                         self.input_click.unit = unit;
                         self.input_click.origin = origin;
                         e.set_selection(origin.0, origin.1);
+                        // A caret put down where two runs meet stays on the side pressed.
+                        if origin == (h.caret, h.caret) { e.affinity = h.side; }
                     }
                 }
-                one.instant = true;
+                one.commit = one.commit.instant();
                 true
             }
             Step::Drag => {
@@ -266,7 +280,7 @@ impl<S: 'static> Runtime<S> {
                     return false;
                 }
                 let Some(l) = layout else { return false };
-                let h = hit(e, &l, x + scroll, y, s, single);
+                let h = hit(e, l.view(), x + scroll, y, s, single);
                 let at = unit_at(e, h, self.input_click.unit);
                 let (anchor, focus) = extend(self.input_click.origin, at);
                 let before = (e.anchor, e.focus);
@@ -275,7 +289,7 @@ impl<S: 'static> Runtime<S> {
                     return false;
                 }
                 e.break_history_group();
-                one.instant = true;
+                one.commit = one.commit.instant();
                 true
             }
             Step::Cancelled => false,

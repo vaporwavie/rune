@@ -2,6 +2,7 @@
 //! polling while hidden, closing, hiding, opening and creating.
 
 use super::*;
+use super::minimize::{HiddenPoll, shell_take};
 
 impl<S: 'static> Host<S> {
     pub(super) fn window_request(&mut self, event_loop: &ActiveEventLoop, request: WindowRequest) {
@@ -50,7 +51,7 @@ impl<S: 'static> Host<S> {
         let Some(w) = &self.win else { return Found::Missing };
         let minimized = w.window.is_minimized() == Some(true);
         match self.life {
-            Life::Shown { covered } => Found::Shown { covered, minimized },
+            Life::Shown { sight } => Found::Shown { covered: sight.covered(), minimized },
             _ => Found::Hidden { minimized },
         }
     }
@@ -148,7 +149,7 @@ impl<S: 'static> Host<S> {
         #[cfg(target_os = "macos")]
         if let (Some(w), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) {
             let size = w.window.inner_size();
-            w.resize_surface(&gpu.device, size);
+            w.resize_surface(Some(&**gpu), size);
             let scale = w.window.scale_factor() as f32;
             self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
         }
@@ -175,9 +176,10 @@ impl<S: 'static> Host<S> {
         self.shortcuts.drain();
         self.menus.drain();
         let (mut had_updates, mut updated) = (false, false);
-        let requests = self.shared.drain(|f| {
+        let _receiving = self.shortcuts.receiving();
+        let requests = self.shared.drain_window(&mut self.rt, |changed| {
             had_updates = true;
-            updated |= self.rt.update_if(f);
+            updated |= changed;
             self.menus.drain();
         });
         let changed = clipboard || answered || updated || self.rt.drag_ends_pending();
@@ -207,9 +209,9 @@ impl<S: 'static> Host<S> {
         if let Some(position) = requests.position { self.set_position(event_loop, position); }
         if let Some(place) = requests.place { self.place(event_loop, place); }
         if let Some(request) = requests.window { self.window_request(event_loop, request); }
-        if requests.focus { self.focus(event_loop); }
+        if requests.activation == Some(Activation::Focus) { self.focus(event_loop); }
         // After the show it may follow; `focus` and `minimize` are last-wins (`AppHandle`).
-        self.rt.minimize_request |= requests.minimize;
+        if requests.activation == Some(Activation::Minimize) { self.rt.minimize_step(MinimizeEvent::Asked); }
         self.shell(event_loop);
         // A pop-up or file dialog a quiet update asked for may have been answered at once.
         let answered = quiet && ((!stale_before && self.rt.needs_commit()) || self.rt.has_pending_input());
@@ -218,17 +220,30 @@ impl<S: 'static> Host<S> {
         // A launcher's cached reveal draws nothing; a hidden one renders its changes hidden,
         // paced (`refresh_hidden`). A covered or minimised one runs them without asking for a
         // frame it wouldn't draw.
-        let launcher = self.launcher();
-        let visible = self.life.shown();
-        let framed = match self.win.as_ref().filter(|_| drain_frame(launcher, visible, shown, changed, quiet)) {
-            None => false,
-            Some(_) if launcher && !visible => self.refresh_hidden(),
-            Some(w) if (!launcher && self.life.covered()) || w.minimized() => {
+        let work = WakeWork::of(
+            WakeFacts {
+                window: self.win.is_some(),
+                launcher: self.launcher(),
+                visible: self.life.shown(),
+                was_shown: shown,
+                changed,
+                quiet,
+                covered: self.life.covered(),
+            },
+            || self.win.as_ref().is_some_and(Win::minimized),
+        );
+        let framed = match work {
+            WakeWork::Nothing => false,
+            WakeWork::HiddenFrame => self.refresh_hidden(),
+            WakeWork::CoveredFrame => {
                 self.covered_frame();
                 self.shell(event_loop);
                 true
             }
-            Some(w) => { w.request_redraw(); true }
+            WakeWork::Paint => {
+                if let Some(w) = &self.win { w.request_redraw(); }
+                true
+            }
         };
         // Neither a poll nor a frame comes to schedule the updates' `wake_after`s.
         if !polled && !framed { self.rt.schedule_pending_wakes(); }
@@ -237,14 +252,18 @@ impl<S: 'static> Host<S> {
     /// A hidden, keep-running or windowless window still reads its inbox when woken: `poll` runs
     /// with no drawable, present or animation, and its changes render when the window is next
     /// shown. A hidden launcher renders poll's changes hidden, paced, keeping its cached frame
-    /// fresh. A minimize waits for a show in the same turn (`shows`). Returns whether it polled.
+    /// fresh. A minimize waits for a show in the same turn (`Minimize`). Returns whether it
+    /// polled.
     pub(super) fn poll_hidden(&mut self, event_loop: &ActiveEventLoop, shows: bool) -> bool {
         if event_loop.exiting() || self.shown_win().is_some() { return false; }
         let changed = self.rt.poll_hidden();
         self.clipboard.flush(&mut self.rt);
-        let minimize = shows && std::mem::take(&mut self.rt.minimize_request);
+        // A show this turn minimizes after it: this poll holds the ask across its own shell, and
+        // a callback's ask during that shell is the one it takes first.
+        let poll = HiddenPoll::new(shows);
+        poll.enter(&mut self.rt);
         self.shell(event_loop);
-        self.rt.minimize_request |= minimize;
+        poll.leave(&mut self.rt);
         if changed && self.launcher() { self.refresh_hidden(); }
         true
     }
@@ -288,7 +307,7 @@ impl<S: 'static> Host<S> {
             if self.rt.stale() { w.request_redraw(); }
         }
         for _ in 0..8 {
-            let minimize = std::mem::take(&mut self.rt.minimize_request);
+            let minimize = shell_take(&mut self.rt);
             match self.rt.shell_request.take() {
                 Some(shell @ (Shell::Quit | Shell::Relaunch)) => {
                     let after = shell.after().unwrap_or(crate::quit::After::Exit);
@@ -317,12 +336,12 @@ impl<S: 'static> Host<S> {
             if self.file_dialog.open(&mut self.rt, window.map(|w| &**w)) && let Some(w) = shown { w.request_redraw(); }
             // A callback that ran (a menu that couldn't open) may have asked to close, quit or
             // minimize.
-            if self.rt.shell_request.is_none() && !self.rt.minimize_request { return; }
+            if self.rt.shell_request.is_none() && !self.rt.minimize.field() { return; }
         }
     }
 
     pub(super) fn close(&mut self, event_loop: &ActiveEventLoop) {
-        self.rt.minimize_request = false;
+        self.rt.minimize_step(MinimizeEvent::Lost);
         if let Some(w) = &mut self.win {
             w.first_frame.hide();
             #[cfg(target_os = "macos")]
@@ -330,7 +349,21 @@ impl<S: 'static> Host<S> {
         }
         self.secure_input.set(false);
         if !self.closes() { return; }
+        crate::marks::mark("window.close");
+        // The last window of an app that ends fast goes as a bare window's close does: its hook,
+        // then the window destroyed at once, with no hide before it. The quit runs after it and
+        // the process ends without dropping the window.
+        let ends = std::mem::take(&mut self.ends_app) && !self.keep_running && cfg!(target_os = "windows");
+        // Off the screen first: the close looks done at once and `on_close` runs unseen.
+        if !ends && let Some(w) = self.shown_win() { w.hide(); }
+        crate::marks::mark("window.close.hidden");
         self.close_hook();
+        crate::marks::mark("window.close.hooked");
+        #[cfg(target_os = "windows")]
+        if ends && let Some(w) = &self.win {
+            crate::platform::win32::destroy_window_now(&w.window);
+            crate::marks::mark("window.destroyed");
+        }
         self.rt.set_live_visible(false);
         // While the window still shows its last frames.
         if let Some(trace) = &mut self.trace { trace.settle_presents(crate::frame::present_time::SETTLE); }
@@ -348,7 +381,8 @@ impl<S: 'static> Host<S> {
             self.file_dialog.cancel(&mut self.rt);
             self.rt.cancel_pointer();
             self.files = FileDrop::default();
-            if let Some(w) = &mut self.win { w.apply_cursor(&self.rt, false); w.hide(); }
+            if !ends && let Some(w) = &mut self.win { w.apply_cursor(&self.rt, false); w.hide(); }
+            crate::marks::mark("window.hidden");
             self.life.finish();
             return;
         }
@@ -367,13 +401,46 @@ impl<S: 'static> Host<S> {
     }
 
     pub(super) fn hide(&mut self, event_loop: &ActiveEventLoop) {
+        self.rest_step(RestEvent::Unseen);
+        self.stop_showing();
+        self.wind_down();
+        let launcher = self.launcher();
+        if self.release_gpu && !launcher {
+            self.release();
+        } else if is_wayland(event_loop) {
+            // Wayland has no hidden toplevel: unmap by destroying, recreate on open.
+            self.win = None;
+            self.native_handle.native.ready.store(false, Ordering::Release);
+            self.native_handle.native.number.store(0, Ordering::Release);
+        } else if let Some(w) = self.win.as_mut() {
+            w.stop_pacing();
+            w.backoff_step(BackoffEvent::Lapsed);
+            w.presented = None;
+            // Its hidden frame delivers the focus loss.
+            if launcher { w.request_redraw(); }
+        }
+    }
+
+    /// What a window does just before it stops drawing: it leaves `Life` (a window that hid can
+    /// be reopened), drops a pending minimize, lands a frame move where it was going, and (macOS)
+    /// delivers the Fn key change a hide need not report. No event loop is needed, so a window
+    /// whose surface can't be replaced does the same before `wind_down`
+    /// (`Host::replace_lost_surface`).
+    pub(super) fn stop_showing(&mut self) {
         self.life.hide(crate::platform::reopen::stamp);
-        self.rt.minimize_request = false;
+        self.rt.minimize_step(MinimizeEvent::Lost);
         self.land_frame();
         // Before the window can go: a hide need not report a blur. `about_to_wait` delivers it,
         // after any Fn change the monitor saw first.
         #[cfg(target_os = "macos")]
         self.fn_key();
+    }
+
+    /// What a window stops doing when it hides: keys released, secure input and IME off, popups
+    /// and file dialogs cancelled, the pointer cancelled, drops dropped, modifiers reset, the
+    /// cursor back to normal, and the native window hidden. No event loop is needed, so a window
+    /// that loses its surface does the same from `draw` (`Host::replace_lost_surface`).
+    pub(super) fn wind_down(&mut self) {
         self.rt.keys_lost();
         if let Some(w) = &mut self.win {
             w.first_frame.hide();
@@ -392,26 +459,18 @@ impl<S: 'static> Host<S> {
         if let Some(w) = &mut self.win { w.apply_cursor(&self.rt, false); }
         self.mods = ModifiersState::empty();
         if let Some(w) = &self.win { w.hide(); }
-        let launcher = self.launcher();
-        if self.release_gpu && !launcher {
-            self.win = None;
-            self.native_handle.native.ready.store(false, Ordering::Release);
-            self.native_handle.native.number.store(0, Ordering::Release);
-            self.gpu = None;
-            self.rt.text.atlas.invalidate();
-            self.rt.images.invalidate();
-        } else if is_wayland(event_loop) {
-            // Wayland has no hidden toplevel: unmap by destroying, recreate on open.
-            self.win = None;
-            self.native_handle.native.ready.store(false, Ordering::Release);
-            self.native_handle.native.number.store(0, Ordering::Release);
-        } else if let Some(w) = self.win.as_mut() {
-            w.stop_pacing();
-            w.retry = None;
-            w.presented = None;
-            // Its hidden frame delivers the focus loss.
-            if launcher { w.request_redraw(); }
-        }
+    }
+
+    /// Gives up the window and the device and surface it drew with, as `hide` does for an app
+    /// that releases its GPU when closed. The next `open` makes a window, a device and a surface
+    /// (an app that sees `AppHandle::window_error` and the window gone can ask for one).
+    pub(super) fn release(&mut self) {
+        self.win = None;
+        self.native_handle.native.ready.store(false, Ordering::Release);
+        self.native_handle.native.number.store(0, Ordering::Release);
+        self.gpu = None;
+        self.rt.text.atlas.invalidate();
+        self.rt.images.invalidate();
     }
 
     /// Creates the window, or records why it can't be and leaves the app windowless; a later
