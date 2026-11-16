@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use rune::runtime::ElementInfo;
 use rune::{TextStyle, Chrome, Cx, El, Env, Key, KeyEvent, Mods, Runtime, TextEdit, TitlebarAction, col, el};
-use rune_kit::shell::{Page, PaneState, Sidebar, SidebarRow, SidebarSection, SplitView, Toolbar, is_sidebar_toggle};
+use rune_kit::shell::{Page, PaneState, Sidebar, SidebarRow, SidebarSection, SidebarToggle, SplitView, Toolbar, is_sidebar_toggle};
 use rune_kit::{Button, IconButton, Kit, glyphs};
 
 const NAMES: [&str; 4] = ["Alpha", "Bravo", "Charlie", "Delta"];
@@ -960,4 +960,41 @@ fn a_section_header_takes_a_height_and_a_trailing_count_and_a_row_takes_a_title_
     assert_eq!(ink("aside"), Some(k.c.text_faint));
     assert_eq!(ink("picked"), Some(k.c.text_base), "a selected row keeps the base ink");
     assert_eq!(ink("plain-row"), Some(k.c.text_muted));
+}
+
+#[test]
+fn a_sidebar_title_sits_past_the_lights_truncates_before_an_in_header_toggle_and_drags_the_window() {
+    fn view(s: &S, cx: &mut Cx<S>) -> El {
+        let k = Kit::neutral(true);
+        let name = if s.two_lines { "A name far too long for the sidebar's title bar row to hold" } else { "Name" };
+        SplitView::new(col().key("body"))
+            .sidebar(&s.sidebar, |s: &mut S| &mut s.sidebar, Sidebar::new().label("Sessions").build(&k))
+            .sidebar_title(rune::text(name).key("name").truncate().shrink().min_w(0.0))
+            .sidebar_toggle(SidebarToggle::new().in_header())
+            .titlebar_inset(cx.titlebar_inset())
+            .build(&k)
+    }
+    let mut rt = Runtime::new(state(), view, (1000.0, 600.0), Env::new(true, 1.0));
+    let inset = Chrome::DEFAULT.titlebar_inset();
+    rt.set_titlebar_inset(inset);
+    rt.frame(0.0);
+    let band = find(&rt, "sidebar-titlebar");
+    let name = find(&rt, "name");
+    assert_eq!(name.rect[0], inset + 8.0, "the title starts past the traffic lights");
+    assert_eq!(name.rect[1] + name.rect[3] / 2.0, band.rect[1] + band.rect[3] / 2.0, "it centres in the row");
+    let toggle = find(&rt, "sidebar-toggle");
+    assert!(name.rect[0] + name.rect[2] < toggle.rect[0], "a short title leaves the toggle clear");
+
+    rt.state.two_lines = true;
+    rt.invalidate();
+    settle(&mut rt);
+    let (name, toggle) = (find(&rt, "name"), find(&rt, "sidebar-toggle"));
+    assert_eq!(toggle.rect[0] + toggle.rect[2], 240.0, "the toggle keeps its place at the row's end");
+    assert!(name.rect[0] + name.rect[2] <= toggle.rect[0] - 8.0 + 0.5, "a long title truncates before the toggle: {name:?}");
+
+    let (x, y) = rt.find("name").unwrap();
+    rt.pointer_move(x, y);
+    rt.pointer_down(x, y);
+    assert_eq!(rt.take_titlebar_action(), Some(TitlebarAction::Drag), "the title drags the window");
+    rt.pointer_up(x, y);
 }
