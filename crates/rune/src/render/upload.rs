@@ -29,8 +29,8 @@ pub(super) struct Uploads {
     has_layers: bool,
     /// The viewport last written to globals (`width << 32 | height`, `u64::MAX` before any).
     viewport: AtomicU64,
-    /// Gamma-space blend and byte-source flags last written to globals.
-    srgb: Option<(bool, bool)>,
+    /// Gamma-space blend, byte-source, and packed scroll-fade stops last written to globals.
+    srgb: Option<(bool, bool, [u32; 2])>,
     /// `Staging::lost` as last seen by `prepare` and by `upload_images`.
     lost: (u64, u64),
     /// The paint the next `prepare`'s instances come from, and which of them alone changed
@@ -55,7 +55,7 @@ impl Default for Uploads {
 
 impl Uploads {
     /// Forgets what the instance buffer holds, so the next frame writes and batches it all.
-    fn forget_instances(&mut self) {
+    pub(super) fn forget_instances(&mut self) {
         self.instances.clear();
         self.batched = false;
         self.held_paint = None;
@@ -148,7 +148,11 @@ impl Renderer {
         let mut changed = self.images.len() != images.pages.len();
         self.images.resize_with(images.pages.len(), || None);
         for (index, page) in images.pages.iter_mut().enumerate() {
-            if page.data.is_empty() { changed |= self.images[index].is_some(); self.images[index] = None; continue; }
+            // A page past the device's largest texture (placed before this renderer said its limit)
+            // draws nothing rather than failing validation.
+            if page.data.is_empty() || page.width.max(page.height) > self.max_texture_dim {
+                changed |= self.images[index].is_some(); self.images[index] = None; continue;
+            }
             if self.images[index].as_ref().is_none_or(|(t, _)| t.width() != page.width || t.height() != page.height) {
                 let texture = Self::image_texture(device, page.width, page.height);
                 let bind = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None);
@@ -161,6 +165,26 @@ impl Renderer {
         }
         if changed { self.images_changed(); }
         self.refresh_layer_bindings(device);
+    }
+
+    /// Drops every uploaded image page's GPU texture and any layer bind groups referencing them.
+    /// Returns whether any texture was held. The next `upload_images` recreates textures for pages
+    /// still present in `ImageAtlas`.
+    #[cfg_attr(not(any(test, not(any(target_os = "macos", target_arch = "wasm32")))), allow(dead_code))]
+    pub(crate) fn clear_images(&mut self) -> bool {
+        let had = self.images.iter().any(Option::is_some);
+        if self.images.is_empty() && !had { return false; }
+        self.images.clear();
+        self.layers.clear_images();
+        self.images_changed();
+        #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
+        self.report_pools();
+        had
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_images(&self) -> bool {
+        self.images.iter().any(Option::is_some)
     }
 
     /// Uploads several instance lists back to back (one buffer, one glyph upload) and returns
@@ -284,9 +308,9 @@ impl Renderer {
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, viewport) as u64, bytemuck::cast_slice(&[viewport.0 as f32, viewport.1 as f32]));
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }
-        let mode = (self.srgb_blend, byte_source);
+        let mode = (self.srgb_blend, byte_source, [self.fade_stops[0].to_bits(), self.fade_stops[1].to_bits()]);
         if self.uploads.srgb.replace(mode) != Some(mode) {
-            let flags: [f32; 4] = [self.srgb_blend as u8 as f32, byte_source as u8 as f32, 0.0, 0.0];
+            let flags: [f32; 4] = [self.srgb_blend as u8 as f32, byte_source as u8 as f32, self.fade_stops[0], self.fade_stops[1]];
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, flags) as u64, bytemuck::cast_slice(&flags));
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }

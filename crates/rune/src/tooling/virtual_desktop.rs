@@ -11,7 +11,6 @@ use serde_json::json;
 use crate::AnyWindowSpec;
 use crate::desktop::displays::VirtualDesktop;
 use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
-use crate::time::Instant;
 use crate::tooling::headless_run::WindowFrame;
 use crate::tooling::{Args, Ev, Kind, Pos, Shot, Timeline, Trace, die};
 
@@ -317,7 +316,7 @@ impl Desk {
 /// `--scene`, `--tree` and `--trace` describe.
 /// `accessory` is `RunOptions::accessory`: reopening brings back no window.
 pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, accessory: bool) {
-    let launched = Instant::now();
+    let launched = crate::time::now();
     let backdrop = args.desktop.clone().expect("--desktop");
     if args.list_scenes { die("--list-scenes lists one window's scenes; drop --desktop"); }
     let source = crate::tooling::read_script(&args);
@@ -362,7 +361,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
     let initial = desk.topmost_visible();
     desk.focus(initial, true);
 
-    let t0 = Instant::now();
+    let t0 = crate::time::now();
     let features = desk.members.iter().fold(wgpu::Features::empty(), |f, m| f | m.features());
     let gpu = Gpu::try_with_features(Gpu::instance_for(features), None, features).unwrap_or_else(|e| die(&e));
     let max = gpu.device.limits().max_texture_dimension_2d;
@@ -375,6 +374,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
     }
     let target = Offscreen::new(&gpu.device, wp, hp);
     let mut readback = crate::tooling::record::Readback::new(&gpu.device, &target, crate::tooling::record::DEPTH);
+    let mut in_flight = crate::tooling::record::InFlight::new(crate::tooling::record::DEPTH);
     let mut slots: Vec<Option<Slot>> = (0..n).map(|_| None).collect();
     let mut overlay = (args.keys.is_some() || args.pointer)
         .then(|| (crate::input::keycaps::Overlay::new(size, scale, args.keys, args.keys_theme, args.pointer), Renderer::new(&gpu.device, OFFSCREEN_FORMAT)));
@@ -420,14 +420,14 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
         desk.drain(&desktop, 0.0);
     }
 
-    let wall = Instant::now();
+    let wall = crate::time::now();
     let mut cpu_ms = Vec::new();
     let mut next_ev = 0;
     let mut last_down = (0.0f32, 0.0f32);
     let mut drawn: Vec<(usize, bool)> = Vec::with_capacity(n);
     for k in 0..=last_frame {
         let real_t = k as f64 * dt;
-        let frame_start = Instant::now();
+        let frame_start = crate::time::now();
         while next_ev < script.len() && script[next_ev].t <= real_t + 1e-9 {
             let e = &script[next_ev];
             next_ev += 1;
@@ -521,6 +521,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
             let app_dark = key.and_then(|i| desk.members[i].backdrop_dark()).unwrap_or(dark);
             let ort = ov.frame(real_t, step, app_dark);
             if !ort.instances.is_empty() {
+                ui.set_fade_stops(ort.fade_stops());
                 ui.prepare_ui(&gpu.device, &gpu.queue, &mut ort.text.atlas, &ort.instances, (wp, hp));
                 ui.draw_over(&mut enc, &target.view);
             }
@@ -538,13 +539,14 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
             for (shot, px) in readback.make_room(&gpu.device) { deliver(shot, px); }
             readback.copy(&mut enc, &target, shot);
         }
-        gpu.queue.submit([enc.finish()]);
+        in_flight.push(gpu.queue.submit([enc.finish()]));
         if want_pixels { readback.submitted(); }
         let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         cpu_ms.push(ms);
         if let Some(tr) = trace.as_mut() { desk.members[selected].trace(tr, real_t * 1000.0, ms); }
         if first_pixels {
             let done = readback.finish(&gpu.device);
+            in_flight.clear();
             let marker = json!({
                 "headless_ms": launched.elapsed().as_secs_f64() * 1000.0, "gpu_init_ms": init_ms, "frame_cpu_ms": ms,
                 "pixel_bytes": done.last().map_or(0, |(_, px)| px.len()),
@@ -554,6 +556,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
         } else if want_pixels {
             for (shot, px) in readback.ready(&gpu.device) { deliver(shot, px); }
         }
+        in_flight.pace(&gpu.device);
         if k == snap_frame && let Some(p) = &args.tree {
             let mut tree = desk.members[selected].tree(real_t);
             tree["windows"] = (0..n).map(|i| {
@@ -570,7 +573,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
     if let Some(video) = writer.finish().unwrap_or_else(|e| die(&e)) {
         eprintln!("rune: wrote {} ({frames_written} frames at {fps} fps)", video.display());
     }
-    gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
     if let Some(p) = &args.strip { crate::tooling::write_strip(p, &strip, (wp, hp), &crops_px, gap, args.cols); }
     let wall = wall.elapsed().as_secs_f64();
     let mean = cpu_ms.iter().sum::<f64>() / cpu_ms.len() as f64;

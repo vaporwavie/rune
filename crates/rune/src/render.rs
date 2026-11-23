@@ -106,6 +106,7 @@ pub use instance::KIND_SHADOW;
 pub use instance::KIND_TRIANGLE;
 pub use instance::Kind;
 pub use instance::NO_CLIP;
+pub(crate) use instance::STOP_FADE_BIAS;
 pub use instance::pack_clip_radii;
 pub use instance::pack_fade;
 pub use instance::unpack_clip_radii;
@@ -116,6 +117,7 @@ pub use offscreen::Offscreen;
 pub use offscreen::write_png;
 pub use rune_core::Blend;
 pub use warmup::warm_gpu;
+pub use warmup::warm_gpu_cache;
 pub use warmup::warm_gpu_with;
 
 /// Rows the first glyph atlas page's texture starts with: a window that shows a few labels holds
@@ -225,6 +227,9 @@ pub struct EffectSite<'a> {
     /// (`in_layer: true`), holds that layer's offscreen target copied at `origin` in window
     /// coordinates.
     pub backdrop: Option<&'a wgpu::TextureView>,
+    /// Packed explicit scroll-fade stops (`Runtime::fade_stops`) for this frame, matching
+    /// `clip_alpha_stops` in `CLIP_WGSL` (`[0.0, 0.0]` when no scroller uses `ScrollFade::stops`).
+    pub fade_stops: [f32; 2],
 }
 
 /// Called at each effect slot, with the pass open and everything painted before the slot already
@@ -304,6 +309,7 @@ pub struct Renderer {
     spring_instances: usize,
     layers: layers::Layers,
     srgb_blend: bool,
+    fade_stops: [f32; 2],
     /// Effect slots of the uploaded instances, by index.
     effects: Vec<(u32, Instance)>,
     /// Pooled viewport-sized backdrop copies, allocated only when a slot sets `effect_backdrop`
@@ -346,6 +352,14 @@ impl Renderer {
         if let Some(s) = &mut self.surfaces {
             s.set_srgb_blend(enabled);
         }
+    }
+
+    pub fn set_fade_stops(&mut self, stops: [f32; 2]) {
+        self.fade_stops = stops;
+    }
+
+    pub fn fade_stops(&self) -> [f32; 2] {
+        self.fade_stops
     }
 
     /// Opt-in retained geometry. IDs map instances to shared translation/opacity nodes.
@@ -477,7 +491,7 @@ impl Renderer {
             };
             pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
             hook(EffectPhase::Draw(pass), &EffectSite { index: *at, instance, mark: effect_mark(instance), data: instance.uv, scale: instance.params[3],
-                format, origin, size, in_layer: target.is_some(), srgb_blend: self.srgb_blend, backdrop });
+                format, origin, size, in_layer: target.is_some(), srgb_blend: self.srgb_blend, backdrop, fade_stops: self.fade_stops });
             pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
             pass.set_scissor(pass.scissor(), size);
         }
@@ -621,20 +635,20 @@ impl Renderer {
 }
 
 /// How far a corner of radius `radius` reaches along each edge. Radii are signed: a negative
-/// radius draws Apple's continuous corner, whose curve starts 1.528 times the radius from the
-/// corner (`CONTINUOUS_K` in shader.wgsl).
+/// radius draws Apple's continuous corner, whose curve starts `CONTINUOUS_K` times the radius from
+/// the corner (`CONTINUOUS_K` in clip.wgsl).
 pub(crate) fn corner_extent(radius: f32) -> f32 {
     if radius < 0.0 { -radius * CONTINUOUS_K } else { radius }
 }
 
-pub(crate) const CONTINUOUS_K: f32 = 1.528_664_8;
+pub(crate) const CONTINUOUS_K: f32 = instance::shader_consts::CONTINUOUS_K;
 
 /// Frame-profile builds: `RUNE_PINNED` forcing the split on (`all`) or off (`off`), and the instances drawn
 /// unsplit and split since the last report (`report_pinned`).
 #[cfg(feature = "frame-profile")]
 pub(super) fn pinned_forced() -> Option<bool> {
     static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| match std::env::var("RUNE_PINNED").as_deref() { Ok("all") => Some(true), Ok("off") => Some(false), _ => None })
+    *FORCED.get_or_init(|| match rune_core::env::var("RUNE_PINNED").as_deref() { Some("all") => Some(true), Some("off") => Some(false), _ => None })
 }
 
 #[cfg(feature = "frame-profile")]

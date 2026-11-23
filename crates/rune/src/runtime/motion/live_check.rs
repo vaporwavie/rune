@@ -27,7 +27,7 @@ impl RuntimeCore {
     /// Always empty in release builds.
     pub fn live_only_warnings(&self) -> &[String] {
         #[cfg(debug_assertions)]
-        { &self.frame.live_only_warnings }
+        { self.frame.live_only_warnings() }
         #[cfg(not(debug_assertions))]
         { &[] }
     }
@@ -37,15 +37,15 @@ impl RuntimeCore {
     /// second after the last commit by committing anyway (true) and comparing what it built.
     pub(in crate::runtime) fn skip_view(&mut self, label: impl std::fmt::Display) -> bool {
         #[cfg(debug_assertions)]
-        if self.frame.live_only_check && self.clock - self.commit.last_commit_clock >= LIVE_ONLY_CHECK {
+        if self.frame.live_only_check && self.clock - self.commit.last_commit_clock() >= LIVE_ONLY_CHECK {
             if self.frame.live_check.is_none() { self.frame.live_check = Some((label.to_string(), self.view_print())); }
             self.frame.live_checks += 1;
-            self.frame.live.set();
+            if self.frame.has_live_subscriptions() { self.frame.live.set(); }
             return true;
         }
         let _ = label;
         self.frame.live_only_skips += 1;
-        self.frame.live.set();
+        if self.frame.has_live_subscriptions() { self.frame.live.set(); }
         false
     }
 
@@ -226,7 +226,7 @@ impl NodePrint {
             ("text style", |t| key(|h| bits(&[t.style.size, t.style.weight]).hash(h)), Some(|t| format!("{:.1}pt weight {}", t.style.size, t.style.weight))),
             ("pills", |t| key(|h| for p in &t.cold.pills {
                 (p.start, p.end, p.icon.map(|i| i.name), p.bg, p.fg).hash(h);
-                p.bare.as_ref().map(|b| (b.size.to_bits(), b.gap.to_bits(), b.radius.to_bits(), b.image.as_ref().map(crate::pixels::Pixels::signature))).hash(h);
+                p.bare.as_ref().map(|b| (b.size.to_bits(), b.gap.to_bits(), b.radius.to_bits(), b.image.as_ref().map(crate::pixels::Pixels::signature), b.replace.map(|r| bits(&[r.width, r.ascent, r.descent, r.bleed])))).hash(h);
             }), None),
             ("rings", |t| key(|h| for &(a, b, c, w) in &t.cold.rings { (a, b, c, w.to_bits()).hash(h) }), None),
             ("strikes", |t| key(|h| t.cold.strikes.hash(h)), None),

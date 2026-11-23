@@ -41,6 +41,7 @@ pub(crate) use placement::restore_frame;
 
 /// Loads a Windows system DLL from System32 only, never from the application directory or CWD.
 /// Rejects names containing path separators or drive prefixes.
+#[allow(unsafe_code)]
 pub(crate) fn load_system_dll(name: &str) -> windows_sys::Win32::Foundation::HMODULE {
     use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
     if name.is_empty() || name.contains(['\\', '/', ':']) {
@@ -59,6 +60,7 @@ pub(crate) fn hwnd(window: &winit::window::Window) -> Option<HWND> {
 
 /// When the display shows its next refresh after `now`, from DWM's timing (`now` plus a 60 Hz
 /// frame when DWM won't say).
+#[allow(unsafe_code)]
 pub(crate) fn next_vblank(now: std::time::Instant) -> std::time::Instant {
     use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
     // The first ask comes from the window's first frame, as DWM shows the window: the query then
@@ -84,6 +86,7 @@ pub(crate) fn next_vblank(now: std::time::Instant) -> std::time::Instant {
 }
 
 /// Whether a screen reader is running (`SPI_GETSCREENREADER`).
+#[allow(unsafe_code)]
 pub(crate) fn screen_reader() -> bool {
     let mut on = 0i32;
     // SAFETY: SPI_GETSCREENREADER writes one BOOL.
@@ -92,6 +95,7 @@ pub(crate) fn screen_reader() -> bool {
 
 /// Whether the system asks `window` to paint part of itself again (an update region): it threw
 /// away what the window showed, as when a window covered whole comes back.
+#[allow(unsafe_code)]
 pub(crate) fn repaint_owed(window: &winit::window::Window) -> bool {
     use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
     let Some(hwnd) = hwnd(window) else { return false };
@@ -107,11 +111,12 @@ pub(crate) fn repaint_owed(window: &winit::window::Window) -> bool {
 /// since. Returns how many it raised.
 pub(crate) fn unidle_d3d_threads_soon() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| { let _ = std::thread::Builder::new().name("rune-unidle".into()).spawn(|| { unidle_d3d_threads(); std::thread::sleep(std::time::Duration::from_secs(2)); unidle_d3d_threads(); }); });
+    ONCE.call_once(|| { std::thread::Builder::new().name("rune-unidle".into()).spawn(|| { unidle_d3d_threads(); std::thread::sleep(std::time::Duration::from_secs(2)); unidle_d3d_threads(); }).ok(); });
 }
 
 /// This process's threads by name and priority, counted (`name (priority) xN`, unnamed ones as
 /// `?`), for saying what a quit waits on.
+#[allow(unsafe_code)]
 pub(crate) fn threads_summary() -> String {
     let mut seen: Vec<(String, i32, usize)> = Vec::new();
     for_each_own_thread(|thread| {
@@ -128,6 +133,7 @@ pub(crate) fn threads_summary() -> String {
 
 /// Raises this process's threads whose name passes `named` and whose priority is under `floor` to
 /// `floor` (a `THREAD_PRIORITY_*`); returns how many. Walks only this process's threads.
+#[allow(unsafe_code)]
 pub fn raise_threads(named: impl Fn(&str) -> bool, floor: i32) -> usize {
     use windows_sys::Win32::System::Threading::{GetThreadPriority, SetThreadPriority};
     let mut raised = 0;
@@ -149,6 +155,7 @@ fn unidle_d3d_threads() -> usize {
 /// Calls `f` with a handle to each of this process's threads, open for querying and setting its
 /// priority, walking this process's own thread list (`NtGetNextThread`). A Toolhelp snapshot lists
 /// every thread on the machine: 67-75 ms a walk on a busy one, twice per launch.
+#[allow(unsafe_code)]
 fn for_each_own_thread(mut f: impl FnMut(windows_sys::Win32::Foundation::HANDLE)) {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -168,6 +175,7 @@ fn for_each_own_thread(mut f: impl FnMut(windows_sys::Win32::Foundation::HANDLE)
         // SAFETY: this process's pseudo-handle and the last thread handle it returned (or none);
         // each handle it returns is closed once the next is taken.
         let status = unsafe { next(GetCurrentProcess(), prev, THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0, &mut thread) };
+        // SAFETY: `prev` is a non-null thread handle returned by the prior `NtGetNextThread` call and is closed once here.
         if !prev.is_null() { unsafe { CloseHandle(prev) }; }
         if status < 0 || thread.is_null() { return; }
         f(thread);
@@ -176,6 +184,7 @@ fn for_each_own_thread(mut f: impl FnMut(windows_sys::Win32::Foundation::HANDLE)
 }
 
 /// A thread's description (`SetThreadDescription`), if it has one.
+#[allow(unsafe_code)]
 fn thread_name(thread: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::System::Threading::GetThreadDescription;
@@ -191,6 +200,7 @@ fn thread_name(thread: windows_sys::Win32::Foundation::HANDLE) -> Option<String>
 }
 
 /// Drops the paint the system still owes `window`, which the loop just painted itself.
+#[allow(unsafe_code)]
 pub(crate) fn drop_paint(window: &winit::window::Window) {
     use windows_sys::Win32::Graphics::Gdi::{RDW_NOINTERNALPAINT, RedrawWindow};
     let Some(hwnd) = hwnd(window) else { return };
@@ -198,8 +208,10 @@ pub(crate) fn drop_paint(window: &winit::window::Window) {
     unsafe { RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_NOINTERNALPAINT) };
 }
 
+#[allow(unsafe_code)]
 pub(crate) fn pointer_position() -> Option<(i32, i32)> {
     let mut p = POINT { x: 0, y: 0 };
+    // SAFETY: `p` is a valid, aligned local `POINT` out-parameter.
     (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
 }
 
@@ -218,7 +230,9 @@ struct Input {
 }
 impl Input {
     fn track(&self) -> bool { self.input.get() == OverlayInput::Regions || self.follow.get() }
+    #[allow(unsafe_code)]
     fn local(&self, mut point: POINT) -> (f32, f32) {
+        // SAFETY: `self.hwnd` is a live window owned by this thread and `point` is a valid local `POINT`.
         unsafe { windows_sys::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut point); }
         (point.x as f32 / self.scale.get(), point.y as f32 / self.scale.get())
     }
@@ -229,10 +243,12 @@ impl Input {
             _ => false,
         })
     }
+    #[allow(unsafe_code)]
     fn observe(&self, point: POINT) {
         if !self.visible.get() { return; }
         let local = self.local(point);
         {
+            // SAFETY: `self.hwnd` is a live window owned by this thread; `GWL_EXSTYLE` toggles `WS_EX_TRANSPARENT`.
             unsafe {
                 let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
                 let next = if self.hit(local) { style & !WS_EX_TRANSPARENT } else { style | WS_EX_TRANSPARENT };
@@ -246,6 +262,7 @@ thread_local! {
     static INPUTS: RefCell<Vec<Rc<Input>>> = const { RefCell::new(Vec::new()) };
 }
 
+#[allow(unsafe_code)]
 unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, _: usize, data: usize) -> LRESULT {
     let ptr = data as *const Input;
     if message == WM_NCDESTROY {
@@ -278,6 +295,7 @@ unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wparam: WPARAM, lpa
         WM_CAPTURECHANGED => input.captured.set(false),
         _ => {}
     }
+    // SAFETY: forwards the unhandled message to the next procedure in this window's subclass chain.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
@@ -291,11 +309,13 @@ pub(crate) struct OverlayWindow {
     keys: crate::KeyPolicy,
 }
 impl OverlayWindow {
+    #[allow(unsafe_code)]
     pub fn new(window: &winit::window::Window, interactive: bool, options: &OverlayOptions, wake: Option<crate::Waker>) -> Result<Self, String> {
         let hwnd = hwnd(window).ok_or("the overlay window has no Win32 handle")?;
         let mode = options.input.resolved(interactive);
         overlay_styles(hwnd, mode, options.keys)?;
         let exclusion = if options.exclude_from_capture {
+            // SAFETY: `hwnd` is a live window owned by this thread; `WDA_EXCLUDEFROMCAPTURE` is a valid display affinity flag.
             if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 { OverlaySupport::Requested } else { OverlaySupport::Failed }
         } else { OverlaySupport::Unknown };
         let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), follow: Cell::new(options.follow_pointer), level: options.level, fading: Cell::new(false) });
@@ -303,14 +323,17 @@ impl OverlayWindow {
         // SAFETY: `data` is reclaimed exactly once, either by `Drop` or by `WM_NCDESTROY`,
         // whichever succeeds in removing the subclass.
         if unsafe { SetWindowSubclass(hwnd, Some(subclass), 0x52554e45, data as usize) } == 0 {
+            // SAFETY: `SetWindowSubclass` failed, so no subclass took ownership of `data`; reclaim the `Rc` created by `into_raw` above.
             unsafe { drop(Rc::from_raw(data)); }
             return Err(format!("SetWindowSubclass failed: {}", last_error()));
         }
         Ok(Self { input, observing: false, exclusion, watch: None, wake, keys: options.keys })
     }
     pub fn capture_exclusion(&self) -> OverlaySupport { self.exclusion }
+    #[allow(unsafe_code)]
     pub fn set_capture_exclusion(&mut self, exclude: bool) -> OverlaySupport {
         let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+        // SAFETY: `self.input.hwnd` is a live window owned by this thread and `affinity` is a valid `WDA_*` constant.
         let applied = unsafe { SetWindowDisplayAffinity(self.input.hwnd, affinity) } != 0;
         self.exclusion = match (exclude, applied) { (true, true) => OverlaySupport::Requested, (true, false) => OverlaySupport::Failed, (false, _) => OverlaySupport::Unknown };
         self.exclusion
@@ -327,10 +350,19 @@ impl OverlayWindow {
     pub fn set_input(&mut self, input: OverlayInput) {
         self.input.input.set(input);
         self.refresh_watch();
-        if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
+        self.observe_current();
     }
     pub fn set_follow_pointer(&mut self, follow: bool) { self.input.follow.set(follow); self.refresh_watch(); }
 
+    fn current_pointer(&self) -> Option<(i32, i32)> {
+        match &self.watch {
+            Some(watch) => watch.current_point(),
+            None => pointer_position(),
+        }
+    }
+    fn observe_current(&self) {
+        if let Some((x, y)) = self.current_pointer() { self.input.observe(POINT { x, y }); }
+    }
     fn refresh_watch(&mut self) {
         if self.input.visible.get() && self.input.track() {
             if self.watch.is_none() { self.watch = Some(crate::platform::win32::pointer::MouseWatch::new(self.wake.clone())); }
@@ -344,7 +376,7 @@ impl OverlayWindow {
         self.input.scale.set(scale);
         if self.input.regions.borrow().as_slice() != regions { *self.input.regions.borrow_mut() = regions.to_vec(); }
         if let Some(watch) = &self.watch { watch.geometry(self.input.hwnd, self.input.follow.get()); }
-        if let Some((x, y)) = pointer_position() {
+        if let Some((x, y)) = self.current_pointer() {
             self.input.observe(POINT { x, y });
             if let Some(watch) = &self.watch { watch.observe((x, y)); }
         }
@@ -352,6 +384,7 @@ impl OverlayWindow {
     /// Puts the window on screen without activating it, above other topmost windows. Rune shows
     /// and hides overlays with Win32 calls alone: winit never sees either, and a winit
     /// visibility change would also reset these styles. Errs when Windows leaves it hidden.
+    #[allow(unsafe_code)]
     pub fn show(&mut self) -> Result<(), String> {
         let hwnd = self.input.hwnd;
         // Opaque again, after any fade-out.
@@ -372,11 +405,12 @@ impl OverlayWindow {
         if read >= 0 && cloaked != 0 { return Err(format!("Windows cloaked the overlay window (DWMWA_CLOAKED {cloaked:#x})")); }
         self.input.visible.set(true);
         raise_levels();
-        if self.observing { return Ok(()); }
-        INPUTS.with(|inputs| inputs.borrow_mut().push(self.input.clone()));
-        self.refresh_watch();
-        self.observing = true;
-        if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
+        if !self.observing {
+            INPUTS.with(|inputs| inputs.borrow_mut().push(self.input.clone()));
+            self.refresh_watch();
+            self.observing = true;
+        }
+        self.observe_current();
         Ok(())
     }
     /// Gives the shown window the foreground and the keys, for `request_keys`, when Windows lets
@@ -387,13 +421,13 @@ impl OverlayWindow {
         self.input.visible.get() && crate::overlay::keys::can_take_keys(self.keys) && cloak::take_foreground(self.input.hwnd)
     }
     /// Keeps the shown window up at `alpha` (255 opaque) while it fades out, taking no clicks.
+    #[allow(unsafe_code)]
     pub fn fade(&self, alpha: u8) {
-        if !self.input.fading.replace(true) && let Some((x, y)) = pointer_position() {
-            self.input.observe(POINT { x, y });
-        }
+        if !self.input.fading.replace(true) { self.observe_current(); }
         // SAFETY: a Win32 call on a live layered window owned by this thread.
         unsafe { SetLayeredWindowAttributes(self.input.hwnd, 0, alpha, LWA_ALPHA); }
     }
+    #[allow(unsafe_code)]
     pub fn hide(&mut self) {
         // SAFETY: a Win32 call on a live window owned by this thread.
         unsafe { ShowWindow(self.input.hwnd, SW_HIDE); }
@@ -407,6 +441,7 @@ impl OverlayWindow {
     }
 }
 impl Drop for OverlayWindow {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         self.hide();
         // SAFETY: removes the subclass installed in `new`; if it was still installed (not already
@@ -425,6 +460,7 @@ impl Drop for OverlayWindow {
 /// layered window, its DirectComposition content included, only once it has layered
 /// attributes: without them it stays invisible however often it is shown (#510 in Hex).
 /// Opaque attributes leave the content's own alpha as the only transparency.
+#[allow(unsafe_code)]
 fn overlay_styles(hwnd: HWND, mode: OverlayInput, keys: crate::KeyPolicy) -> Result<(), String> {
     let through = if mode == OverlayInput::All { 0 } else { WS_EX_TRANSPARENT };
     let no_activate = if crate::overlay::keys::can_take_keys(keys) { 0 } else { WS_EX_NOACTIVATE };
@@ -440,6 +476,7 @@ fn overlay_styles(hwnd: HWND, mode: OverlayInput, keys: crate::KeyPolicy) -> Res
     Ok(())
 }
 
+#[allow(unsafe_code)]
 fn last_error() -> String {
     // SAFETY: reads this thread's last Win32 error.
     let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -452,6 +489,7 @@ pub(crate) fn is_overlay(hwnd: HWND) -> bool {
 }
 
 /// Keeps shown overlays above one another by level.
+#[allow(unsafe_code)]
 fn raise_levels() {
     let inputs = INPUTS.with(|inputs| inputs.borrow().clone());
     for level in [OverlayLevel::Status, OverlayLevel::AboveStatus, OverlayLevel::AboveOverlays] {
@@ -466,6 +504,7 @@ fn raise_levels() {
 
 /// `monitor`'s work area (without its taskbar and app bars) as top and bottom, in physical
 /// desktop pixels.
+#[allow(unsafe_code)]
 pub(crate) fn work_area(monitor: &winit::monitor::MonitorHandle) -> Option<(i32, i32)> {
     use winit::platform::windows::MonitorHandleExtWindows;
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
@@ -478,6 +517,7 @@ pub(crate) fn work_area(monitor: &winit::monitor::MonitorHandle) -> Option<(i32,
 
 /// Destroys this thread's windows at once, for a fast exit: each gets the default window procedure
 /// first, so neither winit's nor a subclass runs while the process is ending.
+#[allow(unsafe_code)]
 pub(crate) fn destroy_own_windows() {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -504,6 +544,7 @@ pub(crate) fn destroy_window_now(window: &winit::window::Window) {
 
 /// Destroys `hwnd` with the default window procedure in place, so neither winit's nor a subclass
 /// runs while the process is ending.
+#[allow(unsafe_code)]
 fn destroy(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, DestroyWindow, GWLP_WNDPROC, SetWindowLongPtrW};
     // SAFETY: a window of this thread's; nothing of this process's uses it after.

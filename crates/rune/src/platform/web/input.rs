@@ -14,7 +14,7 @@ extern "C" {
     #[wasm_bindgen(js_name = syncA11y)]
     fn sync_a11y(handle: &JsValue, json: &str);
     #[wasm_bindgen(js_name = syncScrollX)]
-    fn sync_scroll_x(handle: &JsValue, path: &str, x: f32);
+    fn sync_scroll_x(handle: &JsValue, path: &str, x: f32, rtl: bool);
     fn activate(handle: &JsValue);
     #[wasm_bindgen(js_name = syncPage)]
     fn sync_page(handle: &JsValue, height: f32, focused: bool);
@@ -72,8 +72,8 @@ pub(super) struct Bridge {
     document: bool,
     /// The page height and control focus the page last heard.
     page: Option<(f32, bool)>,
-    /// The horizontal offsets the mirror's containers were last set to.
-    scroll_x: Vec<(String, f32)>,
+    /// The horizontal offsets and RTL flags the mirror's containers were last set to.
+    scroll_x: Vec<(String, f32, bool)>,
     /// The IME area the page's text field was last put at.
     caret: Option<[f32; 4]>,
     /// When the mirror was last rebuilt, for the scroll throttle (`sync_input`).
@@ -125,7 +125,7 @@ impl Bridge {
 }
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let _ = self.dispose_viewport.call0(&JsValue::NULL);
+        self.dispose_viewport.call0(&JsValue::NULL).ok();
         destroy(&self.handle);
     }
 }
@@ -197,10 +197,16 @@ impl Running {
             // A horizontal viewport Rune scrolled (a wheel or a key on desktop) moves the mirror's
             // container to match; one the browser scrolled already says where it is.
             let handle = &self.input.handle;
-            let next = rt.page_scroll_x();
-            for (path, x) in &next {
-                let known = self.input.scroll_x.iter().find(|(p, _)| p == path).map(|(_, x)| *x);
-                if known.is_none_or(|known| (known - x).abs() > 0.5) { sync_scroll_x(handle, path, *x); }
+            let mut nodes = rt.tree.nodes.iter();
+            let next: Vec<_> = rt.page_scroll_x().into_iter().map(|(path, x)| {
+                let rtl = nodes.find(|n| n.path == path).is_some_and(|n| n.flow == crate::el::Flow::Rtl);
+                (path, x, rtl)
+            }).collect();
+            for (path, x, rtl) in &next {
+                let known = self.input.scroll_x.iter().find(|(p, _, _)| p == path).map(|(_, x, rtl)| (*x, *rtl));
+                if known.is_none_or(|(kx, krtl)| (kx - x).abs() > 0.5 || krtl != *rtl) {
+                    sync_scroll_x(handle, path, *x, *rtl);
+                }
             }
             self.input.scroll_x = next;
         }
@@ -307,7 +313,9 @@ impl Running {
             }
             Some("visibility") => {
                 let visible = event["visible"].as_bool().unwrap_or(false);
+                self.last_presented = None;
                 self.shared.set_visible(visible);
+                self.app.set_live_visible(visible);
                 if !visible {
                     crate::input::host_events::hide_reset(
                         self.app.rt_mut(),
@@ -315,7 +323,7 @@ impl Running {
                         &mut self.input.control_click,
                     );
                     hide_menu(&self.input.handle);
-                    let _ = self.app.resolve_popup(None);
+                    self.app.resolve_popup(None).ok();
                     self.cursor.apply(window, crate::el::Cursor::Default, false);
                     // Commit cancellation, FocusLost, FinishIme and poll now: browsers pause rAF
                     // while the tab is hidden.
@@ -337,12 +345,12 @@ impl Running {
                 return true;
             }
             Some(kind @ ("edit" | "selection" | "preedit")) => {
-                self.app.web_edit(event);
+                self.app.web_edit(event, &mut self.input.mirror);
                 // A typed edit is in the model and the page's field: the display's next frame
                 // draws it, one frame for every key and press that came before it.
                 if kind == "edit" && self.sync_live_edit() { return true; }
             }
-            Some("sync") => self.input.mirror.key.clear(), // Composition's final sync was deferred by the DOM.
+            Some("sync") => self.input.mirror.invalidate(), // Composition's final sync was deferred by the DOM.
             Some("paste") => {
                 let mut content = crate::ClipboardContent::new(event["text"].as_str().unwrap_or_default());
                 if let Some(html) = event["html"].as_str().filter(|html| !html.is_empty()) { content = content.with_html(html); }
@@ -354,11 +362,16 @@ impl Running {
                     self.app.rt_mut().web_secure(event["key"].as_str().unwrap_or_default(), text);
                 }
             }
+            Some("secure_replace") => {
+                if let serde_json::Value::String(text) = event["text"].take() {
+                    self.app.web_secure_replace(event["key"].as_str().unwrap_or_default(), text);
+                }
+            }
             Some("key") => activate = self.app.web_key(event),
             Some("a11y_press" | "a11y_link") => { let _ = self.app.rt_mut().web_a11y_action(event); }
             // The page's menu (`showMenu`) was picked from or dismissed.
             Some("menu") => {
-                if self.app.resolve_popup(event["id"].as_str()).is_err() { let _ = self.app.resolve_popup(None); }
+                if self.app.resolve_popup(event["id"].as_str()).is_err() { self.app.resolve_popup(None).ok(); }
             }
             // The browser's menu takes this right-click (bridge.js): its release opens none of Rune's.
             Some("secondary_browser") => { self.app.rt_mut().secondary_abandon(); return false; }
@@ -430,8 +443,7 @@ impl Running {
                     (x, y, rt.page_window().0)
                 };
                 // The mirror's pointer is in window points; the canvas draws the band.
-                self.app.pointer_move(x, y + offset);
-                return true;
+                return self.app.observe_pointer(x, y + offset);
             }
             _ => {}
         }
@@ -453,8 +465,9 @@ impl Running {
             }
             WindowEvent::CursorMoved { position, .. } if !self.app.rt().touching() => {
                 let (x, y) = crate::input::host_events::physical_point(self.app.rt(), position.x, position.y);
-                self.app.pointer_move(x, y);
+                let changed = self.app.observe_pointer(x, y);
                 self.cursor.apply(window, self.app.rt().cursor(), true);
+                return changed;
             }
             WindowEvent::CursorLeft { .. } if !self.app.rt().touching() => {
                 self.app.rt_mut().pointer_leave();

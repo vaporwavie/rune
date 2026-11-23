@@ -2,6 +2,9 @@
 //! input, so Rune never touches samples. The thread creates, drives and releases the recorder;
 //! nothing about it needs the main thread. AVCaptureDevice reports and asks for microphone
 //! access. CoreAudio's default input device is watched for changes.
+
+#![allow(unsafe_code)]
+
 use super::meter::Meter;
 use super::{MicPermission, Options, RecordFormat, Recorder, Shared};
 use objc2::rc::{Allocated, Retained, autoreleasepool};
@@ -13,7 +16,7 @@ use rune_core::machine::Attempt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The default input device is checked this many meter ticks apart (about twice a second).
 const DEVICE_CHECK_TICKS: u32 = 15;
@@ -61,14 +64,17 @@ fn default_input() -> Option<u32> {
     };
     let (mut device, mut size) = (0u32, 4u32);
     // kAudioObjectSystemObject is 1.
+    // SAFETY: `address` is valid, qualifier is null with 0 length, and `size` matches the 4-byte `device` out-buffer.
     let status = unsafe { AudioObjectGetPropertyData(1, &address, 0, std::ptr::null(), &mut size, (&raw mut device).cast()) };
     (status == 0 && device != 0).then_some(device)
 }
 
 pub(super) fn permission() -> MicPermission {
+    // SAFETY: `AVMediaTypeAudio` is an immutable static AVFoundation string constant.
     let (Some(audio), Some(device)) = (unsafe { AVMediaTypeAudio }, AnyClass::get(c"AVCaptureDevice")) else {
         return MicPermission::Restricted;
     };
+    // SAFETY: `device` is `AVCaptureDevice` and `+authorizationStatusForMediaType:` takes `AVMediaType` and returns `isize`.
     let status: isize = unsafe { msg_send![device, authorizationStatusForMediaType: audio] };
     match status {
         3 => MicPermission::Granted,
@@ -86,6 +92,7 @@ pub(super) fn request_permission(callback: Box<dyn FnOnce(MicPermission) + Send>
         return callback(MicPermission::Denied);
     }
     let current = permission();
+    // SAFETY: `AVMediaTypeAudio` is an immutable static AVFoundation string constant.
     let (Some(audio), Some(device)) = (unsafe { AVMediaTypeAudio }, AnyClass::get(c"AVCaptureDevice")) else {
         return callback(current);
     };
@@ -98,6 +105,7 @@ pub(super) fn request_permission(callback: Box<dyn FnOnce(MicPermission) + Send>
             callback(if granted.as_bool() { MicPermission::Granted } else { MicPermission::Denied });
         }
     });
+    // SAFETY: `device` is `AVCaptureDevice`, `audio` is `AVMediaTypeAudio`, and `block` matches `void (^)(BOOL)`.
     unsafe {
         let _: () = msg_send![device, requestAccessForMediaType: audio, completionHandler: &*block];
     }
@@ -106,6 +114,7 @@ pub(super) fn request_permission(callback: Box<dyn FnOnce(MicPermission) + Send>
 /// macOS ends a bundled app that touches the microphone without a usage description; refuse
 /// instead. An unbundled binary is attributed to the terminal that ran it.
 pub(super) fn preflight() -> Result<(), String> {
+    // SAFETY: `NSBundle` class and instance selectors match their Foundation Objective-C signatures.
     unsafe {
         let bundle: Option<Retained<AnyObject>> = msg_send![class!(NSBundle), mainBundle];
         let Some(bundle) = bundle else { return Ok(()) };
@@ -123,12 +132,15 @@ pub(super) fn preflight() -> Result<(), String> {
 }
 
 fn number_u32(value: u32) -> Retained<AnyObject> {
+    // SAFETY: `NSNumber`'s `+numberWithUnsignedInt:` takes a `u32` and returns a retained `NSNumber`.
     unsafe { msg_send![class!(NSNumber), numberWithUnsignedInt: value] }
 }
 fn number_f64(value: f64) -> Retained<AnyObject> {
+    // SAFETY: `NSNumber`'s `+numberWithDouble:` takes an `f64` and returns a retained `NSNumber`.
     unsafe { msg_send![class!(NSNumber), numberWithDouble: value] }
 }
 fn number_bool(value: bool) -> Retained<AnyObject> {
+    // SAFETY: `NSNumber`'s `+numberWithBool:` takes an ObjC `BOOL` and returns a retained `NSNumber`.
     unsafe { msg_send![class!(NSNumber), numberWithBool: Bool::new(value)] }
 }
 
@@ -137,9 +149,11 @@ pub(super) fn make_recorder(path: &Path, opts: &Options) -> Result<Retained<AnyO
     let class = AnyClass::get(c"AVAudioRecorder").ok_or("the system recorder (AVAudioRecorder) is unavailable")?;
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    // SAFETY: `AVSampleRateKey` and `AVNumberOfChannelsKey` are immutable static `NSString` constants exported by AVFoundation.
     let mut entries: Vec<(&NSString, Retained<AnyObject>)> = unsafe {
         vec![(AVSampleRateKey, number_f64(opts.sample_rate as f64)), (AVNumberOfChannelsKey, number_u32(opts.channels as u32))]
     };
+    // SAFETY: `AVFormatIDKey`, `AVEncoderAudioQualityKey`, and `AVLinearPCM*` are immutable static `NSString` constants exported by AVFoundation.
     unsafe {
         match opts.format {
             RecordFormat::Aac => {
@@ -158,6 +172,7 @@ pub(super) fn make_recorder(path: &Path, opts: &Options) -> Result<Retained<AnyO
     let keys: Vec<&NSString> = entries.iter().map(|(k, _)| *k).collect();
     let values: Vec<&AnyObject> = entries.iter().map(|(_, v)| &**v).collect();
     let settings = NSDictionary::<NSString, AnyObject>::from_slices(&keys, &values);
+    // SAFETY: `class` is `AVAudioRecorder`, `url` and `settings` are live Foundation objects, and the initializer matches AVFoundation's signature.
     unsafe {
         let recorder: Allocated<AnyObject> = msg_send![class, alloc];
         let recorder: Result<Retained<AnyObject>, Retained<NSError>> = msg_send![recorder, initWithURL: &*url, settings: &*settings, error: _];
@@ -191,11 +206,11 @@ pub(super) fn start(shared: &Arc<Shared>, attempt: Attempt, path: &Path, opts: &
 }
 
 pub(super) fn pause(session: &Session) {
-    let _ = session.commands.send(Command::Pause);
+    session.commands.send(Command::Pause).ok();
 }
 
 pub(super) fn resume(session: &Session) {
-    let _ = session.commands.send(Command::Resume);
+    session.commands.send(Command::Resume).ok();
 }
 
 pub(super) fn stop(session: Session) -> Result<f64, String> {
@@ -210,7 +225,7 @@ pub(super) fn stop(session: Session) -> Result<f64, String> {
 /// it instead, and the thread stops the recorder as soon as its report returns.
 pub(super) fn finish(session: Session) {
     if !ON_RECORDER_THREAD.try_with(|on| on.get()).unwrap_or(true) {
-        let _ = stop(session);
+        stop(session).ok();
     }
 }
 
@@ -228,7 +243,7 @@ pub(super) fn idle_session() -> (Session, Receiver<Command>) {
 pub(super) fn cancel(session: Session) {
     let (reply, done) = mpsc::channel();
     if session.commands.send(Command::Cancel(reply)).is_ok() {
-        let _ = done.recv_timeout(REPLY_PATIENCE);
+        done.recv_timeout(REPLY_PATIENCE).ok();
     }
 }
 
@@ -236,6 +251,7 @@ pub(super) fn cancel(session: Session) {
 fn open(path: &Path, opts: &Options) -> Result<(Retained<AnyObject>, Option<u32>), String> {
     let device = default_input().ok_or("no microphone is connected")?;
     let recorder = make_recorder(path, opts)?;
+    // SAFETY: `recorder` is a live `AVAudioRecorder`; these selectors match their AVFoundation Objective-C signatures.
     unsafe {
         let _: () = msg_send![&*recorder, setMeteringEnabled: Bool::YES];
         let prepared: Bool = msg_send![&*recorder, prepareToRecord];
@@ -267,16 +283,23 @@ fn run(weak: Weak<Shared>, attempt: Attempt, path: PathBuf, opts: Options, comma
         shared.began(attempt);
     }
     let recorder = &*recorder;
-    let current_time = || -> f64 { unsafe { msg_send![recorder, currentTime] } };
-    let stop = || unsafe {
-        let _: () = msg_send![recorder, stop];
+    let current_time = || -> f64 {
+        // SAFETY: `recorder` is a live `AVAudioRecorder` on this thread and `-currentTime` returns `NSTimeInterval` (`f64`).
+        unsafe { msg_send![recorder, currentTime] }
     };
-    let (mut meter, mut last, mut ticks, mut paused, mut recorded) = (Meter::default(), Instant::now(), 0u32, false, 0f64);
+    let stop = || {
+        // SAFETY: `recorder` is a live `AVAudioRecorder` on this thread and `-stop` takes no arguments and returns void.
+        unsafe {
+            let _: () = msg_send![recorder, stop];
+        }
+    };
+    let (mut meter, mut last, mut ticks, mut paused, mut recorded) = (Meter::default(), rune_core::time::now(), 0u32, false, 0f64);
     loop {
         let command = commands.recv_timeout(Recorder::METER_INTERVAL);
         let done = autoreleasepool(|_| match command {
             Ok(Command::Pause) => {
                 recorded = recorded.max(current_time());
+                // SAFETY: `recorder` is a live `AVAudioRecorder` on this thread and `-pause` takes no arguments and returns void.
                 unsafe {
                     let _: () = msg_send![recorder, pause];
                 }
@@ -284,21 +307,23 @@ fn run(weak: Weak<Shared>, attempt: Attempt, path: PathBuf, opts: Options, comma
                 false
             }
             Ok(Command::Resume) => {
+                // SAFETY: `recorder` is a live `AVAudioRecorder` on this thread and `-record` returns `BOOL`.
                 let _: Bool = unsafe { msg_send![recorder, record] };
-                (paused, last) = (false, Instant::now());
+                (paused, last) = (false, rune_core::time::now());
                 false
             }
             Ok(Command::Stop(reply)) => {
                 // currentTime reads 0 once stopped.
                 recorded = recorded.max(current_time());
                 stop();
-                let _ = reply.send(Ok(recorded));
+                reply.send(Ok(recorded)).ok();
                 true
             }
             Ok(Command::Cancel(reply)) => {
                 stop();
+                // SAFETY: `recorder` is a stopped `AVAudioRecorder` on this thread and `-deleteRecording` returns `BOOL`.
                 let _: Bool = unsafe { msg_send![recorder, deleteRecording] };
-                let _ = reply.send(());
+                reply.send(()).ok();
                 true
             }
             Err(RecvTimeoutError::Timeout) if paused => false,
@@ -307,12 +332,13 @@ fn run(weak: Weak<Shared>, attempt: Attempt, path: PathBuf, opts: Options, comma
                     stop();
                     return true;
                 };
+                // SAFETY: `recorder` is a live `AVAudioRecorder` with metering enabled; channel 0 exists and selectors match AVFoundation.
                 let (peak, average, recording): (f32, f32, Bool) = unsafe {
                     let _: () = msg_send![recorder, updateMeters];
                     (msg_send![recorder, peakPowerForChannel: 0usize], msg_send![recorder, averagePowerForChannel: 0usize], msg_send![recorder, isRecording])
                 };
                 recorded = recorded.max(current_time());
-                let now = Instant::now();
+                let now = rune_core::time::now();
                 meter.push_db(peak, average, (now - last).as_secs_f64());
                 last = now;
                 shared.metered(attempt, meter.level());

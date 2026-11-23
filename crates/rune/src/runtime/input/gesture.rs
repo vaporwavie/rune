@@ -35,14 +35,16 @@ impl RuntimeCore {
         let moved = ev.dx != 0.0 || ev.dy != 0.0;
         if moved {
             self.dismiss_help();
-            self.wheel_delta_arrived(ev.dx, ev.dy);
+            let now = self.now_clock();
+            let pending = self.wheel_pending();
+            self.scroll.wheel_delta(now, ev.dx, ev.dy, pending);
         }
         // A notch or not is the run's to decide, not each delta's.
-        let ev = if moved { WheelEvent { notch: self.scroll.wheel_lock.notched(self.now_clock(), ev.notch), ..ev } } else { ev };
+        let ev = if moved { WheelEvent { notch: self.scroll.wheel_notched(self.now_clock(), ev.notch), ..ev } } else { ev };
         if moved || ev.phase != GesturePhase::Moved {
-            let ev = WheelEvent { momentum: self.scroll.wheel_lock.momentum(), ..ev };
-            let gesture = self.scroll.wheel_lock.gesture;
-            let phased = self.scroll.wheel_lock.phased();
+            let ev = WheelEvent { momentum: self.scroll.wheel_momentum(), ..ev };
+            let gesture = self.scroll.wheel_gesture();
+            let phased = self.scroll.wheel_phased();
             if let Some(start) = self.offer_wheel(gesture, ev) { self.wheel_scroll_for(gesture, ev, phased, start); }
         }
         if ev.phase == GesturePhase::Ended { self.wheel_ended(); }
@@ -51,10 +53,9 @@ impl RuntimeCore {
     /// Queues `ev` for the `on_wheel` handlers it may go to (None), or leaves it to scrolling now,
     /// with where its chain starts when that was already found on the way.
     fn offer_wheel(&mut self, gesture: Attempt, ev: WheelEvent) -> Option<WheelStart> {
-        let lock = &self.scroll.wheel_lock;
         // A delta queued this frame may yet be taken: later ones wait their turn behind it.
         let pending = self.wheel_queued(Some(gesture));
-        let (scrolls, handled) = match lock.owner() {
+        let (scrolls, handled) = match self.scroll.wheel_owner() {
             WheelOwner::Vertical | WheelOwner::Horizontal(_) => (true, false),
             WheelOwner::Handler(_) => (false, true),
             WheelOwner::Unpicked => (false, false),
@@ -63,7 +64,7 @@ impl RuntimeCore {
         let start = if handled { WheelStart::Unknown } else { WheelStart::At(self.chain_start(ev.x, ev.y)) };
         let chain = match start { WheelStart::At(s) => self.gesture_chain_from(s, |g| g.wheel.is_some(), true), WheelStart::Unknown => Vec::new() };
         if chain.is_empty() && !handled && !pending { return Some(start); }
-        let phased = lock.phased();
+        let phased = self.scroll.wheel_phased();
         self.frame.queue.push(Action::Wheel { gesture, chain, ev, phased });
         None
     }
@@ -73,17 +74,17 @@ impl RuntimeCore {
     /// gesture's turn and axis policy, so one queued before a newer gesture began still reaches
     /// the owner its own gesture picked.
     pub(in crate::runtime) fn run_wheel(&mut self, app: &mut dyn AppDriver, gesture: Attempt, chain: Vec<String>, ev: WheelEvent, phased: bool, tx: &mut Tx) -> bool {
-        self.scroll.wheel_lock.sync_gesture(gesture);
+        self.scroll.sync_wheel_gesture(gesture);
         let mut taken = None;
-        match self.scroll.wheel_lock.owner_of(gesture).cloned() {
+        match self.scroll.wheel_owner_of(gesture).cloned() {
             Some(WheelOwner::Handler(path)) => {
                 taken = self.call_wheel(app, &path, ev, tx);
-                if taken.is_none() { self.scroll.wheel_lock.set_owner(gesture, WheelOwner::Unpicked); }
+                if taken.is_none() { self.scroll.set_wheel_owner(gesture, WheelOwner::Unpicked); }
             }
             Some(WheelOwner::Unpicked) => {
                 for path in chain {
                     if self.call_wheel(app, &path, ev, tx) == Some(true) {
-                        self.scroll.wheel_lock.set_owner(gesture, WheelOwner::Handler(path));
+                        self.scroll.set_wheel_owner(gesture, WheelOwner::Handler(path));
                         taken = Some(true);
                         break;
                     }
@@ -124,10 +125,12 @@ impl RuntimeCore {
     }
 
     /// A Ctrl + wheel `dy` at (x, y), which is how a trackpad pinch reaches Windows, Linux and
-    /// web apps: a pinch when an `on_magnify` handler is there (true), else nothing.
+    /// web apps, and how Chromium hands any page Ctrl + wheel: a pinch (`MagnifyEvent::wheel`) when
+    /// an `on_magnify` handler is there (true), else nothing. `dy` moves content down, so the wheel
+    /// turned away from the user (or the fingers spread) zooms in, as in a browser.
     pub(crate) fn pinch_wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
         if dy == 0.0 || self.gesture_chain(x, y, |g| g.magnify.is_some(), false).is_empty() { return false; }
-        self.magnify_event(MagnifyEvent::new(-dy / PINCH_WHEEL).at(x, y));
+        self.magnify_event(MagnifyEvent { wheel: true, ..MagnifyEvent::new(dy / PINCH_WHEEL).at(x, y) });
         true
     }
 
@@ -184,7 +187,7 @@ impl RuntimeCore {
     /// Chromium chains a scroll through: a viewport that only lies beneath (the timeline under an
     /// open menu, a popover or a raised panel) is never one of them.
     pub(in crate::runtime) fn chain_start(&self, x: f32, y: f32) -> Option<usize> {
-        self.hit.wheel_hits.iter().rev().find_map(|&(id, r)| {
+        self.hit.find_wheel_hit(|id, r| {
             if !self.hit_contains(id, r, x, y) { return None; }
             let i = *self.tree.node_index.get(&id)?;
             (!self.subtree_exiting(i) && self.allowed(i)).then_some(i)
@@ -209,7 +212,7 @@ impl RuntimeCore {
             PointerButton::Secondary => return self.secondary_down(x, y),
             _ => {}
         }
-        if self.autoscroll_press(button) { self.pointer.pos = Some((x, y)); return; }
+        if self.pointer.autoscroll_press(button) { self.pointer.pos = Some((x, y)); return; }
         if self.pointer.press.is_held() { return; }
         self.pointer.pos = Some((x, y));
         if button == PointerButton::Middle { self.tint_down(x, y, button); }
@@ -217,7 +220,7 @@ impl RuntimeCore {
         #[cfg(target_os = "linux")]
         if button == PointerButton::Middle && self.primary_paste_down(x, y) { return; }
         self.dismiss_help();
-        let hit = self.hit.hits.iter().rev().find(|&&(id, r)| self.hit_contains(id, r, x, y)).and_then(|(id, _)| self.tree.node_index.get(id).copied());
+        let hit = self.hit.top_hit(|id, r| self.hit_contains(id, r, x, y)).and_then(|id| self.tree.node_index.get(&id).copied());
         let middle = button == PointerButton::Middle;
         let target = std::iter::successors(hit, |&i| self.tree.nodes[i].parent)
             .take_while(|&i| !self.subtree_exiting(i) && self.allowed(i))
@@ -237,10 +240,11 @@ impl RuntimeCore {
         let [lx, ly] = self.to_local(i, x, y);
         let d = Drag { phase: Phase::Down, x: lx, y: ly, w: r[2] - r[0], h: r[3] - r[1], start_x: lx, start_y: ly, dx: 0.0, dy: 0.0, data: 0.0, clicks: 1, cancelled: false, window: [x, y], screen: self.screen_at(x, y) };
         let path = n.path.clone();
-        if self.drags_with(i, button) { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
-        self.pointer.press_clicks.clear();
+        let drag_handler = self.drags_with(i, button).then(|| n.handlers.on_drag.clone()).flatten();
+        if drag_handler.is_some() { self.frame.queue.push(Action::Drag(path.clone(), d, button)); }
+        self.pointer.clear_press_clicks();
         let now = self.now_clock();
-        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link));
+        self.pointer.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None).on_link(link).drag_handler(drag_handler));
     }
 
     /// Element `i` opted in to `button` ([`El::pointer_buttons`]); every element takes the
@@ -263,8 +267,8 @@ impl RuntimeCore {
 
     /// A mouse button came up at (x, y): the release of [`Self::button_down`].
     pub(crate) fn button_up(&mut self, app: &dyn ViewDriver, x: f32, y: f32, button: PointerButton) {
-        self.pointer.tint.release(button);
-        if !matches!(button, PointerButton::Primary | PointerButton::Secondary) && self.autoscroll_release(button) { self.pointer.pos = Some((x, y)); return; }
+        self.pointer.release_tint(button);
+        if !matches!(button, PointerButton::Primary | PointerButton::Secondary) && self.pointer.autoscroll_release(button) { self.pointer.pos = Some((x, y)); return; }
         match button {
             PointerButton::Primary => self.pointer_up(app, x, y),
             PointerButton::Secondary => self.secondary_up(app, x, y),
@@ -297,15 +301,14 @@ impl RuntimeCore {
     /// composition, or which focused element should still hear its release if focus moves.
     pub(in crate::runtime) fn note_key_down(&mut self, app: &mut dyn AppDriver, repeat: bool) {
         let composing = self.composing(app);
-        let focus = &self.kbd.focus;
-        self.kbd.key_releases.down(composing, repeat, || focus.owned());
+        self.kbd.note_key_down(composing, repeat);
     }
 
     /// Suppresses key releases that belong to an IME composition (while preedit is open, or
     /// the release of the key that confirmed or cancelled it).
     pub(in crate::runtime) fn eat_ime_key_up(&mut self, app: &mut dyn AppDriver) -> bool {
         let composing = self.composing(app);
-        self.kbd.key_releases.eat(composing)
+        self.kbd.eat_ime_key_up(composing)
     }
 
     /// A key release goes to the focused element and up through its ancestors, else to every
@@ -314,7 +317,7 @@ impl RuntimeCore {
     pub(in crate::runtime) fn route_key_up(&mut self, app: &mut dyn AppDriver, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if self.eat_ime_key_up(app) { return false; }
         tx.focused = self.focused_key();
-        let pressed = self.kbd.key_releases.route().and_then(|p| self.live_index(&p));
+        let pressed = self.kbd.route_key_release().and_then(|p| self.live_index(&p));
         let focused = self.kbd.focus.path().and_then(|p| self.live_index(p));
         let secure = [pressed, focused].into_iter().flatten()
             .any(|i| self.tree.nodes[i].input.as_ref().is_some_and(|input| input.edit.is_secure()));
@@ -355,267 +358,8 @@ impl RuntimeCore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Env, Mods, PhysicalInput, PhysicalKeyCode, el};
-
-    #[derive(Default)]
-    struct State { ups: Vec<crate::Key>, swallow: bool, zoom: Vec<f32> }
-
-    fn view(_: &State, _: &mut crate::Cx<State>) -> El {
-        el().w_full().h_full()
-            .on_key_up(|s: &mut State, e, _| { s.ups.push(e.key.clone()); true })
-            .on_magnify(|s: &mut State, e, _| { s.zoom.push(e.delta); true })
-            .child(el().key("field").size(40.0, 40.0).focusable(true).on_physical_input(|s: &mut State, _, _| s.swallow))
-    }
-
-    #[test]
-    fn a_physical_release_carries_its_logical_key_to_on_key_up_after_the_focused_handler() {
-        let mut rt = Runtime::new(State::default(), view, (100.0, 100.0), Env::new(true, 1.0));
-        rt.frame(0.0);
-        assert!(rt.wants_key_up());
-        let release = PhysicalInput::Key { key: PhysicalKeyCode::Space, mods: Mods::default(), pressed: false, repeat: false };
-        let space = KeyEvent { key: crate::Key::Text(" ".into()), mods: Mods::default() };
-        assert!(rt.physical_with_fallback(release, Some(space.clone())));
-        rt.frame(0.0);
-        assert_eq!(rt.state.ups, [space.key.clone()]);
-
-        // A focused `on_physical_input` that takes the release keeps it from `on_key_up`.
-        let (x, y) = rt.find("field").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.state.swallow = true;
-        rt.physical_with_fallback(release, Some(space.clone()));
-        rt.frame(0.0);
-        assert_eq!(rt.state.ups.len(), 1);
-        rt.state.swallow = false;
-        rt.physical_with_fallback(release, Some(space));
-        rt.frame(0.0);
-        assert_eq!(rt.state.ups.len(), 2);
-    }
-
-    #[derive(Default)]
-    struct Keys { log: Vec<&'static str> }
-
-    fn stage(s: &Keys, _: &mut crate::Cx<Keys>) -> El {
-        let _ = s;
-        el().w_full().h_full()
-            .child(el().key("stage").size(40.0, 40.0).on_key_up(|s: &mut Keys, _, _| { s.log.push("stage"); true }))
-            .child(el().key("other").size(40.0, 40.0).focusable(true))
-    }
-
-    fn up() -> KeyEvent { KeyEvent { key: crate::Key::Text("a".into()), mods: Mods::default() } }
-
-    #[test]
-    fn an_unfocused_release_reaches_a_nested_handler() {
-        let mut rt = Runtime::new(Keys::default(), stage, (100.0, 100.0), Env::new(true, 1.0));
-        rt.frame(0.0);
-        assert!(rt.wants_key_up());
-        rt.key_up(up());
-        rt.frame(0.0);
-        assert_eq!(rt.state.log, ["stage"]);
-    }
-
-    fn pair(_: &Keys, _: &mut crate::Cx<Keys>) -> El {
-        el().w_full().h_full()
-            .child(el().key("a").size(40.0, 40.0).focusable(true).on_key_up(|s: &mut Keys, _, _| { s.log.push("a"); true }))
-            .child(el().key("b").size(40.0, 40.0).focusable(true).on_key_up(|s: &mut Keys, _, _| { s.log.push("b"); true }))
-    }
-
-    #[test]
-    fn a_release_goes_to_the_element_focused_at_the_press_even_after_focus_moves() {
-        let mut rt = Runtime::new(Keys::default(), pair, (100.0, 100.0), Env::new(true, 1.0));
-        rt.frame(0.0);
-        let click = |rt: &mut Runtime<Keys>, k: &str| { let (x, y) = rt.find(k).unwrap(); rt.pointer_down(x, y); rt.pointer_up(x, y); rt.frame(0.0); };
-        click(&mut rt, "a");
-        rt.key(up());
-        rt.frame(0.0);
-        click(&mut rt, "b");
-        rt.key_up(up());
-        rt.frame(0.0);
-        assert_eq!(rt.state.log, ["a"]);
-    }
-
-    fn modal_view(_: &Keys, _: &mut crate::Cx<Keys>) -> El {
-        el().w_full().h_full()
-            .on_key_up(|s: &mut Keys, _, _| { s.log.push("root"); true })
-            .child(el().key("under").size(40.0, 40.0).on_key_up(|s: &mut Keys, _, _| { s.log.push("under"); true }))
-            .child(el().key("sheet").absolute(50.0, 50.0).size(40.0, 40.0).modal(true, |_: &mut Keys| {})
-                .child(el().key("inside").size(10.0, 10.0).on_key_up(|s: &mut Keys, _, _| { s.log.push("inside"); true })))
-    }
-
-    #[test]
-    fn an_unfocused_release_in_a_modal_stays_inside_it() {
-        let mut rt = Runtime::new(Keys::default(), modal_view, (100.0, 100.0), Env::new(true, 1.0));
-        rt.frame(0.0);
-        rt.key_up(up());
-        rt.frame(0.0);
-        assert_eq!(rt.state.log, ["inside"]);
-    }
-
-    #[test]
-    fn a_ctrl_wheel_pinches_only_where_a_magnify_handler_is() {
-        let mut rt = Runtime::new(State::default(), view, (100.0, 100.0), Env::new(true, 1.0));
-        rt.frame(0.0);
-        assert!(rt.pinch_wheel(50.0, 50.0, -20.0));
-        rt.frame(0.0);
-        assert_eq!(rt.state.zoom, [20.0 / PINCH_WHEEL]);
-        assert!(!rt.pinch_wheel(500.0, 50.0, -20.0), "off the window nothing takes it");
-    }
-
-    #[derive(Default)]
-    struct Wheeled { heard: Vec<f32> }
-
-    fn wheeling(_: &Wheeled, _: &mut crate::Cx<Wheeled>) -> El {
-        el().w_full().h_full()
-            .child(el().key("list").w_full().h(300.0).scroll(crate::ScrollSpec { stick_bottom: false })
-                .child(el().w_full().h(1000.0)
-                    .child(el().key("takes").absolute(100.0, 40.0).size(40.0, 40.0)
-                        .on_wheel(|s: &mut Wheeled, e: crate::WheelEvent, _: &mut Tx| { s.heard.push(e.x); true }))))
-    }
-
-    /// Deltas queued before the platform began the next gesture finish with the owner the
-    /// gesture picked: the one outside the handler still reaches it, rather than scrolling the
-    /// viewport under the pointer.
-    #[test]
-    fn deltas_queued_before_a_new_gesture_began_finish_with_the_gesture_s_owner() {
-        let mut rt = Runtime::new(Wheeled::default(), wheeling, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(110.0, 50.0));
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.wheel_began();
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, [10.0, 190.0], "both deltas in the handler's own points");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 0.0, "the whole gesture stays with the handler");
-    }
-
-    /// A delta queued over the handler, before it has the gesture, still reaches it when a newer
-    /// gesture scrolls at once outside every handler: the newer one's own delta scrolls once.
-    #[test]
-    fn a_queued_delta_picks_its_handler_before_a_newer_gesture_s_scroll() {
-        let mut rt = Runtime::new(Wheeled::default(), wheeling, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(110.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, [10.0], "the queued delta reaches the handler it was offered to");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 10.0, "only the newer gesture's own delta scrolled");
-    }
-
-    /// A delta queued for the handler that has the gesture keeps reaching it when the gesture
-    /// ends and the next one scrolls at once, before the frame drains the queue.
-    #[test]
-    fn a_queued_delta_keeps_its_owner_when_the_next_gesture_scrolls_first() {
-        let mut rt = Runtime::new(Wheeled::default(), wheeling, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        // The handler takes the gesture.
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(110.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, [10.0]);
-        // A delta outside it is queued for that owner; the gesture ends, and the next one
-        // scrolls at once outside every handler.
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.wheel_ended();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, [10.0, 190.0], "the queued delta still reaches the gesture's owner");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 10.0, "only the newer gesture's own delta scrolled");
-    }
-
-    #[derive(Default)]
-    struct Two { heard: Vec<&'static str> }
-
-    fn two_handlers(_: &Two, _: &mut crate::Cx<Two>) -> El {
-        el().w_full().h_full()
-            .child(el().key("list").w_full().h(300.0).scroll(crate::ScrollSpec { stick_bottom: false })
-                .child(el().w_full().h(1000.0)
-                    .child(el().key("a").absolute(20.0, 40.0).size(40.0, 40.0)
-                        .on_wheel(|s: &mut Two, _: crate::WheelEvent, _: &mut Tx| { s.heard.push("a"); true }))
-                    .child(el().key("b").absolute(200.0, 40.0).size(40.0, 40.0)
-                        .on_wheel(|s: &mut Two, _: crate::WheelEvent, _: &mut Tx| { s.heard.push("b"); true }))))
-    }
-
-    /// A gesture whose queued deltas have all run gives its owner's place up: the next gesture's
-    /// queued delta still reaches that gesture's handler instead of scrolling.
-    #[test]
-    fn a_drained_gesture_gives_its_owner_up_to_the_next_queued_one() {
-        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        // A delta over `a`, then a gesture begins and a delta over `b`: each reaches its own.
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, ["a", "b"]);
-        // `b` owns the gesture now; a delta outside it is queued for `b`, and the next gesture
-        // begins before the frame drains it.
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.wheel_began();
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, ["a", "b", "b"], "the queued delta still reaches b");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 0.0, "every delta reached a handler");
-    }
-
-    /// With a delta queued for a handler under one gesture and another under the next, each
-    /// reaches its own gesture's handler, however many gestures began before the frame.
-    #[test]
-    fn a_delta_queued_for_each_of_two_gestures_reaches_its_own_handler() {
-        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
-        rt.wheel_began();
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, ["a", "b"], "each delta goes to the handler its own gesture found");
-    }
-
-    /// Three gestures begin inside one frame, each with a delta queued for the handler under the
-    /// pointer: each delta reaches its own gesture's handler.
-    #[test]
-    fn three_gestures_queued_before_one_frame_each_reach_their_own_handler() {
-        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, ["a", "b", "a"], "each delta goes to the handler its own gesture found");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 0.0, "every delta reached a handler");
-    }
-
-    /// The third gesture scrolls at once outside every handler: the deltas queued for the first
-    /// two gestures still reach their own handlers, and only the third scrolls.
-    #[test]
-    fn a_third_gesture_scrolling_before_the_frame_keeps_both_queued_owners() {
-        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
-        rt.wheel_began();
-        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.heard, ["a", "b"], "the first two gestures' deltas still reach their handlers");
-        let id = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
-        assert_eq!(rt.scroll.scrolls[&id].offset, 10.0, "only the third gesture's own delta scrolled");
-    }
-}
+#[path = "gesture_routing_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "gesture_tests.rs"]

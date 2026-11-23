@@ -11,6 +11,9 @@
 //! minimum width, so `Show::positioned` and `Show::min_width` don't apply. Keyboard navigation
 //! (arrows, Enter, Esc, first letters, submenus), screen-edge flipping and dismissal by a click
 //! outside are the system's. Menus are light or dark as the window's content is (`scheme`).
+
+#![allow(unsafe_code)]
+
 use std::{cell::{Cell, RefCell}, rc::Rc, sync::{Arc, OnceLock, atomic::{AtomicUsize, Ordering}}};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -186,7 +189,7 @@ unsafe extern "system" fn turn(_: HWND, _: u32, _: usize, _: u32) {
     // Clone before invoking so the `RefCell` borrow is released before user code runs.
     let waker = TURN.with(|t| t.borrow().clone());
     if let Some(waker) = waker {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker()));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker())).ok();
     }
 }
 
@@ -207,8 +210,9 @@ pub(crate) fn turns(hwnd: HWND) -> Turns {
 
 impl Drop for Turns {
     fn drop(&mut self) {
-        // SAFETY: only kills the timer if the window is still alive on this thread.
+        // SAFETY: `IsWindow` safely validates `self.hwnd` on this thread before killing the timer.
         if self.armed && unsafe { IsWindow(self.hwnd) != 0 } {
+            // SAFETY: `self.hwnd` was just confirmed live and `self.id` is the timer `turns` armed on it.
             unsafe { KillTimer(self.hwnd, self.id) };
         }
     }

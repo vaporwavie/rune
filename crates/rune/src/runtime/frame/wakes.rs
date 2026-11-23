@@ -5,6 +5,8 @@ impl RuntimeCore {
     /// Clock seconds now: the wall clock in a window (input arrives between frames), the
     /// virtual clock headless.
     pub(in crate::runtime) fn now_clock(&self) -> f64 {
+        #[cfg(test)]
+        if let Some(now) = self.frame.test_clock_now() { return now; }
         self.wall_start.map_or(self.clock, |t| t.elapsed().as_secs_f64())
     }
 
@@ -15,9 +17,9 @@ impl RuntimeCore {
         let (viewport, scale) = self.host.zoom.view();
         if self.fit_resized(viewport.1) {
             self.commit.relayout = true;
-            self.commit.viewport_stepped = false;
+            self.commit.set_viewport_stepped(false);
         }
-        if self.change_viewport(viewport, scale) { self.commit.viewport_stepped = false; }
+        if self.change_viewport(viewport, scale) { self.commit.set_viewport_stepped(false); }
     }
 
     /// The viewport one frame of the window's own resize animation moved it to. Unlike a
@@ -27,7 +29,7 @@ impl RuntimeCore {
         (self.host.zoom.window, self.host.zoom.window_scale) = (viewport, scale);
         let (viewport, scale) = self.host.zoom.view();
         let fresh = !self.commit.relayout;
-        if self.change_viewport(viewport, scale) && fresh { self.commit.viewport_stepped = true; }
+        if self.change_viewport(viewport, scale) && fresh { self.commit.set_viewport_stepped(true); }
     }
 
     /// Whether the change needs a layout.
@@ -40,7 +42,7 @@ impl RuntimeCore {
         }
         let changed = viewport != self.viewport || scale != self.env.scale;
         if changed {
-            if scale != self.env.scale { self.motion.flights.clear(); }
+            if scale != self.env.scale { self.motion.clear_flights(); }
             self.viewport = viewport;
             self.env.scale = scale;
             self.scene.set_pixel_scale(scale);
@@ -62,6 +64,11 @@ impl RuntimeCore {
             if self.host.window_focused.is_some()
                 && (self.focused_input().is_some_and(|i| i.selection_style.is_some()) || self.text_selection().is_some_and(|(_, r)| !r.is_empty()))
             {
+                self.commit.dirty = true;
+            }
+            // Back to the front: a field's keyboard-entry ring stays off until the keys move focus.
+            if focused && self.host.window_focused == Some(false) && self.kbd.focus.entered_by_keys() {
+                self.kbd.focus.step(crate::runtime::input::focus_machine::FocusEvent::WindowReturned);
                 self.commit.dirty = true;
             }
             self.host.window_focused = Some(focused);
@@ -88,7 +95,7 @@ impl RuntimeCore {
                 self.pointer.hover_paused = true;
             }
         }
-        if !focused { self.edit.input_click.clear(); self.wheel_lost(); }
+        if !focused { self.edit.clear_input_click(); self.wheel_lost(); }
     }
 
     /// The window gets no more keys: it lost focus or hid, which may never report a blur. The
@@ -109,7 +116,7 @@ impl RuntimeCore {
     /// Host time on the logical clock.
     pub(in crate::runtime) fn wall_clock(&self) -> Option<f64> {
         #[cfg(test)]
-        if let Some(clock) = &self.frame.test_clock { return Some(clock.now()); }
+        if let Some(now) = self.frame.test_clock_now() { return Some(now); }
         self.wall_start.map(|t0| t0.elapsed().as_secs_f64())
     }
 
@@ -135,13 +142,9 @@ impl RuntimeCore {
         self.schedule_wakes_from(due, [std::time::Duration::ZERO]);
     }
 
+    #[inline]
     pub(in crate::runtime) fn schedule_wakes_from(&mut self, now: f64, wakes: impl IntoIterator<Item = std::time::Duration>) {
-        for delay in wakes {
-            let deadline = now + delay.as_secs_f64();
-            if let Err(index) = self.frame.wake_deadlines.binary_search_by(|t| t.total_cmp(&deadline)) {
-                self.frame.wake_deadlines.insert(index, deadline);
-            }
-        }
+        self.frame.schedule_wakes_from(now, wakes);
     }
 
     /// Next requested wake on the unscaled app clock. None lets the shell sleep indefinitely.
@@ -156,21 +159,21 @@ impl RuntimeCore {
 
     /// When `poll` last ran, on `wake_deadline`'s clock.
     pub(crate) fn polled_at(&self) -> f64 {
-        self.frame.timer_wake.polled_at().unwrap_or(self.clock)
+        self.frame.polled_at(self.clock)
     }
 
     pub(in crate::runtime) fn logical_wake_deadline(&self) -> Option<f64> {
-        self.frame.wake_deadlines.first().copied().into_iter().chain(self.motion.loop_wake.map(|w| w.0)).min_by(f64::total_cmp)
+        self.frame.next_wake_deadline().into_iter().chain(self.motion.loop_wake().map(|w| w.0)).min_by(f64::total_cmp)
     }
 
     /// The next due timer of `poll`'s, on `wake_deadline`'s clock.
     pub(crate) fn poll_wake_deadline(&self) -> Option<f64> {
-        self.frame.wake_deadlines.first().copied()
+        self.frame.next_wake_deadline()
     }
 
     /// The next frame motion asks for at its own cadence (a loop's next step, a video's next
     /// picture), on `wake_deadline`'s clock.
     pub(crate) fn motion_wake_deadline(&self) -> Option<f64> {
-        self.motion.loop_wake.map(|w| w.0)
+        self.motion.loop_wake().map(|w| w.0)
     }
 }

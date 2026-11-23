@@ -87,21 +87,18 @@ pub(crate) fn select_surface_formats(
 
 /// Surface texture usages for a web canvas.
 ///
-/// WebGPU canvases accept `COPY_DST` (for retained loop-only frames) and `COPY_SRC` (for drift
-/// readback) even though wgpu's capabilities report only `RENDER_ATTACHMENT`. WebGL2 runs through
-/// `wgpu-core`, which rejects any usage absent from `caps_usages`.
+/// WebGPU canvases accept `COPY_DST` (for retained loop-only frames) and `COPY_SRC` (for backdrop
+/// copies in `ActivePass::split` and drift readback) even though wgpu's capabilities report only
+/// `RENDER_ATTACHMENT`. WebGL2 runs through `wgpu-core`, which rejects any usage absent from
+/// `caps_usages`.
 pub(crate) fn surface_usage(
     caps_usages: wgpu::TextureUsages,
     backend: wgpu::Backend,
-    drift: bool,
 ) -> wgpu::TextureUsages {
     let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT
         | (caps_usages & wgpu::TextureUsages::COPY_SRC);
     if backend == wgpu::Backend::BrowserWebGpu {
-        usage |= wgpu::TextureUsages::COPY_DST;
-        if drift {
-            usage |= wgpu::TextureUsages::COPY_SRC;
-        }
+        usage |= wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
     }
     usage
 }
@@ -118,6 +115,25 @@ pub(crate) fn needs_device_poll(backend: wgpu::Backend) -> bool {
 pub(crate) enum WebBackend {
     WebGpu,
     WebGl2,
+}
+
+/// Adapter options for a web GPU backend (`WebGPU` with `compatible_surface: None`, or `WebGL2`
+/// with `compatible_surface: Some(&surface)`).
+///
+/// Leaves `power_preference` at [`wgpu::PowerPreference::None`] so `navigator.gpu.requestAdapter`
+/// omits `powerPreference` and lets the browser choose the GPU (e.g. Chromium picks `LowPower` on
+/// battery and `HighPerformance` on AC power, avoids forcing an integrated GPU that cannot import
+/// textures across to a discrete display GPU on Linux, and avoids Chrome's Windows console warning
+/// for explicit `powerPreference`).
+pub(crate) fn adapter_options<'a, 'b>(
+    compatible_surface: Option<&'a wgpu::Surface<'b>>,
+) -> wgpu::RequestAdapterOptions<'a, 'b> {
+    wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::None,
+        compatible_surface,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }
 }
 
 /// Backends to attempt in order, given whether `navigator.gpu` is exposed and whether the
@@ -170,6 +186,562 @@ pub(crate) fn loss_action(is_webgl: bool, gpu_first: bool, embedded: bool, docum
     }
 }
 
+/// Web draw state reduced to the facts `WebFrameHost::gate` needs to decide whether a frame runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebDrawKind {
+    Cpu,
+    HandingOver { waiting_for_gpu: bool },
+    Gpu,
+    ContextLost,
+    Moving,
+}
+
+/// Decides whether a web frame skips, steps before acquiring (`Gate::QuietTimer` when a
+/// previous GPU presentation is valid so an unchanged frame avoids acquiring a canvas texture),
+/// or draws unconditionally (`Gate::Draw`).
+pub(crate) fn web_frame_gate(
+    suspended: bool,
+    draw: WebDrawKind,
+    quiet_candidate: bool,
+) -> crate::frame::host_step::Gate {
+    if suspended
+        || matches!(
+            draw,
+            WebDrawKind::HandingOver { waiting_for_gpu: true }
+                | WebDrawKind::ContextLost
+                | WebDrawKind::Moving
+        )
+    {
+        crate::frame::host_step::Gate::Skip
+    } else if draw == WebDrawKind::Gpu && quiet_candidate {
+        crate::frame::host_step::Gate::QuietTimer
+    } else {
+        crate::frame::host_step::Gate::Draw
+    }
+}
+
+/// Whether a presented GPU frame can be recorded in [`crate::window::Presented`] so a later
+/// redraw that builds the same pixels skips acquiring and presenting a canvas texture.
+pub(crate) fn should_record_presented(
+    drawn: bool,
+    moving: bool,
+    stale: bool,
+    has_window_frame: bool,
+) -> bool {
+    drawn && !moving && !stale && !has_window_frame
+}
+
+/// Outcome of one `wgpu::Surface::get_current_texture` call without the texture payload, so
+/// acquisition policy can be tested off `wasm32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebAcquireStatus {
+    Ready,
+    Timeout,
+    Occluded,
+    OutdatedOrLost,
+    Validation,
+}
+
+/// Action taken after `get_current_texture` returns [`WebAcquireStatus`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebAcquireAction {
+    UseTexture,
+    ReconfigureAndRetry,
+    Miss(crate::window::Missed),
+}
+
+/// Maps a canvas texture acquisition status and remaining reconfigure retries to an action.
+///
+/// Transient `Timeout` and `Occluded` statuses return missed frames instead of terminating the
+/// app; `Outdated` and `Lost` reconfigure once before becoming fatal `Missed::Unconfigured`.
+pub(crate) fn web_acquire_action(status: WebAcquireStatus, retries_left: u8) -> WebAcquireAction {
+    use crate::window::Missed;
+    match status {
+        WebAcquireStatus::Ready => WebAcquireAction::UseTexture,
+        WebAcquireStatus::Timeout => WebAcquireAction::Miss(Missed::Timeout),
+        WebAcquireStatus::Occluded => WebAcquireAction::Miss(Missed::Occluded),
+        WebAcquireStatus::OutdatedOrLost if retries_left > 0 => WebAcquireAction::ReconfigureAndRetry,
+        WebAcquireStatus::OutdatedOrLost | WebAcquireStatus::Validation => {
+            WebAcquireAction::Miss(Missed::Unconfigured)
+        }
+    }
+}
+
+/// How the web host responds inside `FrameHost::on_missed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebMissAction {
+    /// Canvas acquisition failed fatally: report the error and end the event loop.
+    Fatal,
+    /// Surface is occluded: step covered work if unstepped, without requesting another rAF.
+    CoveredOnly,
+    /// Transient miss: step covered work if unstepped and request a redraw on the next rAF.
+    RetryNextFrame,
+}
+
+/// Classifies a missed web frame for `WebFrameHost::on_missed`.
+pub(crate) fn web_miss_action(missed: crate::window::Missed) -> WebMissAction {
+    use crate::window::Missed;
+    match missed {
+        Missed::Unconfigured => WebMissAction::Fatal,
+        Missed::Occluded => WebMissAction::CoveredOnly,
+        Missed::Timeout | Missed::Outdated => WebMissAction::RetryNextFrame,
+    }
+}
+
+/// Whether `WebFrameHost::post_step_check` should drop the acquired drawable and reblend.
+///
+/// Skips re-acquiring when this frame already tried reblending for `rt_srgb` (for example on a
+/// WebGL2 surface without an sRGB twin where the chosen format cannot match `rt_srgb`).
+pub(crate) fn should_post_step_reblend(
+    renderer_srgb: bool,
+    rt_srgb: bool,
+    reblend_tried: Option<bool>,
+) -> bool {
+    renderer_srgb != rt_srgb && reblend_tried != Some(rt_srgb)
+}
+
+/// How a browser represents `Element.scrollLeft` on a `direction: rtl` container.
+///
+/// Matches `detectRtlScrollType()` in `platform/web/bridge.js`:
+/// - `Negative` (CSSOM View standard: Chromium >= 85, Firefox, Safari >= 15.4): `0` at the right
+///   (start) edge, `-max` at the left (end) edge.
+/// - `Reverse` (legacy Edge/IE): `0` at the right (start) edge, `+max` at the left (end) edge.
+/// - `Default` (legacy Blink/WebKit): `+max` at the right (start) edge, `0` at the left (end) edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RtlScrollModel {
+    Negative,
+    Reverse,
+    Default,
+}
+
+/// Converts a DOM `Element.scrollLeft` reading into Rune's logical horizontal scroll offset
+/// (`0..=max_scroll`, measuring distance from the inline-start edge).
+pub(crate) fn scroll_x_from_dom(
+    scroll_left: f32,
+    max_scroll: f32,
+    rtl: bool,
+    model: RtlScrollModel,
+) -> f32 {
+    if !scroll_left.is_finite() || !max_scroll.is_finite() {
+        return 0.0;
+    }
+    let max = max_scroll.max(0.0);
+    let logical = if !rtl {
+        scroll_left
+    } else {
+        match model {
+            RtlScrollModel::Negative => -scroll_left,
+            RtlScrollModel::Reverse => scroll_left,
+            RtlScrollModel::Default => max - scroll_left,
+        }
+    };
+    logical.clamp(0.0, max)
+}
+
+/// Converts Rune's logical horizontal scroll offset (`0..=max_scroll`) into the DOM
+/// `Element.scrollLeft` value expected by the browser's RTL scroll model.
+pub(crate) fn scroll_x_to_dom(
+    offset: f32,
+    max_scroll: f32,
+    rtl: bool,
+    model: RtlScrollModel,
+) -> f32 {
+    if !offset.is_finite() || !max_scroll.is_finite() {
+        return 0.0;
+    }
+    let max = max_scroll.max(0.0);
+    let clamped = offset.clamp(0.0, max);
+    if !rtl {
+        clamped
+    } else {
+        match model {
+            RtlScrollModel::Negative => if clamped == 0.0 { 0.0 } else { -clamped },
+            RtlScrollModel::Reverse => clamped,
+            RtlScrollModel::Default => max - clamped,
+        }
+    }
+}
+
+/// Builds the web host's `Runtime` and splits off its shared state, compositor and fonts.
+/// Kept out of `platform/web/app.rs` so web startup configuration runs in native unit tests.
+pub(crate) fn start_web_runtime<S: 'static>(
+    mut app: crate::App<S>,
+    viewport: (f32, f32),
+    env: crate::Env,
+    wake: crate::Waker,
+    live_wake: crate::Waker,
+) -> (
+    crate::Runtime<S>,
+    std::sync::Arc<crate::app::Shared<S>>,
+    Option<Box<dyn crate::compose::Compositor<S>>>,
+    &'static [&'static [u8]],
+) {
+    let compositor = app.compositor.take();
+    let (playground, attach_playground) = (app.playground.take(), app.attach_playground);
+    let spec_fonts = app.spec.fonts;
+    let (spec, state, shared, runtime) = app.into_parts(None);
+    let mut rt = crate::tooling::runtime_for(&spec, state, viewport, env, wake);
+    // Live values wake on their own lane so a value already drawn in the frame that published
+    // it does not trigger Wake::App's invalidate and redundant redraw.
+    rt.set_live_waker(live_wake);
+    if let Some(attach) = attach_playground {
+        attach(&mut rt, playground, &spec, None, None, true);
+    }
+    rt.configure(runtime);
+    rt.track_marks = compositor.is_some();
+    (rt, shared, compositor, spec_fonts)
+}
+
+/// Whether a resize's frame waits in a queued microtask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ResizeRedraw {
+    #[default]
+    Idle,
+    Queued,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeRedrawEvent {
+    /// winit's ResizeObserver or scale callback resized the canvas, which clears it.
+    Resized,
+    /// The queued microtask ran.
+    Fired,
+    /// A frame is drawing.
+    Drawing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeRedrawEffect {
+    QueueMicrotask,
+    Draw,
+}
+
+/// A resize's frame is drawn in a microtask after winit's callback returns (it holds the canvas
+/// borrowed while it runs), which is still before the browser paints the cleared canvas. A scale
+/// change and the resize after it share one microtask, and a frame drawn first makes it a no-op.
+pub(crate) fn step_resize_redraw(state: &mut ResizeRedraw, event: ResizeRedrawEvent) -> crate::machine::Effects<ResizeRedrawEffect> {
+    use crate::machine::Effects;
+    match (*state, event) {
+        (ResizeRedraw::Idle, ResizeRedrawEvent::Resized) => { *state = ResizeRedraw::Queued; Effects::one(ResizeRedrawEffect::QueueMicrotask) }
+        (ResizeRedraw::Queued, ResizeRedrawEvent::Fired) => { *state = ResizeRedraw::Idle; Effects::one(ResizeRedrawEffect::Draw) }
+        (_, ResizeRedrawEvent::Drawing) => { *state = ResizeRedraw::Idle; Effects::none() }
+        (ResizeRedraw::Queued, ResizeRedrawEvent::Resized) | (ResizeRedraw::Idle, ResizeRedrawEvent::Fired) => Effects::none(),
+    }
+}
+
+/// Initial retry delay after a refused web surface configuration; doubles per consecutive failure.
+pub(crate) const CONFIGURE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(50);
+/// Consecutive surface configuration failures before waiting for a resize instead of retrying.
+pub(crate) const CONFIGURE_MAX_FAILURES: u8 = 5;
+
+/// Health and retry state of a web canvas surface's configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceHealth {
+    /// Ready to draw (or awaiting the answer to the latest `active` configure).
+    Ready { failures: u8, active: Option<crate::machine::Attempt> },
+    /// A configure was refused; a retry timer is armed for `attempt`.
+    WaitingRetry { failures: u8, attempt: crate::machine::Attempt },
+    /// Exhausted retries; no further configures or draws run until a resize arrives.
+    GaveUp,
+}
+
+impl Default for SurfaceHealth {
+    fn default() -> Self {
+        Self::Ready { failures: 0, active: None }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceHealthEvent {
+    /// A configure call was issued with `attempt`.
+    Begin(crate::machine::Attempt),
+    /// A configure call resolved (synchronously on WebGL2, or via JS error scopes on WebGPU).
+    Outcome { attempt: crate::machine::Attempt, error: Option<String> },
+    /// The scheduled retry timer fired for `attempt`.
+    RetryDue(crate::machine::Attempt),
+    /// A frame presented cleanly, ending any run of failures.
+    Presented,
+    /// The canvas resized to a non-zero extent, allowing a fresh configure.
+    Resized,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceHealthEffect {
+    /// Issue a new surface configure now.
+    Configure,
+    /// Schedule a `RetryDue(attempt)` wake after `delay`.
+    ScheduleRetry { attempt: crate::machine::Attempt, delay: std::time::Duration },
+    /// Log the first failure in a run.
+    ReportFirst(String),
+    /// Log that retries ran out and the canvas waits for a resize.
+    ReportGaveUp(String),
+}
+
+impl SurfaceHealth {
+    /// Whether the surface can currently acquire and draw frames.
+    pub(crate) fn can_draw(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    pub(crate) fn step(
+        &mut self,
+        seq: &mut crate::machine::Seq,
+        event: SurfaceHealthEvent,
+    ) -> crate::machine::Effects<SurfaceHealthEffect> {
+        use crate::machine::Effects;
+        match (*self, event) {
+            (Self::Ready { failures, .. } | Self::WaitingRetry { failures, .. }, SurfaceHealthEvent::Begin(attempt)) => {
+                *self = Self::Ready { failures, active: Some(attempt) };
+                Effects::none()
+            }
+            (Self::GaveUp, SurfaceHealthEvent::Begin(attempt)) => {
+                *self = Self::Ready { failures: 0, active: Some(attempt) };
+                Effects::none()
+            }
+            (Self::Ready { failures, active: Some(expected) }, SurfaceHealthEvent::Outcome { attempt, error })
+                if attempt == expected =>
+            {
+                match error {
+                    None => {
+                        *self = Self::Ready { failures, active: None };
+                        Effects::none()
+                    }
+                    Some(why) => {
+                        let next = failures.saturating_add(1);
+                        if next >= CONFIGURE_MAX_FAILURES {
+                            *self = Self::GaveUp;
+                            return Effects::one(SurfaceHealthEffect::ReportGaveUp(why));
+                        }
+                        let retry = seq.next();
+                        let delay = CONFIGURE_RETRY_BASE * (1u32 << (next - 1));
+                        *self = Self::WaitingRetry { failures: next, attempt: retry };
+                        let schedule = SurfaceHealthEffect::ScheduleRetry { attempt: retry, delay };
+                        if next == 1 {
+                            Effects::two(SurfaceHealthEffect::ReportFirst(why), schedule)
+                        } else {
+                            Effects::one(schedule)
+                        }
+                    }
+                }
+            }
+            (Self::WaitingRetry { failures, attempt: expected }, SurfaceHealthEvent::RetryDue(attempt))
+                if attempt == expected =>
+            {
+                *self = Self::Ready { failures, active: None };
+                Effects::one(SurfaceHealthEffect::Configure)
+            }
+            (Self::Ready { active, .. }, SurfaceHealthEvent::Presented) => {
+                *self = Self::Ready { failures: 0, active };
+                Effects::none()
+            }
+            (Self::GaveUp | Self::WaitingRetry { .. }, SurfaceHealthEvent::Resized) => {
+                *self = Self::Ready { failures: 0, active: None };
+                Effects::none()
+            }
+            _ => Effects::none(),
+        }
+    }
+}
+
+/// How long a CPU-first web page draws nothing non-ambient before starting synchronous GPU
+/// setup, and the longest after its first CPU frame that it waits for quiet.
+pub(crate) const GPU_START_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const GPU_START_QUIET_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether a resolved GPU device must yield a browser macrotask before waking `Wake::Ready`
+/// so `gpu_side` (`Renderer::new`) runs in a separate browser task from `try_webgl2`.
+///
+/// WebGPU resolves from browser promises and warms pipelines asynchronously off the main thread;
+/// WebGL2 (`wgpu-core`) resolves `request_adapter` and `request_device` synchronously without
+/// yielding, and winit's `EventLoopProxy::send_event` dispatches via `queueMicrotask`.
+pub(crate) fn needs_ready_yield(backend: wgpu::Backend) -> bool {
+    backend == wgpu::Backend::Gl
+}
+
+/// Which backend a scheduled CPU-first GPU startup timer is waiting to start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuStartPhase {
+    /// WebGPU advertises async pipeline compilation, so probe WebGPU right after the first frame.
+    ProbeWebGpu,
+    /// Synchronous WebGPU (no `createRenderPipelineAsync`): wait for quiet before probing WebGPU.
+    WaitQuietForWebGpu,
+    /// Synchronous WebGL2 (no `navigator.gpu`, or WebGPU probe failed): wait for quiet before
+    /// starting WebGL2 setup.
+    WaitQuietForWebGl2,
+    /// Neither WebGPU nor WebGL2 is available: report no GPU on the next turn.
+    NoBackend,
+}
+
+/// Explicit state machine scheduling CPU-first GPU acquisition after the first CPU frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GpuStartup {
+    #[default]
+    Idle,
+    Scheduled {
+        attempt: crate::machine::Attempt,
+        first_at: crate::time::Instant,
+        drawn_at: crate::time::Instant,
+        phase: GpuStartPhase,
+        webgl_enabled: bool,
+    },
+    ProbingWebGpu {
+        first_at: crate::time::Instant,
+        drawn_at: crate::time::Instant,
+        webgl_enabled: bool,
+    },
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuStartupEvent {
+    FirstPresented {
+        at: crate::time::Instant,
+        has_navigator_gpu: bool,
+        compiles_async: bool,
+        webgl_enabled: bool,
+    },
+    FrameDrawn { at: crate::time::Instant },
+    CheckDue { attempt: crate::machine::Attempt, now: crate::time::Instant },
+    WebGpuSucceeded,
+    WebGpuFailed { now: crate::time::Instant },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuStartupEffect {
+    ScheduleCheck { attempt: crate::machine::Attempt, delay: std::time::Duration },
+    AskWebGpu,
+    AskWebGl2,
+    FailNoBackend,
+}
+
+fn quiet_remaining(
+    first_at: crate::time::Instant,
+    drawn_at: crate::time::Instant,
+    now: crate::time::Instant,
+) -> Option<std::time::Duration> {
+    let since_first = now.saturating_duration_since(first_at);
+    if since_first >= GPU_START_QUIET_LIMIT {
+        return None;
+    }
+    let since_draw = now.saturating_duration_since(drawn_at);
+    if since_draw >= GPU_START_QUIET {
+        return None;
+    }
+    let until_quiet = GPU_START_QUIET.saturating_sub(since_draw);
+    let until_limit = GPU_START_QUIET_LIMIT.saturating_sub(since_first);
+    Some(until_quiet.min(until_limit))
+}
+
+impl GpuStartup {
+    pub(crate) fn step(
+        &mut self,
+        seq: &mut crate::machine::Seq,
+        event: GpuStartupEvent,
+    ) -> crate::machine::Effects<GpuStartupEffect> {
+        use crate::machine::Effects;
+        use std::time::Duration;
+        match (*self, event) {
+            (
+                Self::Idle,
+                GpuStartupEvent::FirstPresented { at, has_navigator_gpu, compiles_async, webgl_enabled },
+            ) => {
+                let (phase, delay) = if has_navigator_gpu && compiles_async {
+                    (GpuStartPhase::ProbeWebGpu, Duration::ZERO)
+                } else if has_navigator_gpu {
+                    (GpuStartPhase::WaitQuietForWebGpu, GPU_START_QUIET)
+                } else if webgl_enabled {
+                    (GpuStartPhase::WaitQuietForWebGl2, GPU_START_QUIET)
+                } else {
+                    (GpuStartPhase::NoBackend, Duration::ZERO)
+                };
+                let attempt = seq.next();
+                *self = Self::Scheduled { attempt, first_at: at, drawn_at: at, phase, webgl_enabled };
+                Effects::one(GpuStartupEffect::ScheduleCheck { attempt, delay })
+            }
+            (
+                Self::Scheduled { attempt, first_at, drawn_at, phase, webgl_enabled },
+                GpuStartupEvent::FrameDrawn { at },
+            ) => {
+                *self = Self::Scheduled { attempt, first_at, drawn_at: drawn_at.max(at), phase, webgl_enabled };
+                Effects::none()
+            }
+            (
+                Self::ProbingWebGpu { first_at, drawn_at, webgl_enabled },
+                GpuStartupEvent::FrameDrawn { at },
+            ) => {
+                *self = Self::ProbingWebGpu { first_at, drawn_at: drawn_at.max(at), webgl_enabled };
+                Effects::none()
+            }
+            (
+                Self::Scheduled { attempt: expected, first_at, drawn_at, phase, webgl_enabled },
+                GpuStartupEvent::CheckDue { attempt, now },
+            ) if attempt == expected => match phase {
+                GpuStartPhase::ProbeWebGpu => {
+                    *self = Self::ProbingWebGpu { first_at, drawn_at, webgl_enabled };
+                    Effects::one(GpuStartupEffect::AskWebGpu)
+                }
+                GpuStartPhase::WaitQuietForWebGpu => match quiet_remaining(first_at, drawn_at, now) {
+                    Some(delay) => {
+                        let next = seq.next();
+                        *self = Self::Scheduled { attempt: next, first_at, drawn_at, phase, webgl_enabled };
+                        Effects::one(GpuStartupEffect::ScheduleCheck { attempt: next, delay })
+                    }
+                    None => {
+                        *self = Self::ProbingWebGpu { first_at, drawn_at, webgl_enabled };
+                        Effects::one(GpuStartupEffect::AskWebGpu)
+                    }
+                },
+                GpuStartPhase::WaitQuietForWebGl2 => match quiet_remaining(first_at, drawn_at, now) {
+                    Some(delay) => {
+                        let next = seq.next();
+                        *self = Self::Scheduled { attempt: next, first_at, drawn_at, phase, webgl_enabled };
+                        Effects::one(GpuStartupEffect::ScheduleCheck { attempt: next, delay })
+                    }
+                    None => {
+                        *self = Self::Done;
+                        Effects::one(GpuStartupEffect::AskWebGl2)
+                    }
+                },
+                GpuStartPhase::NoBackend => {
+                    *self = Self::Done;
+                    Effects::one(GpuStartupEffect::FailNoBackend)
+                }
+            },
+            (Self::ProbingWebGpu { .. }, GpuStartupEvent::WebGpuSucceeded) => {
+                *self = Self::Done;
+                Effects::none()
+            }
+            (
+                Self::ProbingWebGpu { first_at, drawn_at, webgl_enabled },
+                GpuStartupEvent::WebGpuFailed { now },
+            ) => {
+                if !webgl_enabled {
+                    *self = Self::Done;
+                    return Effects::one(GpuStartupEffect::FailNoBackend);
+                }
+                // Always schedule via a macrotask (remaining quiet time, or Duration::ZERO if
+                // already quiet) so synchronous WebGL2 setup never runs inside requestAdapter's
+                // Promise microtask or before the page has had a quiet window after drawing.
+                let delay = quiet_remaining(first_at, drawn_at, now).unwrap_or(Duration::ZERO);
+                let attempt = seq.next();
+                *self = Self::Scheduled {
+                    attempt,
+                    first_at,
+                    drawn_at,
+                    phase: GpuStartPhase::WaitQuietForWebGl2,
+                    webgl_enabled: true,
+                };
+                Effects::one(GpuStartupEffect::ScheduleCheck { attempt, delay })
+            }
+            _ => Effects::none(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "web_math_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "web_startup_tests.rs"]
+mod startup_tests;

@@ -1,18 +1,21 @@
 //! Low-level Taffy 0.15 solver trait implementations over [`LayoutStore`].
 
+#![forbid(unsafe_code)]
+
 use taffy::compute::{
     compute_block_layout, compute_cached_layout, compute_flexbox_layout, compute_grid_layout, compute_hidden_layout,
     compute_oof_layout,
 };
 use taffy::geometry::{Point, Rect, Size};
 use taffy::style::{
-    AlignSelf, BoxGenerationMode, BoxSizing, Contain, CoreStyle, Dimension, Direction, Display, ExpandedDimension,
-    ExpandedLengthPercentageAuto, FlexboxItemStyle, LengthPercentage, LengthPercentageAuto, Overflow, Position, Style,
+    AlignSelf, AvailableSpace, BoxGenerationMode, BoxSizing, Contain, CoreStyle, Dimension, Direction, Display,
+    ExpandedDimension, ExpandedLengthPercentageAuto, FlexDirection, FlexboxItemStyle, LengthPercentage, LengthPercentageAuto,
+    Overflow, Position, Style,
 };
 use taffy::tree::{
     DetailedLayoutInfo, Layout, LayoutBlockContainer, LayoutContainingBlock, LayoutFlexboxContainer,
-    LayoutGridContainer, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, RunMode, TraversePartialTree,
-    TraverseTree,
+    LayoutGridContainer, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, RequestedAxis, RunMode, SizingMode,
+    TraversePartialTree, TraverseTree,
 };
 use taffy::{BlockContext, CacheTree, DetailedGridInfo};
 
@@ -20,6 +23,39 @@ use crate::store::{BoxLayout, LayoutStore, RetainedSlot, SlotChildIter};
 use crate::style::CompactStyle;
 
 const NONE_DETAIL: DetailedLayoutInfo = DetailedLayoutInfo::None;
+
+/// Available border-box width to clamp an auto-width flex row against under CSS fit-content sizing.
+///
+/// Upstream Taffy 0.15's `determine_container_main_size` returns a single line's sum of flex bases
+/// under `AvailableSpace::Definite(avail)` without clamping to `min(max-content, max(min-content, avail))`,
+/// so non-stretched row items in columns (`align-items: flex-start` / `center` / `end`) expand to
+/// their unwrapped width instead of shrinking their flexible children.
+#[inline]
+fn fit_content_row_limit(style: &CompactStyle, inputs: &LayoutInput) -> Option<f32> {
+    if !matches!(style.flex_direction(), FlexDirection::Row | FlexDirection::RowReverse) || inputs.known_dimensions.width.is_some() {
+        return None;
+    }
+    let AvailableSpace::Definite(avail_w) = inputs.available_space.width else {
+        return None;
+    };
+    if inputs.sizing_mode == SizingMode::InherentSize {
+        match style.size().width.expand() {
+            ExpandedDimension::Auto | ExpandedDimension::FitContent => {}
+            ExpandedDimension::Percent(_) if inputs.parent_size.width.is_none() => {}
+            _ => return None,
+        }
+        let height_definite = inputs.known_dimensions.height.is_some()
+            || match style.size().height.expand() {
+                ExpandedDimension::Length(_) => true,
+                ExpandedDimension::Percent(_) => inputs.parent_size.height.is_some(),
+                _ => false,
+            };
+        if style.aspect_ratio().is_some() && height_definite {
+            return None;
+        }
+    }
+    Some(avail_w)
+}
 
 #[inline(always)]
 fn round_dim(d: Dimension) -> Dimension {
@@ -130,18 +166,12 @@ where
 {
     #[inline(always)]
     fn slot(&self, node_id: NodeId) -> &RetainedSlot {
-        let idx = u64::from(node_id) as usize;
-        debug_assert!(idx < self.store.slots.len());
-        // SAFETY: all `NodeId`s in `curr_children` and `root` are allocated indices into `slots`.
-        unsafe { self.store.slots.get_unchecked(idx) }
+        &self.store.slots[u64::from(node_id) as usize]
     }
 
     #[inline(always)]
     fn slot_mut(&mut self, node_id: NodeId) -> &mut RetainedSlot {
-        let idx = u64::from(node_id) as usize;
-        debug_assert!(idx < self.store.slots.len());
-        // SAFETY: all `NodeId`s in `curr_children` and `root` are allocated indices into `slots`.
-        unsafe { self.store.slots.get_unchecked_mut(idx) }
+        &mut self.store.slots[u64::from(node_id) as usize]
     }
 
     #[inline(always)]
@@ -161,11 +191,12 @@ where
 
         let mut out = compute_cached_layout(self, node_id, inputs, |view, node_id, inputs| {
             let idx = u64::from(node_id) as usize;
-            // SAFETY: `node_id` is a live `SlotId` index into `slots`.
-            let (display_mode, has_children, whole_col) = unsafe {
-                let s = view.store.slots.get_unchecked(idx);
-                (s.style.display(), s.child_len() != 0, s.style.whole_rows_column())
-            };
+            let s = &view.store.slots[idx];
+            let (display_mode, has_children, whole_col) =
+                (s.style.display(), s.child_len() != 0, s.style.whole_rows_column());
+            let fit_row_avail = (display_mode == Display::Flex && has_children)
+                .then(|| fit_content_row_limit(&s.style, &inputs))
+                .flatten();
 
             match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(view, node_id),
@@ -176,7 +207,40 @@ where
                             Display::FlowRoot => compute_block_layout(view, node_id, inputs, None),
                             Display::Flex => {
                                 view.in_whole_rows_col = whole_col;
-                                let r = compute_flexbox_layout(view, node_id, inputs);
+                                let mut r = compute_flexbox_layout(view, node_id, inputs);
+                                if let Some(avail_w) = fit_row_avail && r.size.width > avail_w {
+                                    let min_inputs = LayoutInput {
+                                        run_mode: RunMode::ComputeSize,
+                                        axis: RequestedAxis::Horizontal,
+                                        available_space: Size {
+                                            width: AvailableSpace::MinContent,
+                                            height: inputs.available_space.height,
+                                        },
+                                        ..inputs
+                                    };
+                                    let min_w = compute_flexbox_layout(view, node_id, min_inputs).size.width;
+                                    let clamped_w = r.size.width.min(avail_w.max(min_w));
+                                    if clamped_w < r.size.width {
+                                        if inputs.run_mode == RunMode::ComputeSize
+                                            && inputs.axis == RequestedAxis::Horizontal
+                                        {
+                                            r = LayoutOutput::from_outer_size(Size { width: clamped_w, height: 0.0 });
+                                        } else {
+                                            let clamped_inputs = LayoutInput {
+                                                known_dimensions: Size {
+                                                    width: Some(clamped_w),
+                                                    height: inputs.known_dimensions.height,
+                                                },
+                                                known_dimensions_are_definite: Size {
+                                                    width: true,
+                                                    height: inputs.known_dimensions_are_definite.height,
+                                                },
+                                                ..inputs
+                                            };
+                                            r = compute_flexbox_layout(view, node_id, clamped_inputs);
+                                        }
+                                    }
+                                }
                                 view.in_whole_rows_col = false;
                                 r
                             }
@@ -190,15 +254,9 @@ where
                     })
                 }
                 (_, false) => {
-                    // SAFETY: `idx` is in bounds of both `slots` and `node_idx`.
-                    let (ctx, style) = unsafe {
-                        let s = view.store.slots.get_unchecked(idx);
-                        let ctx = s
-                            .has_context()
-                            .then(|| *view.store.node_idx.get_unchecked(idx) as usize);
-                        (ctx, &s.style)
-                    };
-                    (view.measure_leaf)(inputs, ctx, style)
+                    let s = &view.store.slots[idx];
+                    let ctx = s.has_context().then(|| view.store.node_idx[idx] as usize);
+                    (view.measure_leaf)(inputs, ctx, &s.style)
                 }
             }
         });
@@ -224,8 +282,7 @@ where
         let s = self.slot(parent_node_id);
         let start = s.child_start as usize;
         let end = start + s.child_len() as usize;
-        // SAFETY: `child_start..child_start + child_len` was appended to `curr_children` this commit.
-        SlotChildIter(unsafe { self.store.curr_children.get_unchecked(start..end) }.iter())
+        SlotChildIter(self.store.curr_children[start..end].iter())
     }
 
     #[inline(always)]
@@ -237,8 +294,7 @@ where
     fn get_child_id(&self, parent_node_id: NodeId, child_index: usize) -> NodeId {
         let s = self.slot(parent_node_id);
         debug_assert!(child_index < s.child_len() as usize);
-        // SAFETY: Taffy calls `get_child_id` with `child_index < child_count(parent_node_id)`.
-        let child_slot = unsafe { *self.store.curr_children.get_unchecked(s.child_start as usize + child_index) };
+        let child_slot = self.store.curr_children[s.child_start as usize + child_index];
         NodeId::new(child_slot as u64)
     }
 }

@@ -121,10 +121,11 @@ fn erf2(x: vec2<f32>) -> vec2<f32> {
     return s - s / (r * r);
 }
 
-fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: vec2<f32>) -> f32 {
-    let delta = min(half.y - corner - abs(y), 0.0);
-    let curved = half.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
-    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
+fn shadow_x(x: f32, y: f32, sigma: f32, radii: vec4<f32>, half: vec2<f32>) -> f32 {
+    let corner = select(radii.xy, radii.wz, y > 0.0);
+    let delta = min(vec2<f32>(half.y) - corner - vec2<f32>(abs(y)), vec2<f32>(0.0));
+    let curved = vec2<f32>(half.x) - corner + sqrt(max(vec2<f32>(0.0), corner * corner - delta * delta));
+    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved.y, curved.x)) * (sqrt(0.5) / sigma));
     return integral.y - integral.x;
 }
 
@@ -132,9 +133,10 @@ fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: vec2<f32>) -> f32 {
 // four midpoint weights of the ±3σ window, 3·(g(0.75) + g(2.25)) for a unit Gaussian g.
 const SHADOW_INSIDE: f32 = 0.99863125;
 
-fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
+fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, radii: vec4<f32>) -> f32 {
     // A big panel's shadow is mostly interior, and its erf rows there cost a 5K frame
     // milliseconds. 6σ in, each row is within 1e-6 of fully covered.
+    let corner = max(max(radii.x, radii.y), max(radii.z, radii.w));
     if (abs(p.x) <= half.x - 6.0 * sigma && abs(p.y) <= half.y - corner - 6.0 * sigma) {
         return SHADOW_INSIDE;
     }
@@ -146,7 +148,7 @@ fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
     var y = start + step * 0.5;
     var v = 0.0;
     for (var i = 0; i < 4; i = i + 1) {
-        v = v + shadow_x(p.x, p.y - y, sigma, corner, half) * gaussian(y, sigma) * step;
+        v = v + shadow_x(p.x, p.y - y, sigma, radii, half) * gaussian(y, sigma) * step;
         y = y + step;
     }
     return v;
@@ -413,16 +415,19 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         } else {
             color = layer_load(vec2<i32>(floor(p)), additive);
         }
-        return color * i.fill.a * clip_alpha(screen, i.clip, i.fade) * hole_alpha(screen, i.radii);
+        return color * i.fill.a * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw) * hole_alpha(screen, i.radii);
     }
     let kind = fragment_kind(i);
     if (kind > 11.5) { discard; }
+    // Fragment position is the rasterizer's exact pixel centre; interpolated `i.p` drifts by
+    // subpixel ULPs on D3D12, turning exact 1.0 edge coverage into 1.0 - eps (which drops to
+    // 1 - 1/2048 in Rgba16Float layer targets). Only rotated glyphs need interpolated `i.p`.
+    let screen = i.pos.xy + projection.xy;
     let half = i.rect.zw * 0.5;
     let center = i.rect.xy + half;
     var col = vec4<f32>(0.0);
-    var clip_p = i.p;
     if (kind < 0.5) {
-        let d = sd_rounded(i.p - center, half, i.radii);
+        let d = sd_rounded(screen - center, half, i.radii);
         let soft = max(i.params.z, 0.5);
         let bw = i.params.x;
         if (bw > 0.0) {
@@ -436,7 +441,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
                 let ih = max(half - vec2<f32>(w.y + w.w, w.x + w.z) * 0.5, vec2<f32>(0.0));
                 let ic = center + vec2<f32>(w.w - w.y, w.x - w.z) * 0.5;
                 let cut = vec4<f32>(max(w.x, w.w), max(w.x, w.y), max(w.z, w.y), max(w.z, w.w));
-                inner_d = sd_rounded(i.p - ic, ih, sign(i.radii) * max(abs(i.radii) - cut, vec4<f32>(0.0)));
+                inner_d = sd_rounded(screen - ic, ih, sign(i.radii) * max(abs(i.radii) - cut, vec4<f32>(0.0)));
             }
             col = border_over(i.fill, i.border, d, inner_d, soft, bw, i.params.w, !sides && any(i.radii != vec4<f32>(0.0)));
         } else {
@@ -444,16 +449,16 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         }
     } else if (kind < 1.5) {
         let sigma = max(i.params.z, 0.01);
-        let corner = min(abs(i.radii.x), min(half.x, half.y));
-        col = i.fill * shadow(i.p - center, half, sigma, corner);
+        let radii = min(abs(select(i.radii, i.radii.xxxx, i.uv.z > 0.0)), vec4<f32>(min(half.x, half.y)));
+        col = i.fill * shadow(screen - center, half, sigma, radii);
         // A shadow under a native system material leaves its interior clear: `uv` holds the
         // hole relative to this rect and `radii.w` its corner radius.
         if (i.uv.z > 0.0) {
             let hole = i.uv.zw * 0.5;
-            col = col * clamp(0.5 + sd_rounded(i.p - (i.rect.xy + i.uv.xy + hole), hole, vec4<f32>(i.radii.w)), 0.0, 1.0);
+            col = col * clamp(0.5 + sd_rounded(screen - (i.rect.xy + i.uv.xy + hole), hole, vec4<f32>(i.radii.w)), 0.0, 1.0);
         }
     } else if (kind > 6.5) {
-        let d = sd_rounded(i.p - center, half, i.radii);
+        let d = sd_rounded(screen - center, half, i.radii);
         if (kind > 10.5) {
             // Radial (`uv.z > 0`) or angled linear (`uv.z == 0`) gradient stop segment from
             // `fill` at t0 (`params.x`) to `border` at t1 (`params.w`); `+ 2.0` marks an open
@@ -468,9 +473,9 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let t1 = select(t1_raw, t1_raw - 2.0, upper_open);
             var t: f32;
             if (i.uv.z > 0.0) {
-                t = length((i.p - i.rect.xy - i.uv.xy) / i.uv.zw);
+                t = length((screen - i.rect.xy - i.uv.xy) / i.uv.zw);
             } else {
-                t = 0.5 + dot(i.p - center, i.uv.xy);
+                t = 0.5 + dot(screen - center, i.uv.xy);
             }
             if ((lower_open && t < t0) || (upper_open && t >= t1)) {
                 col = vec4<f32>(0.0);
@@ -484,14 +489,12 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let soft = max(i.params.z, 0.5);
             let bw = i.params.x;
             let ring = clamp(0.5 - d / (soft * 2.0), 0.0, 1.0) - clamp(0.5 - (d + bw) / (soft * 2.0), 0.0, 1.0);
-            let t = clamp((i.p.y - i.rect.y) / max(i.rect.w, 1.0), 0.0, 1.0);
-            // The pixel centre, not `p`: inside a tight corner s jumps across the diagonal, and
-            // interpolation could put a pixel on that diagonal on the other side of it.
-            let arc = ring_arc(i.pos.xy + projection.xy - i.rect.xy, i.rect.zw, i.radii, bw);
+            let t = clamp((screen.y - i.rect.y) / max(i.rect.w, 1.0), 0.0, 1.0);
+            let arc = ring_arc(screen - i.rect.xy, i.rect.zw, i.radii, bw);
             col = mix(i.fill, i.border, t) * (ring * dash_cov(arc.x, arc.y, i.uv.xyz));
         } else {
             // Bilinear, clamped to the image's own texels so neighbours in the atlas never bleed.
-            let local = (i.p - i.rect.xy) * i.uv.zw / i.rect.zw - vec2<f32>(0.5);
+            let local = (screen - i.rect.xy) * i.uv.zw / i.rect.zw - vec2<f32>(0.5);
             let lo = vec2<i32>(i.uv.xy);
             let hi = lo + vec2<i32>(i.uv.zw) - vec2<i32>(1);
             let base = floor(local);
@@ -504,11 +507,9 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             col = c * (i.fill.a * clamp(0.5 - d, 0.0, 1.0));
         }
     } else if (kind > 4.5 && kind < 5.5) {
-        col = i.fill * segment(i.pos.xy + projection.xy, i.radii.xy, i.radii.zw, i.params.x, i.params.z > 0.5);
+        col = i.fill * segment(screen, i.radii.xy, i.radii.zw, i.params.x, i.params.z > 0.5);
     } else if (kind > 5.5 && kind < 6.5) {
-        // The pixel centre itself, not `p`: `p` is interpolated over each triangle's own quad, so
-        // neighbours would disagree in the last bits about who owns a pixel on a shared edge.
-        col = i.fill * triangle(i.pos.xy + projection.xy, i.radii.xy, i.radii.zw, i.uv.xy, u32(i.params.x + 0.5));
+        col = i.fill * triangle(screen, i.radii.xy, i.radii.zw, i.uv.xy, u32(i.params.x + 0.5));
     } else if (kind > 2.5) {
         if (kind < 3.5) {
             // Inset shadow: the element's shape minus a blurred copy of it shrunk by the spread
@@ -516,18 +517,19 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             // ring's corner pixel is as dark as Chromium draws it.
             let spread = i.params.x;
             let ih = max(half - vec2<f32>(spread), vec2<f32>(0.0));
-            let q = i.p - center - i.uv.xy;
+            let q = screen - center - i.uv.xy;
             var lit: f32;
             if (i.params.z < 0.3) {
                 lit = box_cov(q, ih, sign(i.radii) * max(abs(i.radii) - vec4<f32>(spread), vec4<f32>(0.0)));
             } else {
-                lit = shadow(q, ih, i.params.z, max(min(abs(i.radii.x) - spread, min(ih.x, ih.y)), 0.0));
+                let radii = max(min(abs(i.radii) - vec4<f32>(spread), vec4<f32>(min(ih.x, ih.y))), vec4<f32>(0.0));
+                lit = shadow(q, ih, i.params.z, radii);
             }
-            col = i.fill * box_cov(i.p - center, half, i.radii) * (1.0 - clamp(lit, 0.0, 1.0));
+            col = i.fill * box_cov(screen - center, half, i.radii) * (1.0 - clamp(lit, 0.0, 1.0));
         } else {
             // With a border width, kind 0 whose ring runs from `border` (top) to `uv` (bottom).
-            let d = sd_rounded(i.p - center, half, i.radii);
-            let t = clamp((i.p.y - i.rect.y) / max(i.rect.w, 1.0), 0.0, 1.0);
+            let d = sd_rounded(screen - center, half, i.radii);
+            let t = clamp((screen.y - i.rect.y) / max(i.rect.w, 1.0), 0.0, 1.0);
             let soft = max(i.params.z, 0.5);
             let bw = i.params.x;
             if (bw > 0.0) {
@@ -537,12 +539,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             }
         }
     } else {
-        // Interpolated screen coordinates can round below an integer texel
-        // boundary. Fragment position is the rasterizer's exact pixel center.
-        let screen = i.pos.xy + projection.xy;
         let rotated = i.params.x != 0.0;
-        // A turned glyph clips on screen, where its quad is.
-        if rotated { clip_p = screen; }
         var cov: f32;
         if i.uv.z > 0.0 || rotated {
             // Flying text keeps the original atlas footprint while its quad scales uniformly.
@@ -567,7 +564,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             col = i.fill * pow(cov, i.params.w);
         }
     }
-    let source = col * clip_alpha(clip_p, i.clip, i.fade);
+    let source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
     // On a direct byte surface cpu_boot::blend converts the source *after* mask gamma,
     // colour, shape coverage and clipping. The mask texel itself isn't the blend source.
     let flat_fill = kind == 0.0 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0;

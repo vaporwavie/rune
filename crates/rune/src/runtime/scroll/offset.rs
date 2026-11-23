@@ -4,6 +4,18 @@
 use super::*;
 use crate::runtime::scroll_mode::{self as mode, Event as ModeEvent};
 
+/// How a keyed scroll request anchors its target within the viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollAnchor {
+    None,
+    /// Place the target's top `y` points below the viewport's top (`Tx::scroll_key_to`).
+    Top,
+    /// Place the target's vertical midpoint (for a `TextHighlight`, its inline font-metric box
+    /// `[baseline - ascent, baseline + descent]`) `y` points below the viewport's top, snapped to
+    /// whole device pixels (`Tx::scroll_key_center_at`).
+    CenterSnapped,
+}
+
 /// A request to move a viewport to an offset on one axis or both.
 #[derive(Clone, Debug)]
 pub(crate) struct ScrollRequest {
@@ -12,9 +24,7 @@ pub(crate) struct ScrollRequest {
     pub y: Option<f32>,
     /// The spring it glides on, or None to jump.
     pub glide: Option<Spring>,
-    /// `key` names an element, and `y` is how far below the viewport's top its top lands
-    /// (`Tx::scroll_key_to`).
-    pub anchor: bool,
+    pub anchor: ScrollAnchor,
 }
 
 impl RuntimeCore {
@@ -30,10 +40,10 @@ impl RuntimeCore {
         // Anchored jumps, placed again from the new layout once virtual rows land.
         let mut anchors = Vec::new();
         for r in requests {
-            if r.anchor {
-                let Some((i, to)) = self.anchor_offset(&r.key, r.y.unwrap_or(0.0)) else { continue };
+            if r.anchor != ScrollAnchor::None {
+                let Some((i, to)) = self.anchor_offset(&r.key, r.y.unwrap_or(0.0), r.anchor) else { continue };
                 jumps.push((self.tree.nodes[i].id, false, to));
-                anchors.push((jumps.len() - 1, r.key, r.y.unwrap_or(0.0)));
+                anchors.push((jumps.len() - 1, r.key, r.y.unwrap_or(0.0), r.anchor));
                 if let Some(st) = self.scroll.scrolls.get_mut(&self.tree.nodes[i].id) { st.halt(); }
                 continue;
             }
@@ -72,61 +82,68 @@ impl RuntimeCore {
                 }
             }
         }
-        self.apply_jumps(&jumps);
+        self.scroll.apply_jumps(&self.tree.nodes, self.clock, &jumps);
         // Landing mounts the virtual rows there, which measure and can move the end it clamped to.
-        for _ in 0..3 {
-            if !self.virtual_window_changed() { break; }
-            // A jump is at once, and so are the rows it mounts: none fades in where it lands.
-            self.commit(app, &Tx { commit: Commit::Instant, ..Tx::default() });
-            self.step_scroll(0.0);
-            for (j, key, at) in &anchors {
-                if let Some((_, to)) = self.anchor_offset(key, *at) { jumps[*j].2 = to; }
-            }
-            self.apply_jumps(&jumps);
-        }
-    }
-
-    fn apply_jumps(&mut self, jumps: &[(NodeId, bool, f64)]) {
-        let now = self.clock;
-        for &(id, horizontal, to) in jumps {
-            let stick = self.tree.nodes.iter().find(|n| n.id == id).and_then(|n| n.scroll).is_some_and(|s| s.stick_bottom);
-            let Some(st) = self.scroll.scrolls.get_mut(&id) else { continue };
-            st.moved();
-            let was = if horizontal { st.x.offset } else { st.offset };
-            if horizontal {
-                st.x.offset = to.min(st.x.max);
+        // Pass 0 shifts the window if needed; follow-up passes run only when the measured jump left
+        // part of the viewport uncovered, letting remaining overscan fill over subsequent frames.
+        for pass in 0..3 {
+            let need = if pass == 0 {
+                self.virtual_window_changed()
             } else {
-                st.offset = to.min(st.max);
-                // The jump halted the old motion when queued. Don't cancel a later
-                // request in the same transaction to glide from the new offset.
-                if st.glide().is_none() { st.land(stick); }
+                self.virtual_viewport_uncovered()
+            };
+            if !need { break; }
+            // A jump is at once, and so are the rows it mounts: none fades in where it lands.
+            self.commit_virtual_scroll(app, &Tx { commit: Commit::Instant, ..Tx::default() });
+            self.step_scroll(0.0);
+            for (j, key, at, mode) in &anchors {
+                if let Some((_, to)) = self.anchor_offset(key, *at, *mode) { jumps[*j].2 = to; }
             }
-            if (if horizontal { st.x.offset } else { st.offset } - was).abs() > 1e-3 {
-                // The arm's due is taken back from the state each frame (`step_nudges`), so a
-                // later arm in the same frame wins and nothing here has to keep it.
-                let _ = st.nudge.arm(now);
-            }
+            self.scroll.apply_jumps(&self.tree.nodes, self.clock, &jumps);
         }
     }
 
-    /// The vertical viewport around the element or `TextHighlight` `key` and the offset that puts
-    /// its top `at` points below the viewport's top, before clamping.
+    /// The vertical viewport around the element or `TextHighlight` `key` and the offset that
+    /// anchors it `at` points below the viewport's top (by top edge or device-pixel-snapped
+    /// vertical midpoint), before clamping.
     /// A virtual row not mounted yet stands where its list's estimates put it: the jump there
-    /// mounts it, and is placed again from its laid-out top once it has (`scroll_to_offsets`).
-    fn anchor_offset(&self, key: &str, at: f32) -> Option<(usize, f64)> {
+    /// mounts it, and is placed again from its laid-out geometry once it has (`scroll_to_offsets`).
+    fn anchor_offset(&self, key: &str, at: f32, mode: ScrollAnchor) -> Option<(usize, f64)> {
         let found = |scope: Option<&str>, key: &str| {
             self.live_named(scope, key)
-                .map(|i| (i, self.tree.nodes[i].target[1]))
+                .map(|i| {
+                    let y0 = self.tree.nodes[i].target[1];
+                    let y = match mode {
+                        ScrollAnchor::CenterSnapped => y0 + self.tree.nodes[i].local.h * 0.5,
+                        _ => y0,
+                    };
+                    (i, y)
+                })
                 .or_else(|| {
-                    let (i, [_, y0, _, _]) = self.highlight_target_in(&self.tree.nodes, scope, key)?;
-                    (!self.subtree_exiting(i)).then_some((i, y0))
+                    let (i, [_, y0, _, y1]) = match mode {
+                        ScrollAnchor::CenterSnapped => self.highlight_inline_target_in(&self.tree.nodes, scope, key)?,
+                        _ => self.highlight_target_in(&self.tree.nodes, scope, key)?,
+                    };
+                    let y = match mode {
+                        ScrollAnchor::CenterSnapped => (y0 + y1) * 0.5,
+                        _ => y0,
+                    };
+                    (!self.subtree_exiting(i)).then_some((i, y))
                 })
         };
         // `"row/mark"`: element or highlight `mark` anywhere inside the element keyed `row`.
-        let top = found(None, key).or_else(|| key.split_once('/').and_then(|(row, mark)| found(Some(row), mark)));
-        if let Some((i, top)) = top {
+        let target = found(None, key).or_else(|| key.split_once('/').and_then(|(row, mark)| found(Some(row), mark)));
+        if let Some((i, y)) = target {
             let v = std::iter::successors(Some(i), |&p| self.tree.nodes[p].parent).find(|&p| self.tree.nodes[p].scroll.is_some() && self.tree.nodes[p].scroll_axes.y())?;
-            return Some((v, f64::from(top - self.tree.nodes[v].target[1] - at).max(0.0)));
+            let raw = f64::from(y - self.tree.nodes[v].target[1] - at).max(0.0);
+            let to = match mode {
+                ScrollAnchor::CenterSnapped => {
+                    let s = f64::from(self.env.scale).max(1.0);
+                    (raw * s).round() / s
+                }
+                _ => raw,
+            };
+            return Some((v, to));
         }
         self.tree.nodes.iter().find_map(|n| {
             let list = self.commit.virtuals.get(&n.path)?;
@@ -272,6 +289,16 @@ impl ScrollState {
     /// Momentum and any glide stop; a pinned viewport stays pinned.
     pub(in crate::runtime) fn halt(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Halt); }
 
+    /// Shifts the vertical offset by `delta` points when content above a virtual list's anchor
+    /// changed height, carrying a running glide's target offset along with it.
+    pub(in crate::runtime) fn shift_anchor(&mut self, delta: f32) {
+        let delta = f64::from(delta);
+        self.offset = (self.offset + delta).max(0.0);
+        if let ScrollMode::Glide { to: GlideTo::Offset(to) | GlideTo::ShrunkEnd(to), .. } = &mut self.mode {
+            *to = (*to + delta).max(0.0);
+        }
+    }
+
     /// A hand or an app put the offset where it is: momentum and any glide stop, and a
     /// stick-to-bottom viewport (`stick`) follows its end only if it sits there.
     /// An app's keep moved the offset (rows above measured, an anchor held what's on screen): a
@@ -288,17 +315,45 @@ impl ScrollState {
     pub(in crate::runtime) fn hold_at(&self, now: f64) -> bool { self.nudge.hold_at(now) }
 }
 
-impl RuntimeCore {
+impl requests::ScrollTables {
+    pub(super) fn apply_jumps(&mut self, nodes: &[Node], now: f64, jumps: &[(NodeId, bool, f64)]) {
+        for &(id, horizontal, to) in jumps {
+            let stick = nodes.iter().find(|n| n.id == id).and_then(|n| n.scroll).is_some_and(|s| s.stick_bottom);
+            let Some(st) = self.scrolls.get_mut(&id) else { continue };
+            st.moved();
+            let was = if horizontal { st.x.offset } else { st.offset };
+            if horizontal {
+                st.x.offset = to.min(st.x.max);
+            } else {
+                st.offset = to.min(st.max);
+                // The jump halted the old motion when queued. Don't cancel a later
+                // request in the same transaction to glide from the new offset.
+                if st.glide().is_none() { st.land(stick); }
+            }
+            if (if horizontal { st.x.offset } else { st.offset } - was).abs() > 1e-3 {
+                // The arm's due is taken back from the state each frame (`step_nudges`), so a
+                // later arm in the same frame wins and nothing here has to keep it.
+                let _ = st.nudge.arm(now);
+            }
+        }
+    }
+
     /// Steps the holds an app's instant scrolls armed, and returns the earliest due one still
     /// pending: the frame that carries it resolves hover at the pointer. A held nudge asks for
     /// no frame itself, so the frame's end wakes for that one, however often the app re-armed it.
-    pub(in crate::runtime) fn step_nudges(&mut self) -> Option<f64> {
-        let now = self.clock;
+    pub(in crate::runtime) fn step_nudges(&mut self, now: f64) -> Option<f64> {
         let mut due: Option<f64> = None;
-        for st in self.scroll.scrolls.values_mut() {
+        for st in self.scrolls.values_mut() {
             st.nudge.tick(now);
             if let Some(at) = st.nudge.due() { due = Some(due.map_or(at, |d: f64| d.min(at))); }
         }
         due
+    }
+}
+
+impl RuntimeCore {
+    #[inline]
+    pub(in crate::runtime) fn step_nudges(&mut self) -> Option<f64> {
+        self.scroll.step_nudges(self.clock)
     }
 }

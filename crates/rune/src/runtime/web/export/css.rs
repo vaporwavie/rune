@@ -225,7 +225,10 @@ fn family(f: crate::tok::Family) -> String {
     match f {
         crate::tok::Family::Sans => "var(--rune-sans)".into(),
         crate::tok::Family::Mono | crate::tok::Family::SystemMono => "var(--rune-mono)".into(),
-        crate::tok::Family::Named(name) => format!("\"{}\"", escape(name)),
+        crate::tok::Family::Named(name) => {
+            let clean = crate::runtime::web_a11y::sanitize_font_family(name);
+            if clean.is_empty() { "var(--rune-sans)".into() } else { format!("\"{clean}\"") }
+        }
     }
 }
 
@@ -260,9 +263,14 @@ pub(super) fn text(spec: &TextSpec, d: &mut Decls) {
 /// The text with its spans (weight, size, colour, code backgrounds, underlines) and its links.
 pub(super) fn text_html(spec: &TextSpec) -> String {
     let content = &spec.content;
+    let hrefs: Vec<Option<String>> = spec.cold.links.iter()
+        .map(|l| crate::open_url::check_href(&l.id).ok())
+        .collect();
     let mut cuts: Vec<usize> = vec![0, content.len()];
     for s in &spec.spans { cuts.extend([s.start as usize, s.end as usize]); }
-    for l in &spec.cold.links { cuts.extend([l.start as usize, l.end as usize]); }
+    for (k, l) in spec.cold.links.iter().enumerate() {
+        if hrefs[k].is_some() { cuts.extend([l.start as usize, l.end as usize]); }
+    }
     cuts.retain(|&c| c <= content.len() && content.is_char_boundary(c));
     cuts.sort_unstable();
     cuts.dedup();
@@ -270,27 +278,31 @@ pub(super) fn text_html(spec: &TextSpec) -> String {
     let mut open_link: Option<usize> = None;
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let link = spec.cold.links.iter().position(|l| (l.start as usize) <= a && b <= l.end as usize);
+        let link = spec.cold.links.iter().enumerate()
+            .find(|&(k, l)| hrefs[k].is_some() && (l.start as usize) <= a && b <= l.end as usize)
+            .map(|(k, _)| k);
         if link != open_link {
             if open_link.is_some() { out.push_str("</a>"); }
-            if let Some(k) = link { let _ = write!(out, "<a href=\"{}\">", escape(&spec.cold.links[k].id)); }
+            if let Some(k) = link && let Some(href) = &hrefs[k] {
+                write!(out, "<a href=\"{}\">", escape(href)).ok();
+            }
             open_link = link;
         }
         let piece = escape(&content[a..b]);
         let mut style = String::new();
         if let Some(s) = spec.spans.iter().rev().find(|s| (s.start as usize) <= a && b <= s.end as usize) {
-            if let Some(w) = s.weight { let _ = write!(style, "font-weight:{};", num(w)); }
+            if let Some(w) = s.weight { write!(style, "font-weight:{};", num(w)).ok(); }
             if s.mono { style.push_str("font-family:var(--rune-mono);"); }
-            if let Some(z) = s.size { let _ = write!(style, "font-size:{};", px(z)); }
-            if let Some(c) = s.color { let _ = write!(style, "color:{};", color(c)); }
-            if let Some(c) = s.bg { let _ = write!(style, "background:{};border-radius:3px;padding:0 {};", color(c), px(s.bg_pad)); }
-            if let Some(c) = s.underline { let _ = write!(style, "text-decoration:underline {};", color(c)); }
+            if let Some(z) = s.size { write!(style, "font-size:{};", px(z)).ok(); }
+            if let Some(c) = s.color { write!(style, "color:{};", color(c)).ok(); }
+            if let Some(c) = s.bg { write!(style, "background:{};border-radius:3px;padding:0 {};", color(c), px(s.bg_pad)).ok(); }
+            if let Some(c) = s.underline { write!(style, "text-decoration:underline {};", color(c)).ok(); }
             if s.italic { style.push_str("font-style:italic;"); }
         }
         if style.is_empty() {
             out.push_str(&piece);
         } else {
-            let _ = write!(out, "<span style=\"{}\">{piece}</span>", style.trim_end_matches(';'));
+            write!(out, "<span style=\"{}\">{piece}</span>", style.trim_end_matches(';')).ok();
         }
     }
     if open_link.is_some() { out.push_str("</a>"); }
@@ -308,21 +320,21 @@ pub(super) fn svg(shape: &crate::Shape, size: (f32, f32)) -> String {
     // Consecutive fills of one colour share a path.
     let mut fill: Option<(Color, String)> = None;
     let flush = |out: &mut String, fill: &mut Option<(Color, String)>| {
-        if let Some((c, d)) = fill.take() { let _ = write!(out, "<path fill=\"{}\" d=\"{d}\"/>", color(c)); }
+        if let Some((c, d)) = fill.take() { write!(out, "<path fill=\"{}\" d=\"{d}\"/>", color(c)).ok(); }
     };
     for op in &shape.ops {
         match op {
             crate::shape::Op::Fill { points: pts, color: c } => {
                 if fill.as_ref().is_some_and(|(fc, _)| fc != c) { flush(&mut out, &mut fill); }
                 let d = &mut fill.get_or_insert_with(|| (*c, String::new())).1;
-                let _ = write!(d, "M{}Z", points(pts).replace(' ', "L"));
+                write!(d, "M{}Z", points(pts).replace(' ', "L")).ok();
             }
             crate::shape::Op::Stroke { points: pts, closed, width, cap, color: c } => {
                 flush(&mut out, &mut fill);
                 let el = if *closed { "polygon" } else { "polyline" };
                 let cap = if *cap == crate::shape::LineCap::Round { "round" } else { "butt" };
-                let _ = write!(out, "<{el} fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-linecap=\"{cap}\" stroke-linejoin=\"round\" vector-effect=\"non-scaling-stroke\" points=\"{}\"/>",
-                    color(*c), num(*width), points(pts));
+                write!(out, "<{el} fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-linecap=\"{cap}\" stroke-linejoin=\"round\" vector-effect=\"non-scaling-stroke\" points=\"{}\"/>",
+                    color(*c), num(*width), points(pts)).ok();
             }
         }
     }

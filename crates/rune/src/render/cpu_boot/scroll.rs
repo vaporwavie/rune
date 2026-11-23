@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use super::Scene;
 use super::bin::{Bins, Show, Solid, TILE_H, TILE_W, covers, cut, interior};
 use super::shade::{Clip, has_sides};
+use crate::render::instance::shader_consts;
 use crate::render::{INSTANCE_WORDS, Instance, Kind, word};
 
 /// What the last frame drew, kept for the next frame's comparison.
@@ -137,13 +138,22 @@ fn tile_moved(prev: &Prev, scene: &Scene<'_>, bins: &Bins, t: usize, r: [u32; 4]
     });
     let both = [r[0] as f32, r[1].min(back[1] as u32) as f32, r[2] as f32, r[3].max(back[3] as u32) as f32];
     let tile = [r[0] as i32, r[1] as i32, r[2] as i32, r[3] as i32];
-    bins.tile(t).iter().all(|&n| {
-        olds.next().is_some_and(|m| {
-            let new_r = cut(bins.bounds[n as usize], tile);
-            let old_r = cut(prev.bins.bounds[m as usize], back);
-            new_r == [old_r[0], old_r[1] + dy, old_r[2], old_r[3] + dy] && same(scene, bins, prev, n, m, dy, both)
-        })
-    }) && olds.next().is_none()
+    let matches = |n: u32, m: u32| {
+        let new_r = cut(bins.bounds[n as usize], tile);
+        let old_r = cut(prev.bins.bounds[m as usize], back);
+        new_r == [old_r[0], old_r[1] + dy, old_r[2], old_r[3] + dy] && same(scene, bins, prev, n, m, dy, both)
+    };
+    let mut news = bins.tile(t).iter().copied();
+    // When tile `t` starts with an opaque box covering all of `r`, `Bins` culled everything
+    // before it; if `back` straddles an old tile that box didn't cover whole, `olds` still
+    // carries those occluded instances ahead of it, so skip to the matching opaque box in `TOP`.
+    if bins.covered[t] {
+        let Some(n0) = news.next() else { return false };
+        if !olds.any(|m| prev.bins.within[m as usize] == super::bin::TOP && matches(n0, m)) {
+            return false;
+        }
+    }
+    news.all(|n| olds.next().is_some_and(|m| matches(n, m))) && olds.next().is_none()
 }
 
 /// Whether new instance `n` draws over the tile what old instance `m` drew `dy` rows back:
@@ -195,12 +205,12 @@ fn rows_alike(i: &Instance, r: [f32; 4]) -> bool {
     let reach = i.radii.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let alike = match i.kind() {
         // `sd_rounded` there is `|x| - half width`, or deep inside past the border's reach.
-        Some(Kind::Rect) => !has_sides(i) && middle(reach + 4.0 * (i.params[0].max(0.0) + i.params[2].max(0.5)) + 4.0),
+        Some(Kind::Rect) => !has_sides(i) && middle(reach + 4.0 * (i.params[0].max(0.0) + i.params[2].max(shader_consts::SOFT_MIN)) + 4.0),
         // `shadow_row`'s samples and its interior test are the same on every row there.
         Some(Kind::Shadow) => i.uv[2] <= 0.0 && {
             let half = [i.rect[2] * 0.5, i.rect[3] * 0.5];
-            let corner = i.radii[0].abs().min(half[0].min(half[1]));
-            middle(corner + 6.0 * i.params[2].max(0.01) + 1.0)
+            let corner = reach.min(half[0].min(half[1]));
+            middle(corner + shader_consts::SHADOW_INSIDE_SIGMA * i.params[2].max(shader_consts::SHADOW_MIN_SIGMA) + 1.0)
         },
         Some(
             Kind::Glyph | Kind::Inset | Kind::Gradient | Kind::Segment | Kind::Triangle

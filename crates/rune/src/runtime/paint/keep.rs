@@ -150,7 +150,10 @@ pub(in crate::runtime) fn inh_key(p: &Inh) -> u64 {
     bits(&mut h, &[p.still.0]);
     bits(&mut h, &p.still.1);
     bits(&mut h, &p.still.2);
-    (p.in_cache, p.skip_paint, p.turn).hash(&mut h);
+    bits(&mut h, &[p.held.0]);
+    bits(&mut h, &p.held.1);
+    bits(&mut h, &p.held.2);
+    (p.held_moving, p.in_cache, p.skip_paint, p.anchor_hidden, p.turn).hash(&mut h);
     p.snap.hash_bits(&mut h);
     h.finish()
 }
@@ -202,8 +205,8 @@ impl RuntimeCore {
         self.paint.keep.painted = self.paint.keep.frame;
         // Paint goes depth first, siblings in paint order (`update_layer_paint_order`), so a subtree
         // paints in one run unless it holds a node lifted out to paint last.
-        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise;
-        let shareable = !lifted && self.motion.flights.is_empty() && self.paint.paint_rank.is_none()
+        let lifted = !self.motion.flying.is_empty() || self.tree.has_raise || self.paint.has_lifted_anchors();
+        let shareable = !lifted && self.motion.flights().is_empty() && self.paint.paint_rank.is_none()
             && self.kbd.modal_scope.is_none() && !self.commit.defaults.force_focus_rings && !disabled();
         let key = shareable.then(|| {
             let mut h = rune_motion::Fx::default();
@@ -217,7 +220,7 @@ impl RuntimeCore {
             h.finish()
         });
         if logging() && !shareable {
-            eprintln!("rune: paint keep off: raise {}, text flights {}, flying {}, rank {}, modal {}", self.tree.has_raise, self.motion.flights.len(), self.motion.flying.len(), self.paint.paint_rank.is_some(), self.kbd.modal_scope.is_some());
+            eprintln!("rune: paint keep off: raise {}, text flights {}, flying {}, rank {}, modal {}", self.tree.has_raise, self.motion.flights().len(), self.motion.flying.len(), self.paint.paint_rank.is_some(), self.kbd.modal_scope.is_some());
         }
         let k = &mut self.paint.keep;
         k.recording = !lifted;
@@ -310,7 +313,7 @@ impl RuntimeCore {
 
     /// Opens node `i`'s record, before it paints anything.
     pub(in crate::runtime) fn keep_open(&mut self, i: usize, glyphs: usize, sel: &[(usize, usize, usize)], marks: &[(usize, usize, usize)]) {
-        self.slide_node_opens(i);
+        self.paint.slide_node_opens(i, self.instances.len(), self.env.scale);
         if !self.paint.keep.recording { return; }
         let rec = PaintRec {
             id: self.tree.nodes[i].id,
@@ -456,7 +459,7 @@ impl RuntimeCore {
                 let before = self.instances.len();
                 if active_cache.is_some_and(|ac| ac.instance_start == start) {
                     let ac = active_cache.take().unwrap();
-                    self.close_cached_layer(ac, start, surface_start, glyph_count);
+                    self.paint.close_cached_layer(&self.tree.nodes, &mut self.instances, &mut self.surfaces, &mut self.marks, self.track_marks, &mut self.text, self.commit.commit_gen(), ac, start, surface_start, glyph_count);
                 } else {
                     crate::render::end_layer(&mut self.instances, &mut self.surfaces, &mut self.marks, start, surface_start);
                 }
@@ -495,7 +498,7 @@ impl RuntimeCore {
 
     /// The end of a paint: what was moved is painted, and what wasn't kept is said.
     pub(in crate::runtime) fn keep_end(&mut self) {
-        self.close_slide();
+        self.paint.close_slide(self.instances.len(), self.env.scale);
         let k = &mut self.paint.keep;
         k.moved.clear();
         if !k.recording {
@@ -555,7 +558,7 @@ impl RuntimeCore {
 }
 
 #[path = "cycle.rs"]
-mod cycle;
+pub(super) mod cycle;
 #[path = "slide.rs"]
 mod slide;
 
@@ -582,7 +585,8 @@ fn static_ok(n: &Node) -> bool {
         && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none() && n.vis.pixels.is_none()
         && n.sticky.is_none() && n.above.is_none() && n.matched.is_none()
         && n.static_scale == 1.0 && !n.scale_track && n.vis.mark == 0
-        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none() && t.reveal < 0.0)
+        && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none()
+            && !t.cold.pills.iter().any(|p| p.bare.as_ref().is_some_and(|b| b.image.is_some())))
 }
 
 /// What the runtime holds for a node besides it: selection, marks, reveals, loops, scales
@@ -590,8 +594,8 @@ fn static_ok(n: &Node) -> bool {
 fn dynamic_ok(rt: &RuntimeCore, i: usize, sel: &[(usize, usize, usize)], marks: &[(usize, usize, usize)]) -> bool {
     let id = rt.tree.nodes[i].id;
     !sel.iter().any(|r| r.0 == i) && !marks.iter().any(|r| r.0 == i)
-        && (rt.motion.reveals.is_empty() || !rt.motion.reveals.contains_key(&id))
-        && (rt.motion.loops.is_empty() || !rt.motion.loops.contains_key(&id))
+        && !rt.motion.reveal_fading(id)
+        && !rt.motion.has_loop(id)
         && (rt.paint.static_scales.is_empty() || !rt.paint.static_scales.contains_key(&id))
         && rt.paint.row_mask[i] < 0.0
 }

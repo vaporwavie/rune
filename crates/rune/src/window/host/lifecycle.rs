@@ -11,7 +11,6 @@ use winit::window::WindowLevel;
 use super::Host;
 use crate::app::{Activation, WindowRequest};
 use crate::el::Shell;
-use crate::time::Instant;
 use crate::window::chrome::{self, sync_chrome_core};
 use crate::window::file_drop::FileDrop;
 use crate::window::handle::native_window_number;
@@ -89,6 +88,11 @@ impl Host {
                     rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(self.args.scroll_bars));
                 }
                 RevealEffect::Build => built = self.build_for_show(),
+                RevealEffect::ApplyFrame => {
+                    if self.take_frame_request(self.frame_secs(crate::time::now()), false) {
+                        self.idle = false;
+                    }
+                }
                 RevealEffect::Place => self.apply_placement(event_loop),
                 RevealEffect::Create => {
                     // `App::open_inactive`: the first open leaves focus where it is.
@@ -99,7 +103,7 @@ impl Host {
                     #[cfg(target_os = "macos")]
                     if focus && self.started && let Some(w) = self.shown_win() { w.focus(); }
                 }
-                RevealEffect::OrderIn { focus } => if let Some(w) = &self.win { w.show(focus) },
+                RevealEffect::OrderIn { focus } => if let Some(w) = &mut self.win { w.show(focus) },
                 RevealEffect::Unminimize => if let Some(w) = &self.win { w.window.set_minimized(false) },
                 RevealEffect::Settle => {
                     if !built { self.app.rt_mut().settle_all(); }
@@ -136,7 +140,7 @@ impl Host {
         None
     }
 
-    /// Focuses a shown window; Wayland's compositor wants the open's token for that.
+    /// Focuses a shown window; Wayland and X11 use the open's startup token for that.
     fn activate(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
         let Some(w) = self.win.as_mut() else { return };
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -154,6 +158,10 @@ impl Host {
                 None => w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational)),
             }
             return;
+        } else if let Some(token) = token.as_deref()
+            && crate::platform::x11::activation::activate(&w.window, token)
+        {
+            return;
         }
         let _ = (event_loop, token);
         w.focus();
@@ -165,16 +173,8 @@ impl Host {
     pub(in crate::window) fn build_for_show(&mut self) -> bool {
         if !self.app.build_for_show() { return false; }
         self.clipboard.flush_core(self.app.rt_mut());
+        // macOS sets the frame and resizes the surface at once; elsewhere `Resized` brings it.
         self.take_frame_request(0.0, false);
-        // macOS sets the frame at once: the first drawable and layout take the new size.
-        // Elsewhere the window's `Resized` brings it.
-        #[cfg(target_os = "macos")]
-        if let (Some(w), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) {
-            let size = w.window.inner_size();
-            w.resize_surface(Some(&**gpu), size);
-            let scale = w.window.scale_factor() as f32;
-            self.app.rt_mut().set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
-        }
         true
     }
 
@@ -290,7 +290,7 @@ impl Host {
     pub(in crate::window) fn refresh_hidden(&mut self) -> bool {
         let now_due = self.hidden_launcher_renders();
         let Some(w) = &mut self.win else { return false };
-        let render = now_due || w.first_frame.deadline().is_some() || w.hidden_pace.changed(Instant::now());
+        let render = now_due || w.first_frame.deadline().is_some() || w.hidden_pace.changed(crate::time::now());
         if render { w.request_redraw(); }
         render
     }
@@ -342,7 +342,13 @@ impl Host {
             let paints = self.shown_win().is_some_and(|w| !self.life.covered() && !w.minimized());
             // A painting macOS window moves its frame over its next frames (`redraw`).
             if self.app.rt().host.window_frame.is_some() && !(paints && cfg!(target_os = "macos")) {
-                self.take_frame_request(self.frame_secs(Instant::now()), false);
+                let resized = self.take_frame_request(self.frame_secs(crate::time::now()), false);
+                if resized && !self.life.shown() && self.launcher() && let Some(w) = &mut self.win {
+                    // The hidden surface resized, invalidating its old-size cached pixels; draw at
+                    // the new height before any pending reveal orders it in.
+                    w.first_frame.missed();
+                    w.request_redraw();
+                }
             }
             let shown = self.win.as_ref().filter(|_| self.life.shown());
             let window = shown.map(|w| &w.window);
@@ -374,7 +380,8 @@ impl Host {
         self.close_hook();
         crate::marks::mark("window.close.hooked");
         #[cfg(target_os = "windows")]
-        if ends && let Some(w) = &self.win {
+        if ends && let Some(w) = &mut self.win {
+            w.native.drop_target = None;
             crate::platform::win32::destroy_window_now(&w.window);
             crate::marks::mark("window.destroyed");
         }
@@ -459,8 +466,10 @@ impl Host {
             #[cfg(target_os = "macos")]
             { w.native.prime.stop(); }
         }
+        #[cfg(target_os = "windows")]
+        self.look_stale();
         self.secure_input.set(false);
-        self.ime_allowed = false;
+        self.ime.clear();
         if let Some(w) = &self.win { w.window.set_ime_allowed(false); }
         self.app.set_live_visible(false);
         self.app.rt_mut().cancel_timer_frame();
@@ -547,7 +556,7 @@ impl Host {
             let rt = self.app.rt_mut();
             rt.text.rest();
             rt.images.rest();
-            if let Some(rewind) = rt.rewind() { rewind.rest(); }
+            if let Some(rewind) = rt.motion.rewind() { rewind.rest(); }
         }
         self.app.run_on_rest();
         if let Some((gpu, renderer)) = &mut self.gpu {
@@ -557,7 +566,7 @@ impl Host {
             // polled: a poll costs the next two frames' submits 4-9 ms each on an Iris Xe.
             if all {
                 gpu.queue.submit(std::iter::empty());
-                let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+                rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
                 renderer.trim_uploads();
             }
         }

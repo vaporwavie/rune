@@ -21,6 +21,14 @@ pub fn primary_extents(style: TextStyle) -> Option<(f32, f32)> {
     with_text(|t| t.primary_extents(style.family, style.weight, style.italic))
 }
 
+/// Printable-ASCII (`0x20..0x7f`) glyph advances in points at `scale = 1.0`, the widest advance,
+/// and whether the resolved font face is fixed-pitch; `None` if printable ASCII spans more than
+/// one font face. Reuses the lent window `TextSystem`'s cached `AsciiLine`.
+#[doc(hidden)]
+pub fn ascii_metrics(style: TextStyle) -> Option<([f32; 95], f32, bool)> {
+    with_text(|t| t.ascii_line(style, 1.0, false).map(|a| (a.advance, a.widest, a.fixed_pitch)))
+}
+
 struct Fonts {
     /// Bumped by any change, of fonts or families.
     generation: u64,
@@ -33,7 +41,17 @@ struct Fonts {
 }
 
 static FONTS: Mutex<Option<Fonts>> = Mutex::new(None);
+/// Lock-free mirror of the global (non-overridden) font epoch so [`font_epoch`] never acquires
+/// `FONTS` on the render hot path.
+static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 static SCOPES: AtomicU64 = AtomicU64::new(1);
+/// Process-wide counter for `Fonts::fonts_generation` so a [`with_families`] scope that loads
+/// different fonts never collides with the global state's or another scope's font generation.
+static FONTS_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_fonts_generation() -> u64 {
+    FONTS_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Layouts kept between evictions (each eviction keeps those used since the one before).
 const EVICT_EVERY: u32 = 512;
@@ -50,20 +68,31 @@ thread_local! {
     /// This thread's [`with_families`] state: a private copy of `FONTS` that notes land in.
     static OVERRIDE: RefCell<Option<Fonts>> = const { RefCell::new(None) };
     /// The text system of the window whose view is running on this thread (`lend`), if any.
-    static LENT: std::cell::Cell<*mut TextSystem> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static LENT: RefCell<Option<TextSystem>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` (a window's view) with [`measure`] and the rest using `text`, the window's own text
 /// system, rather than this thread's copy. The copy loads every font and fallback again (a title
 /// with one Arabic or emoji character costs 6-30 ms its first time), and its shapes aren't the ones
-/// the window lays out. `text` mustn't be used another way until `f` returns.
+/// the window lays out. Moves `text` into thread-local storage for the duration of `f` and restores
+/// it on return or unwind.
 #[doc(hidden)]
 pub fn lend<R>(text: &mut TextSystem, f: impl FnOnce() -> R) -> R {
-    struct Restore(*mut TextSystem);
-    impl Drop for Restore {
-        fn drop(&mut self) { LENT.with(|l| l.set(self.0)); }
+    struct Restore<'a> {
+        dest: &'a mut TextSystem,
+        previous: Option<TextSystem>,
     }
-    let _restore = Restore(LENT.with(|l| l.replace(text)));
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            let returned = LENT.with_borrow_mut(|slot| std::mem::replace(slot, previous));
+            if let Some(lent) = returned {
+                *self.dest = lent;
+            }
+        }
+    }
+    let previous = LENT.with_borrow_mut(|slot| slot.replace(std::mem::replace(text, TextSystem::empty())));
+    let _restore = Restore { dest: text, previous };
     f()
 }
 
@@ -79,10 +108,27 @@ fn with_state<R>(f: impl FnOnce(&mut Option<Fonts>) -> R) -> R {
             r
         }
         None => match FONTS.lock() {
-            Ok(mut slot) => f(&mut slot),
+            Ok(mut slot) => {
+                let before = slot.as_ref().map(epoch_of);
+                let r = f(&mut slot);
+                if let Some(after) = slot.as_ref().map(epoch_of) && Some(after) != before {
+                    GLOBAL_EPOCH.store(after, Ordering::Release);
+                }
+                r
+            }
             Err(_) => f(&mut None),
         },
     }
+}
+
+fn ensure_fonts(slot: &mut Option<Fonts>) -> &mut Fonts {
+    slot.get_or_insert_with(|| Fonts {
+        generation: 1,
+        fonts_generation: next_fonts_generation(),
+        fonts: Vec::new(),
+        families: ("Inter".to_owned(), "Inter".to_owned()),
+        scope: 0,
+    })
 }
 
 fn apply_fonts(slot: &mut Option<Fonts>, fonts: &[&'static [u8]], families: (&str, &str)) {
@@ -91,7 +137,10 @@ fn apply_fonts(slot: &mut Option<Fonts>, fonts: &[&'static [u8]], families: (&st
         return;
     }
     let generation = slot.as_ref().map_or(1, |f| f.generation + 1);
-    let fonts_generation = match slot.as_ref() { Some(f) if same_fonts => f.fonts_generation, _ => generation };
+    let fonts_generation = match slot.as_ref() {
+        Some(f) if same_fonts => f.fonts_generation,
+        _ => next_fonts_generation(),
+    };
     let scope = slot.as_ref().map_or(0, |f| f.scope);
     let families = (families.0.to_owned(), families.1.to_owned());
     *slot = Some(Fonts { generation, fonts_generation, fonts: fonts.to_vec(), families, scope });
@@ -109,7 +158,7 @@ pub(crate) fn note_faces_arrived() {
     with_state(|slot| {
         if let Some(f) = slot.as_mut() {
             f.generation += 1;
-            f.fonts_generation = f.generation;
+            f.fonts_generation = next_fonts_generation();
         }
     });
 }
@@ -131,7 +180,10 @@ pub(crate) fn note_families(sans: &str, mono: &str) {
 /// Under a [`with_families`] guard it is a different number from the one outside, so a cache
 /// keyed on it never mixes the scoped families with the others.
 pub fn font_epoch() -> u64 {
-    with_state(|f| f.as_ref().map(epoch_of)).unwrap_or(0)
+    OVERRIDE.with_borrow(|o| match o {
+        Some(f) => epoch_of(f),
+        None => GLOBAL_EPOCH.load(Ordering::Acquire),
+    })
 }
 
 fn epoch_of(f: &Fonts) -> u64 {
@@ -177,21 +229,18 @@ impl Drop for FamiliesGuard {
 /// Prefer a guard over a closure so a test can hold it for its whole body, and it restores on
 /// a panic.
 pub fn with_families(sans: &str, mono: &str) -> FamiliesGuard {
-    // Make sure there is state to copy: a thread that never measured has none yet.
-    if with_state(|f| f.is_none()) {
-        with_text(|_| {});
-    }
     let scope = SCOPES.fetch_add(1, Ordering::Relaxed);
-    let seeded = with_state(|f| {
-        f.as_ref().map(|f| Fonts {
+    let seeded = with_state(|slot| {
+        let f = ensure_fonts(slot);
+        Fonts {
             generation: f.generation + 1,
             fonts_generation: f.fonts_generation,
             fonts: f.fonts.clone(),
             families: (sans.to_owned(), mono.to_owned()),
             scope,
-        })
+        }
     });
-    let previous = OVERRIDE.with_borrow_mut(|o| std::mem::replace(o, seeded));
+    let previous = OVERRIDE.with_borrow_mut(|o| o.replace(seeded));
     FamiliesGuard { previous, _not_send: PhantomData }
 }
 
@@ -256,37 +305,38 @@ pub fn line_starts(text: &str, size: f32, weight: f32, width: f32) -> Vec<usize>
 /// Runs `f` on this thread's text system, built from the fonts the app was given.
 pub(super) fn with_text<R>(f: impl FnOnce(&mut TextSystem) -> R) -> R {
     // A view's measures use its window's text system, unless a `with_families` guard asks for
-    // other families. Taken while in use, so a measure inside `f` can't alias it.
-    let lent = LENT.with(|l| l.replace(std::ptr::null_mut()));
-    if !lent.is_null() && OVERRIDE.with_borrow(Option::is_none) {
-        struct Restore(*mut TextSystem);
-        impl Drop for Restore {
-            fn drop(&mut self) { LENT.with(|l| l.set(self.0)); }
+    // other families. Borrowed in place; a re-entrant call sees the active borrow and falls
+    // through to `MEASURER` instead of aliasing.
+    let f = if OVERRIDE.with_borrow(Option::is_none) {
+        match LENT.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(text) => Ok(f(text)),
+                None => Err(f),
+            },
+            Err(_) => Err(f),
+        }) {
+            Ok(result) => return result,
+            Err(f) => f,
         }
-        let _restore = Restore(lent);
-        // SAFETY: `lend` set it from a live `&mut TextSystem` that nothing else uses until
-        // `lend` returns, and it's taken out of `LENT` while this borrow lives.
-        return f(unsafe { &mut *lent });
-    }
-    LENT.with(|l| l.set(lent));
+    } else {
+        f
+    };
     MEASURER.with_borrow_mut(|m| {
         let current = font_epoch();
         if m.as_ref().is_none_or(|m| m.generation != current) {
-            let wanted = with_state(|f| f.as_ref().map(|f| (f.fonts_generation, f.fonts.clone(), f.families.clone())));
-            match (m.as_mut(), &wanted) {
+            let (epoch, fonts_generation, fonts, (sans, mono)) = with_state(|slot| {
+                let f = ensure_fonts(slot);
+                (epoch_of(f), f.fonts_generation, f.fonts.clone(), f.families.clone())
+            });
+            match m.as_mut() {
                 // Only the families changed: the loaded fonts stay.
-                (Some(m), Some((fonts_generation, _, (sans, mono)))) if m.fonts_generation == *fonts_generation => {
-                    m.text.set_families(sans, mono);
-                    m.generation = font_epoch();
+                Some(m) if m.fonts_generation == fonts_generation => {
+                    m.text.apply_families(&sans, &mono);
+                    m.generation = epoch;
                 }
                 _ => {
-                    let text = match &wanted {
-                        Some((_, fonts, (sans, mono))) => TextSystem::new(fonts, (sans, mono)),
-                        None => TextSystem::default(),
-                    };
-                    // Building a text system notes its fonts, so read the generation it settled on.
-                    let fonts_generation = with_state(|f| f.as_ref().map(|f| f.fonts_generation)).unwrap_or(0);
-                    *m = Some(Measurer { generation: font_epoch(), fonts_generation, text, calls: 0 });
+                    let text = TextSystem::new_local(&fonts, (&sans, &mono));
+                    *m = Some(Measurer { generation: epoch, fonts_generation, text, calls: 0 });
                 }
             }
         }
@@ -324,5 +374,173 @@ mod tests {
         assert!(plain_w > 120.0, "without wrap_anywhere the token runs past the width: {plain_w}");
         assert!(w <= 120.0 && h > plain_h * 2.0, "{w} {h} vs {plain_w} {plain_h}");
         assert_eq!(measure(link, &[], style, Some(120.0)), measure_with(link, &[], style, Some(120.0), RichLayoutOptions::new()));
+    }
+
+    #[test]
+    fn lend_uses_lent_text_system_and_restores_on_return_and_panic() {
+        let style = TextStyle::new(14.0, 400.0);
+        let mut text = TextSystem::default();
+        assert_eq!(text.shaped, 0);
+
+        let (w, h) = lend(&mut text, || measure("Lend normal return", &[], style, None));
+        assert!(w > 50.0 && h >= 17.0, "{w} {h}");
+        assert!(text.shaped > 0, "measure inside lend should shape on the lent TextSystem");
+        let after_normal = text.shaped;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lend(&mut text, || {
+                let _ = measure("Lend panic unwind", &[], style, None);
+                panic!("boom");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(text.shaped > after_normal, "lent TextSystem must be restored intact after panic unwind");
+        assert!(LENT.with_borrow(Option::is_none), "LENT slot must be cleared after unwind");
+        // Subsequent measure and lend still work cleanly.
+        let after_panic = text.shaped;
+        let _ = lend(&mut text, || measure("Lend after panic", &[], style, None));
+        assert!(text.shaped > after_panic);
+    }
+
+    #[test]
+    fn lend_nests_and_restores_outer_on_return_and_panic() {
+        let style = TextStyle::new(14.0, 400.0);
+        let mut outer = TextSystem::default();
+        let mut inner = TextSystem::default();
+
+        lend(&mut outer, || {
+            let _ = measure("Outer before", &[], style, None);
+            lend(&mut inner, || {
+                let _ = measure("Inner normal", &[], style, None);
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lend(&mut inner, || {
+                    let _ = measure("Inner panic", &[], style, None);
+                    panic!("inner boom");
+                });
+            }));
+            assert!(caught.is_err());
+            let _ = measure("Outer after", &[], style, None);
+        });
+
+        assert!(outer.shaped >= 2, "outer should receive both outer measures: {}", outer.shaped);
+        assert!(inner.shaped >= 2, "inner should receive both inner measures: {}", inner.shaped);
+        assert!(LENT.with_borrow(Option::is_none));
+    }
+
+    #[test]
+    fn with_text_reentrancy_and_override_bypass_lent() {
+        let style = TextStyle::new(14.0, 400.0);
+        let mut text = TextSystem::default();
+        let mut saw_nested = false;
+
+        lend(&mut text, || {
+            with_text(|outer| {
+                let before = outer.shaped;
+                // Re-entrant call sees active RefCell borrow and falls back to MEASURER without panicking.
+                let (w, _) = measure("Reentrant fallback", &[], style, None);
+                assert!(w > 50.0);
+                assert_eq!(outer.shaped, before, "re-entrant measure must not touch actively borrowed lent system");
+                saw_nested = true;
+            });
+            // A `with_families` override bypasses LENT without disturbing it.
+            let _guard = with_families("Inter", "IBM Plex Mono");
+            let (w, _) = measure("Override bypass", &[], style, None);
+            assert!(w > 50.0);
+        });
+
+        assert!(saw_nested);
+        assert_eq!(text.shaped, 0, "neither re-entrant nor overridden measure should shape on lent text");
+        assert!(LENT.with_borrow(Option::is_none));
+    }
+
+    #[test]
+    fn with_text_does_not_tag_measurer_with_newer_fonts_generation() {
+        const PLEX: &[u8] = include_bytes!("../../rune/assets/IBMPlexMono-Regular.ttf");
+        let base = crate::fonts::default_fonts::DEFAULT_FONTS;
+        let with_plex = [base[0], base[1], base[2], PLEX];
+        let mono_style = TextStyle::new(14.0, 400.0).mono();
+        let expected_plex = TextSystem::new(&with_plex, ("Inter", "IBM Plex Mono"))
+            .layout_rich("iiiiiiiiii", &[], mono_style, 1.0, None)
+            .full_width();
+
+        // Race a thread building its measurer from default fonts against another thread registering
+        // a new font set. The measurer must never be tagged with the newer fonts_generation while
+        // still holding the older fonts.
+        for round in 0..24 {
+            note_fonts(&[], ("Inter", "Inter"));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let done = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writer_start = start.clone();
+            let writer_done = done.clone();
+            let writer = std::thread::spawn(move || {
+                writer_start.wait();
+                // Spin-wait (Windows sleep has coarse ~1-15ms granularity) so the update lands
+                // right inside TextSystem construction across rounds.
+                let delay = std::time::Duration::from_micros((round % 16) * 40);
+                let t0 = std::time::Instant::now();
+                while t0.elapsed() < delay {
+                    std::hint::spin_loop();
+                }
+                note_fonts(&with_plex, ("Inter", "IBM Plex Mono"));
+                let fg = with_state(|f| f.as_ref().map(|f| f.fonts_generation)).unwrap_or(0);
+                let ep = font_epoch();
+                writer_done.wait();
+                (fg, ep)
+            });
+
+            let reader = std::thread::spawn(move || {
+                start.wait();
+                with_text(|_| {});
+                done.wait();
+                let snapshot = MEASURER.with_borrow_mut(|m| {
+                    let m = m.as_mut().expect("measurer set");
+                    (m.generation, m.fonts_generation, m.text.font_cx.collection.family_id("IBM Plex Mono").is_some())
+                });
+                let _guard = with_families("Inter", "IBM Plex Mono");
+                let override_has_plex = with_state(|f| f.as_ref().is_some_and(|f| f.fonts == with_plex));
+                let adv = advance("iiiiiiiiii", mono_style);
+                let after_has_plex = with_text(|t| t.font_cx.collection.family_id("IBM Plex Mono").is_some());
+                (snapshot, override_has_plex, adv, after_has_plex)
+            });
+
+            let (plex_fg, plex_epoch) = writer.join().unwrap();
+            let ((m_gen, m_fg, before_has_plex), override_has_plex, adv, after_has_plex) = reader.join().unwrap();
+            if !before_has_plex {
+                assert_ne!(
+                    m_fg, plex_fg,
+                    "round {round}: measurer loaded older fonts but was tagged with newer fonts_generation {plex_fg}",
+                );
+                assert_ne!(
+                    m_gen, plex_epoch,
+                    "round {round}: measurer loaded older fonts but was tagged with newer epoch {plex_epoch}",
+                );
+            }
+            if override_has_plex {
+                assert!(after_has_plex, "round {round}: measurer kept stale fonts after with_families");
+                assert_eq!(adv, expected_plex, "round {round}: advance measured stale fonts");
+            }
+        }
+        note_fonts(&[], ("Inter", "Inter"));
+    }
+
+    #[test]
+    fn scoped_fonts_generations_do_not_collide_across_guards() {
+        const PLEX: &[u8] = include_bytes!("../../rune/assets/IBMPlexMono-Regular.ttf");
+        let base = crate::fonts::default_fonts::DEFAULT_FONTS;
+        let with_plex = [base[0], base[1], base[2], PLEX];
+
+        {
+            let _g1 = with_families("Inter", "Inter");
+            note_fonts(&with_plex, ("Inter", "IBM Plex Mono"));
+            let has_plex = with_text(|t| t.font_cx.collection.family_id("IBM Plex Mono").is_some());
+            assert!(has_plex);
+        }
+        {
+            let _g2 = with_families("Inter", "Inter");
+            note_fonts(&[base[0]], ("Inter", "Inter"));
+            let has_plex = with_text(|t| t.font_cx.collection.family_id("IBM Plex Mono").is_some());
+            assert!(!has_plex, "second guard loaded different fonts and must not reuse the first guard's measurer");
+        }
     }
 }

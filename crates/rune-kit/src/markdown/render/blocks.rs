@@ -290,7 +290,7 @@ impl Renderer {
                     let quote = bidi::directed(
                         row().role("blockquote").w_full()
                             .child(el().w(q.width).h_full().radius((q.width / 2.0).min(1.0)).fill(self.s.quote_rule))
-                            .child(drawn.grow(1.0).shrink().pl(q.pad)),
+                            .child(drawn.shrink().pl(q.pad)),
                         dirs.of(quote_block),
                     );
                     ret = Some(match &self.quote_frame {
@@ -308,7 +308,7 @@ impl Renderer {
                         let (k, gap_mt, task, is_deep_tail) = pending_item.take().unwrap();
                         if is_deep_tail {
                             *list_col = std::mem::replace(list_col, el()).child(
-                                row().key(format!("i{k}")).w_full().mt(gap_mt).pl(*indent).child(item_body.grow(1.0).shrink()),
+                                row().key(format!("i{k}")).w_full().mt(gap_mt).pl(*indent).child(item_body.shrink()),
                             );
                         } else if let Some((checked, marker_offset)) = task {
                             *list_col = std::mem::replace(list_col, el()).child(self.task_item_body((k, real_n), *indent, &items[k], item_body, marker_offset, checked).mt(gap_mt));
@@ -317,7 +317,7 @@ impl Renderer {
                             *list_col = std::mem::replace(list_col, el()).child(
                                 row().key(format!("i{k}")).role("listitem").position_in_set(k + 1, real_n).w_full().mt(gap_mt)
                                     .child(self.with_reveal(marker).a11y_hidden())
-                                    .child(item_body.grow(1.0).shrink()),
+                                    .child(item_body.shrink()),
                             );
                         }
                         continue;
@@ -352,7 +352,12 @@ impl Renderer {
                                 (None, Some(num)) => Lead::Number(num + k as u64),
                                 (None, None) => Lead::Bullet,
                             };
-                            self.flow.set(Flow { lists: sf.lists + 1, inset: sf.inset + ind, cols: sf.cols + lead.width(), lead: Some((sf.cols, lead, if k == 0 && sf.lists == 0 { 2 } else { 1 })), ..sf });
+                            let item_inset = if task.is_some() {
+                                ind.max(self.s.task.left + self.s.task.size)
+                            } else {
+                                ind
+                            };
+                            self.flow.set(Flow { lists: sf.lists + 1, inset: sf.inset + item_inset, cols: sf.cols + lead.width(), lead: Some((sf.cols, lead, if k == 0 && sf.lists == 0 { 2 } else { 1 })), ..sf });
                             if task.is_none() && am && !item_open_tail {
                                 let (src_at, src_n) = (self.next_source.get(), ipre.map_or_else(|| item.iter().map(memo::source_count).sum::<usize>(), |p| p.src_n as usize));
                                 let (task_at, task_n) = (self.next_task.get(), ipre.map_or_else(|| item.iter().map(memo::task_count).sum::<usize>(), |p| p.task_n as usize));
@@ -366,7 +371,7 @@ impl Renderer {
                                             vec![RenderFrame::Blocks { blocks: item, pre: ipre.map(|p| &*p.inner), maps: imap, names: rendered_keys(item.len(), &[]), top_level: false, in_item: true, open_tail: false, allow_memo: false, idx: 0, prev_mb: 0.0, after_heading: false, last_dir: None, col: col().w_full(), pending: None }],
                                             dirs,
                                             &mut sub_qpc,
-                                        ).grow(1.0).shrink();
+                                        ).shrink();
                                         debug_assert_eq!(self.next_source.get(), src_at + src_n);
                                         debug_assert_eq!(self.next_task.get(), task_at + task_n);
                                         b
@@ -433,7 +438,7 @@ impl Renderer {
             .focusable(interactive)
             .w_full()
             .child(control)
-            .child(item_body.grow(1.0).shrink());
+            .child(item_body.shrink());
         if let Some(on_task) = self.on_task.as_ref().filter(|_| !self.tasks_read_only) {
             let block_key = self.current_block_key.borrow().clone();
             r = on_task(r.cursor(Cursor::Pointer), block_key, item_idx, !checked);
@@ -447,7 +452,10 @@ impl Renderer {
             el().w(indent).h(s.body.line_px()).child(el().outside_list_disc(s.body).fill(s.muted))
         } else {
             let words = start.map_or_else(|| "•".into(), |num| format!("{}.", num + k as u64));
-            let marker = text(words).font(s.body).color(s.muted).exact_lines().w(indent);
+            // CSS Lists Level 3 / Blink UA stylesheet sets `::marker { font-variant-numeric: tabular-nums; }`
+            // so `1.` aligns with `2.` and `3.`.
+            let font = if start.is_some() { TextStyle { features: table::with_tnum(s.body.features), ..s.body } } else { s.body };
+            let marker = text(words).font(font).color(s.muted).exact_lines().w(indent);
             if s.list_outside { marker.align(Align::End).pr(space) } else { marker.align(Align::Center) }
         }
     }
@@ -472,18 +480,53 @@ impl Renderer {
                 let n = self.next_source.get();
                 self.next_source.set(n + 1);
                 let source = self.sources.get(n).filter(|src| src.len == code.len());
-                match &self.code_frame {
+                #[cfg(feature = "math")]
+                if !source.is_some_and(|s| s.open)
+                    && crate::math::is_math_fence(source.and_then(|s| s.lang.as_deref()))
+                {
+                    let ink = self.flow.get().ink.unwrap_or(self.s.text);
+                    if let crate::math::MathStatus::Ready(rendered) =
+                        crate::math::poll_or_enqueue(code, self.s.body.size, ink, self.s.math_scale)
+                    {
+                        let avail = self.s.text_width.map(|w| (w - self.flow.get().inset).max(0.0));
+                        let digest = self.settled_math_card_digest(code, ink, avail, rendered.id);
+                        return rune::memo::cached(digest, || {
+                            memo::note_block_build();
+                            crate::math::view(code, &rendered, self.s.wide_fade, avail, self.scroll_wide)
+                        });
+                    }
+                }
+                let wrapped = self.wraps_code(n, code);
+                match self.code_frame.as_ref().and_then(|w| w.frame.as_ref()) {
                     Some(f) => {
-                        let card = match self.settled_code_card_digest(code, source, code_map) {
+                        let card = match self.settled_code_card_digest(code, source, code_map, wrapped) {
                             Some(digest) => rune::memo::cached(digest, || {
                                 memo::note_block_build();
-                                self.code(code, source, code_map).key("card")
+                                self.code(code, source, code_map, wrapped).key("card")
                             }),
-                            None => self.code(code, source, code_map).key("card"),
+                            None => self.code(code, source, code_map, wrapped).key("card"),
                         };
-                        f(card, &CodeFrame { index: n, source: code, language: source.and_then(|s| s.lang.as_deref()), open: source.is_some_and(|s| s.open) })
+                        f(card, &CodeFrame {
+                            index: n,
+                            source: code,
+                            language: source.and_then(|s| s.lang.as_deref()),
+                            open: source.is_some_and(|s| s.open),
+                            wrapped,
+                            digest: pre.map(|p| p.digest),
+                            font: self.s.code_block,
+                            text_width: self.s.text_width,
+                            inset: self.flow.get().inset,
+                            pad_x: self.s.code_block_pad[0],
+                        })
                     }
-                    None => self.code(code, source, code_map),
+                    None if self.code_frame.as_ref().is_some_and(|w| w.wrap.is_some()) => match self.settled_code_card_digest(code, source, code_map, wrapped) {
+                        Some(digest) => rune::memo::cached(digest, || {
+                            memo::note_block_build();
+                            self.code(code, source, code_map, wrapped)
+                        }),
+                        None => self.code(code, source, code_map, wrapped),
+                    },
+                    None => self.code(code, source, code_map, wrapped),
                 }
             }
             Block::Diff(src) => self.diff(src, code_map),

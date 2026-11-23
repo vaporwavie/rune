@@ -3,7 +3,6 @@
 
 use std::sync::atomic::Ordering;
 
-use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Theme, Window, WindowId};
@@ -214,6 +213,10 @@ impl Host {
         if self.win.as_ref().is_none_or(|w| w.window.id() != id) {
             return;
         }
+        // A window replaying `--window-script` takes its pointer from the script alone.
+        if super::window_script::drops(self.window_script.is_some(), &event) {
+            return;
+        }
         self.a11y_window_event(&event);
         // What says whether other windows cover it (`look`): the pointer reaching it shows some
         // of it; its own move, size or focus makes the next frame look.
@@ -223,7 +226,7 @@ impl Host {
             WindowEvent::Focused(true) | WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.look_stale(),
             _ => {}
         }
-        if !matches!(event, WindowEvent::RedrawRequested) && let Some(w) = &mut self.win {
+        if !matches!(event, WindowEvent::RedrawRequested | WindowEvent::CursorMoved { .. }) && let Some(w) = &mut self.win {
             w.timer_frame.no_longer_quiet();
             w.loop_frame.touched();
         }
@@ -278,6 +281,7 @@ impl Host {
         // Minimised on Windows, where no occlusion event need say so.
         if matches!(event, WindowEvent::Resized(size) if size.width == 0 || size.height == 0) { self.rest_step(RestEvent::Unseen); }
         if let WindowEvent::Occluded(occluded) = event {
+            crate::marks::mark(if occluded { "window.covered" } else { "window.uncovered" });
             // Alpha-zero launcher panels remain renderable on explicit invalidation.
             // Their native occlusion transitions must not settle or redraw a reveal.
             if !(self.macos_window.launcher && cfg!(target_os = "macos")) { self.set_cover(Cover::System, occluded); }
@@ -297,15 +301,28 @@ impl Host {
         match event {
             WindowEvent::Moved(_) => {
                 // winit queues `ScaleFactorChanged` in `kCFRunLoopDefaultMode`, which waits
-                // until a window drag ends; resize the surface now when a drag crosses displays
-                // so top-left gravity never shows the old scale's drawable at half or double size.
+                // until a window drag ends; resize the surface and draw synchronously inside the
+                // current Core Animation transaction when a drag crosses displays so the new
+                // `contentsScale` and new-scale drawable land together with no flash.
                 if (scale - app.rt().window_scale()).abs() > f32::EPSILON {
                     let size = l.window.inner_size();
                     if size.width > 0 && size.height > 0 {
                         l.resize_surface(gpu, size);
+                        #[cfg(target_os = "macos")]
+                        if let Some(surface) = &l.surface { crate::platform::macos::sync_contents_scale(surface, scale); }
                         let rt = app.rt_mut();
-                        rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+                        rt.set_viewport((l.config.width as f32 / scale, l.config.height as f32 / scale), scale);
                         sync_chrome_core(rt, l, chrome, titlebar);
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.draw(true);
+                            if let Some(l) = self.win.as_mut() && !crate::platform::macos::in_live_resize(&l.window) {
+                                l.set_live_resize(false);
+                            }
+                            self.shell(event_loop);
+                            return;
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         l.request_redraw();
                     }
                 }
@@ -329,7 +346,11 @@ impl Host {
                 let origin_moved = sync_screen_origin_core(app.rt_mut(), &l.window);
                 // A frame Rune moved itself has its drawable and viewport already.
                 let resized = l.resize_surface(gpu, size);
-                let viewport = (size.width as f32 / scale, size.height as f32 / scale);
+                #[cfg(target_os = "macos")]
+                if let Some(surface) = &l.surface && (scale - app.rt().window_scale()).abs() > f32::EPSILON {
+                    crate::platform::macos::sync_contents_scale(surface, scale);
+                }
+                let viewport = (l.config.width as f32 / scale, l.config.height as f32 / scale);
                 if !resized && viewport == app.rt().window_viewport() && scale == app.rt().window_scale() {
                     if restored || origin_moved { l.request_redraw(); }
                     return;
@@ -361,19 +382,39 @@ impl Host {
                 if let Some(shadow) = &l.native.shadow { shadow.redraw(); }
                 let scale = scale_factor as f32;
                 let size = l.window.inner_size();
-                // Still the old scale's size: Windows resizes the window after this event.
+                // Still the old scale's size for a normal window: Windows resizes it after this
+                // event. A maximised or full-screen window is not resized by winit and already
+                // carries the new monitor's size from the preceding `Resized`.
                 #[cfg(target_os = "windows")]
                 let size = {
-                    let (width, height) = crate::window::frame::rescaled((size.width, size.height), f64::from(app.rt().window_scale()), scale_factor);
+                    let (width, height) = crate::window::frame::scale_change_size(
+                        (size.width, size.height),
+                        f64::from(app.rt().window_scale()),
+                        scale_factor,
+                        l.window.is_maximized(),
+                        l.window.fullscreen().is_some(),
+                    );
                     winit::dpi::PhysicalSize::new(width, height)
                 };
                 if size.width > 0 && size.height > 0 {
                     let resized = l.resize_surface(gpu, size);
-                    let viewport = (size.width as f32 / scale, size.height as f32 / scale);
+                    #[cfg(target_os = "macos")]
+                    if let Some(surface) = &l.surface { crate::platform::macos::sync_contents_scale(surface, scale); }
+                    let viewport = (l.config.width as f32 / scale, l.config.height as f32 / scale);
                     let rt = app.rt_mut();
                     if resized || viewport != rt.window_viewport() || scale != rt.window_scale() {
                         rt.set_viewport(viewport, scale);
                         sync_chrome_core(rt, l, chrome, titlebar);
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.draw(true);
+                            if let Some(l) = self.win.as_mut() && !crate::platform::macos::in_live_resize(&l.window) {
+                                l.set_live_resize(false);
+                            }
+                            self.shell(event_loop);
+                            return;
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         l.request_redraw();
                     }
                 }
@@ -398,24 +439,13 @@ impl Host {
                     // `window_focus` wrote the composition into its field: the input method drops its copy.
                     crate::platform::ime::cancel(&l.window);
                     l.window.set_ime_allowed(false);
-                    self.ime_allowed = false;
+                    self.ime.clear();
                     // A minimized or occluded window skips redraw.
                     l.apply_cursor_core(rt, false);
                 } else if rt.stale() {
                     rt.edit.ime_reset = true;
                 } else {
-                    let ime_allowed = rt.ime_area.is_some() && !rt.has_secure_focus();
-                    if std::mem::take(&mut rt.edit.ime_reset) || ime_allowed != self.ime_allowed {
-                        l.window.set_ime_allowed(false);
-                        l.window.set_ime_allowed(ime_allowed);
-                        self.ime_allowed = ime_allowed;
-                    }
-                    if let Some(a) = rt.ime_area.map(|a| rt.to_window(a)) {
-                        l.window.set_ime_cursor_area(
-                            LogicalPosition::new(a[0] as f64, a[1] as f64),
-                            LogicalSize::new(a[2] as f64, a[3] as f64),
-                        );
-                    }
+                    host_events::sync_ime(&l.window, rt, &mut self.ime, true);
                     l.apply_cursor_core(rt, true);
                 }
                 if rt.stale() { l.request_redraw(); }
@@ -423,6 +453,11 @@ impl Host {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 if pressed { crate::marks::input_arrived(true); }
+                if pressed && let Some(text) = crate::platform::ime::take_direct_commit(&l.window) {
+                    host_events::ime(app.rt_mut(), &l.window, &mut self.ime, winit::event::Ime::Commit(text));
+                    l.request_redraw();
+                    return;
+                }
                 // A menu item handing Rune its key: it acts after, if no handler takes it. So does
                 // the window menu's Alt+Space, posted rather than run inside the key's message.
                 let logical = pressed.then(|| map_key_event(&event, self.mods)).flatten();
@@ -435,7 +470,7 @@ impl Host {
                 }
             }
             WindowEvent::Ime(ime) => {
-                host_events::ime(app.rt_mut(), &l.window, ime);
+                host_events::ime(app.rt_mut(), &l.window, &mut self.ime, ime);
                 l.request_redraw();
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
@@ -459,9 +494,15 @@ impl Host {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let input_scale = app.rt().input_scale();
-                app.pointer_move(position.x as f32 / input_scale, position.y as f32 / input_scale);
+                let (redraw, drag_out) = cursor_moved_core(
+                    app,
+                    &mut l.timer_frame,
+                    &mut l.loop_frame,
+                    position.x as f32 / input_scale,
+                    position.y as f32 / input_scale,
+                );
                 // AppKit needs the drag session started inside this mouse-dragged event.
-                if let Some(start) = app.rt_mut().take_drag_out() {
+                if let Some(start) = drag_out {
                     let rt = app.rt();
                     let image = self.gpu.as_ref().filter(|_| start.item.drag_image().is_none()).and_then(|(gpu, renderer)|
                         crate::drag_out::snapshot(gpu, renderer, (l.config.width, l.config.height), scale, rt.clear_color(), start.rect));
@@ -473,7 +514,11 @@ impl Host {
                     }));
                     l.apply_cursor_core(rt, false);
                 }
-                l.request_redraw();
+                if redraw {
+                    l.request_redraw();
+                } else {
+                    l.apply_cursor_core(app.rt(), l.window.has_focus());
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 app.rt_mut().pointer_leave();
@@ -501,7 +546,7 @@ impl Host {
                             // AppKit needs the drag started inside this mouse-down.
                             match app.rt_mut().take_titlebar_action() {
                                 Some(TitlebarAction::Drag) => {
-                                    let _ = l.window.drag_window();
+                                    l.window.drag_window().ok();
                                 }
                                 Some(TitlebarAction::DoubleClick) => titlebar_double_click(&l.window),
                                 None => {}
@@ -539,6 +584,26 @@ impl Host {
             _ => {}
         }
     }
+}
+
+/// Applies a pointer move in view points, returning whether the host must request a redraw and
+/// any OS drag-out session the move armed. Leaves `timer_frame` quiet and `loop_frame` untouched
+/// when the move changed nothing the next frame would run or paint.
+pub(super) fn cursor_moved_core(
+    app: &mut dyn WindowApp,
+    timer_frame: &mut crate::window::surface::TimerFrame,
+    loop_frame: &mut crate::window::surface::LoopFrame,
+    x: f32,
+    y: f32,
+) -> (bool, Option<crate::drag_out::DragOutStart>) {
+    let changed = app.observe_pointer(x, y);
+    let drag_out = app.rt_mut().take_drag_out();
+    let redraw = changed || drag_out.is_some();
+    if redraw {
+        timer_frame.no_longer_quiet();
+        loop_frame.touched();
+    }
+    (redraw, drag_out)
 }
 
 /// Runs the updates queued before launch with `run`, as the host `shortcuts` guards, as every

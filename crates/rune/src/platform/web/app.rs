@@ -35,7 +35,7 @@ pub(super) struct StartedWebApp {
     pub(super) fonts: &'static [&'static [u8]],
 }
 
-type StartFn = Box<dyn FnOnce(Vec<Vec<u8>>, (f32, f32), Env, Waker) -> StartedWebApp>;
+type StartFn = Box<dyn FnOnce(Vec<Vec<u8>>, (f32, f32), Env, Waker, Waker) -> StartedWebApp>;
 
 /// Everything `Browser` holds of an `App<S>` before `start_app` constructs its `Runtime<S>`.
 pub(super) struct PendingApp {
@@ -65,8 +65,8 @@ impl PendingApp {
         Ok(())
     }
 
-    pub(super) fn start(self, fonts: Vec<Vec<u8>>, viewport: (f32, f32), env: Env, wake: Waker) -> StartedWebApp {
-        (self.start)(fonts, viewport, env, wake)
+    pub(super) fn start(self, fonts: Vec<Vec<u8>>, viewport: (f32, f32), env: Env, wake: Waker, live_wake: Waker) -> StartedWebApp {
+        (self.start)(fonts, viewport, env, wake, live_wake)
     }
 }
 
@@ -88,7 +88,7 @@ pub(super) trait WebApp {
     fn compositor_features(&self) -> wgpu::Features;
     fn compositor_animating(&self) -> bool;
     fn compositor_draws_own(&self) -> bool;
-    fn render_compositor(&mut self, args: CompositorFrame<'_>);
+    fn render_compositor(&mut self, args: CompositorFrame<'_>) -> bool;
     fn paste_event(&mut self, clipboard: &crate::clipboard::Client, content: crate::ClipboardContent, image: Option<&JsValue>);
 }
 
@@ -104,6 +104,14 @@ impl dyn WebApp + '_ {
 
     pub(super) fn frame(&mut self, dt: f64) -> bool {
         self.driver(|rt, app| rt.frame(app, dt))
+    }
+
+    pub(super) fn covered_wake(&mut self) {
+        self.driver(|rt, app| { rt.covered_wake(app); });
+    }
+
+    pub(super) fn set_live_visible(&mut self, visible: bool) {
+        self.driver(|rt, app| rt.set_live_visible(app, visible));
     }
 
     pub(super) fn clock_advance(&mut self, clock: &mut FrameClock, at: Instant, compositing: bool) -> (bool, f64) {
@@ -128,6 +136,10 @@ impl dyn WebApp + '_ {
 
     pub(super) fn pointer_move(&mut self, x: f32, y: f32) {
         self.driver(|rt, app| rt.pointer_move(app, x, y));
+    }
+
+    pub(super) fn observe_pointer(&mut self, x: f32, y: f32) -> bool {
+        self.driver(|rt, app| rt.observe_pointer(app, x, y))
     }
 
     pub(super) fn mouse_button(
@@ -167,8 +179,12 @@ impl dyn WebApp + '_ {
         self.driver(|rt, app| rt.web_key(app, event))
     }
 
-    pub(super) fn web_edit(&mut self, event: &serde_json::Value) {
-        self.driver(|rt, app| rt.web_edit(app, event));
+    pub(super) fn web_edit(&mut self, event: &serde_json::Value, mirror: &mut crate::runtime::web_runtime::Mirror) {
+        self.driver(|rt, app| rt.web_edit(app, event, mirror));
+    }
+
+    pub(super) fn web_secure_replace(&mut self, key: &str, text: String) {
+        self.driver(|rt, app| rt.web_secure_replace(app, key, text));
     }
 }
 
@@ -198,15 +214,10 @@ impl<S: 'static> TypedWebApp<S> {
         let same_tab_router = app.same_tab_router.take();
         let compositor_features = app.compositor.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
         let shared = app.shared.core.clone();
-        let start: StartFn = Box::new(move |fonts, viewport, env, wake| {
+        let start: StartFn = Box::new(move |fonts, viewport, env, wake, live_wake| {
             app.spec.fonts = with_fonts(app.spec.fonts, fonts);
-            let compositor = app.compositor.take();
-            let (playground, attach_playground) = (app.playground.take(), app.attach_playground);
-            let spec_fonts = app.spec.fonts;
-            let (spec, state, shared, runtime) = app.into_parts(None);
-            let mut rt = crate::tooling::runtime_for(&spec, state, viewport, env, wake.clone());
-            if let Some(attach) = attach_playground { attach(&mut rt, playground, &spec, None, None, true); }
-            rt.configure(runtime);
+            let (rt, shared, compositor, spec_fonts) =
+                super::super::web_math::start_web_runtime(app, viewport, env, wake.clone(), live_wake);
             let menus = crate::native_menu::MenuGuard::attach(&shared, false);
             let shortcuts = crate::shortcuts::Guard::attach(&shared, wake, false, false);
             StartedWebApp {
@@ -267,8 +278,8 @@ impl<S: 'static> WebApp for TypedWebApp<S> {
         self.compositor.as_ref().is_some_and(|c| c.draws_own())
     }
 
-    fn render_compositor(&mut self, args: CompositorFrame<'_>) {
-        let Some(c) = self.compositor.as_mut() else { return };
+    fn render_compositor(&mut self, args: CompositorFrame<'_>) -> bool {
+        let Some(c) = self.compositor.as_mut() else { return false };
         let mut f = Frame {
             device: args.device,
             queue: args.queue,
@@ -282,6 +293,7 @@ impl<S: 'static> WebApp for TypedWebApp<S> {
             ui: args.ui,
         };
         c.render(&mut f);
+        c.animating()
     }
 
     fn paste_event(&mut self, clipboard: &crate::clipboard::Client, content: crate::ClipboardContent, image: Option<&JsValue>) {

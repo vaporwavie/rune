@@ -15,12 +15,17 @@ const AFTER: &str = "RUNE_RELAUNCH_AFTER";
 const HANDED: &str = "RUNE_INSTANCE_HANDED";
 /// The longest a relaunched process waits for the previous one.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The same from the single-instance claim (Windows, [`wait_for_previous_release`]): one that
+/// hasn't let go by then is hung, and the claim passes it over; one still quitting answers the
+/// claim, which waits for it.
+#[cfg(target_os = "windows")]
+const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Starts this app again, to go on once this process has exited. Errors are logged: the app
 /// is quitting either way.
 pub(crate) fn spawn() {
     #[cfg(not(target_arch = "wasm32"))]
-    if let Err(e) = start(std::env::args_os().skip(1).collect(), AFTER) {
+    if let Err(e) = start(crate::tooling::without_relaunch_drops(std::env::args_os().skip(1).collect()), AFTER) {
         eprintln!("rune: couldn't start the app again: {e}");
     }
 }
@@ -84,35 +89,88 @@ fn bundle_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
 /// A relaunched process waits here, once, for the process that started it to exit, for at most
 /// ten seconds. Any other launch goes straight on.
 pub(crate) fn wait_for_previous() {
+    wait_once(false);
+}
+
+/// The process this one was relaunched after (`Tx::relaunch`), if it isn't this one.
+#[cfg(target_os = "windows")]
+pub(crate) fn relaunched_after() -> Option<u32> {
+    std::env::var_os(AFTER).and_then(|v| v.to_str().and_then(|v| v.parse::<u32>().ok())).filter(|pid| *pid != std::process::id())
+}
+
+/// [`wait_for_previous`] from the single-instance claim (Windows): the previous process lets go
+/// of the claim (`release_instance`) once it holds nothing this one needs (its files closed), so
+/// that, or its exit, is what's waited for, and for at most [`CLAIM_WAIT`]. Its teardown after
+/// that (threads, the GPU, a diagnostics queue) costs this launch nothing.
+#[cfg(target_os = "windows")]
+pub(crate) fn wait_for_previous_release() {
+    wait_once(true);
+}
+
+fn wait_once(_claim: bool) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let Some(pid) = std::env::var_os(AFTER).and_then(|v| v.to_str().and_then(|v| v.parse::<u32>().ok())) else { return };
-            if pid != std::process::id() { wait(pid); }
+            if pid == std::process::id() {
+                return;
+            }
+            #[cfg(target_os = "windows")]
+            wait(pid, _claim);
+            #[cfg(not(target_os = "windows"))]
+            wait(pid);
         });
     }
 }
 
 #[cfg(target_os = "windows")]
-fn wait(pid: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
+#[allow(unsafe_code)]
+fn wait(pid: u32, claim: bool) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    let until = crate::time::now() + if claim { CLAIM_WAIT } else { WAIT };
     // SAFETY: a plain handle request; a process that already exited answers null. The handle is
     // closed once.
     unsafe {
         let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
         if handle.is_null() { return; }
-        WaitForSingleObject(handle, WAIT.as_millis() as u32);
+        loop {
+            let left = until.saturating_duration_since(crate::time::now());
+            // From the claim, looks for the release every 2 ms; else one wait for the exit.
+            let slice = if claim { left.min(std::time::Duration::from_millis(2)) } else { left };
+            if WaitForSingleObject(handle, slice.as_millis() as u32) != WAIT_TIMEOUT
+                || (claim && crate::open_url::instance::released(pid))
+                || crate::time::now() >= until
+            {
+                break;
+            }
+        }
         CloseHandle(handle);
     }
 }
 
-/// Whether process `pid` still runs: it hasn't exited, and it isn't ending (a process that was
-/// terminated has its exit code at once, while its last threads and kernel objects can linger
-/// for seconds).
+/// Whether process `pid` still holds what it holds: its process object isn't signalled yet. A
+/// process that was terminated has its exit code at once, but it is signalled only after the
+/// kernel has closed its handles (its instance pipe, its file locks), which can take a while: a
+/// process in between is still here, and is [`ending`].
 #[cfg(target_os = "windows")]
 pub(crate) fn alive(pid: u32) -> bool {
+    process(pid).is_some_and(|(signalled, _)| !signalled)
+}
+
+/// Whether process `pid` has an exit code but hasn't closed its handles yet: a launch that finds
+/// its pipe waits for the name to come free rather than taking another.
+#[cfg(target_os = "windows")]
+pub(crate) fn ending(pid: u32) -> bool {
+    process(pid).is_some_and(|(signalled, running)| !signalled && !running)
+}
+
+/// `pid`'s process object: whether it is signalled, and whether its exit code is still
+/// `STILL_ACTIVE`. None when it is gone (or can't be opened).
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn process(pid: u32) -> Option<(bool, bool)> {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject};
     // SAFETY: a plain handle request; a process that already exited answers null. The handle is
@@ -120,24 +178,26 @@ pub(crate) fn alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            return None;
         }
+        let signalled = WaitForSingleObject(handle, 0) != WAIT_TIMEOUT;
         let mut code = 0;
-        let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT && GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let running = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
         CloseHandle(handle);
-        running
+        Some((signalled, running))
     }
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 fn wait(pid: u32) {
-    let deadline = std::time::Instant::now() + WAIT;
-    while alive(pid) && std::time::Instant::now() < deadline {
+    let deadline = crate::time::now() + WAIT;
+    while alive(pid) && crate::time::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
+#[allow(unsafe_code)]
 fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }

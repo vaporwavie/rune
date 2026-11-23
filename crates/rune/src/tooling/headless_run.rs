@@ -1,7 +1,7 @@
 //! What a headless run was asked to do, for the app to read (`tooling::headless_run`).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::RwLock;
 
 use crate::edit::KeyEvent;
 
@@ -188,18 +188,108 @@ pub enum ScriptPoint {
     FromDown(f32, f32),
 }
 
-static RUN: AtomicPtr<HeadlessRun> = AtomicPtr::new(std::ptr::null_mut());
+static RUN: RwLock<Option<&'static HeadlessRun>> = RwLock::new(None);
 
 /// The headless run this process is rendering, or None in a window. Set before the app's
 /// state is created, so `init`, `setup`, views and handlers can read it; a `run_windows`
 /// factory runs too early to see it.
 pub fn headless_run() -> Option<&'static HeadlessRun> {
-    // SAFETY: only `publish` stores, and it stores leaked boxes that are never freed.
-    unsafe { RUN.load(Ordering::Acquire).as_ref() }
+    *RUN.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Makes `run` the process's headless run. Each run leaks its small description so earlier
 /// references stay valid; a process renders one run, or a few in tests.
 pub(crate) fn publish(run: HeadlessRun) {
-    RUN.store(Box::into_raw(Box::new(run)), Ordering::Release);
+    #[cfg(test)]
+    assert!(
+        TEST_TURN_HELD.with(std::cell::Cell::get),
+        "headless runs share the process-wide tooling::headless_run(); take tooling::headless_run::test_turn() before starting one in a test",
+    );
+    *RUN.write().unwrap_or_else(|e| e.into_inner()) = Some(Box::leak(Box::new(run)));
+}
+
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TURN_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds the process-wide headless-run turn for a unit test and restores `RUN` on drop.
+#[cfg(test)]
+#[must_use = "hold the returned TestTurn for the duration of the headless test"]
+pub(crate) struct TestTurn {
+    prev: Option<&'static HeadlessRun>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestTurn {
+    fn drop(&mut self) {
+        *RUN.write().unwrap_or_else(|e| e.into_inner()) = self.prev;
+        TEST_TURN_HELD.with(|held| held.set(false));
+    }
+}
+
+/// Serializes unit tests that start a headless run or replace [`headless_run`].
+#[cfg(test)]
+pub(crate) fn test_turn() -> TestTurn {
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    TEST_TURN_HELD.with(|held| held.set(true));
+    TestTurn { prev: headless_run(), _guard: guard }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_run(scale: f32, fps: f64, size: (f32, f32)) -> HeadlessRun {
+        HeadlessRun {
+            script: None,
+            events: Vec::new(),
+            scale,
+            fps,
+            size,
+            start: 0.0,
+            frames: 0,
+            end: 0.0,
+            desktop: None,
+            windows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn publish_replaces_current_run_while_earlier_references_stay_valid() {
+        let _turn = test_turn();
+        publish(sample_run(1.0, 30.0, (320.0, 200.0)));
+        let first: &'static HeadlessRun = headless_run().expect("first run published");
+        assert_eq!((first.scale(), first.fps(), first.size()), (1.0, 30.0, (320.0, 200.0)));
+
+        publish(sample_run(2.0, 60.0, (640.0, 480.0)));
+        let second: &'static HeadlessRun = headless_run().expect("second run published");
+        assert_eq!((second.scale(), second.fps(), second.size()), (2.0, 60.0, (640.0, 480.0)));
+        assert_eq!((first.scale(), first.fps(), first.size()), (1.0, 30.0, (320.0, 200.0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "test_turn()")]
+    fn publish_without_test_turn_panics() {
+        publish(sample_run(1.0, 60.0, (100.0, 100.0)));
+    }
+
+    #[test]
+    fn test_turn_restores_previous_run_and_releases_on_drop() {
+        let before = {
+            let turn = test_turn();
+            let before = headless_run();
+            publish(sample_run(3.0, 120.0, (100.0, 50.0)));
+            assert_eq!(headless_run().unwrap().scale(), 3.0);
+            drop(turn);
+            before
+        };
+        assert!(!TEST_TURN_HELD.with(std::cell::Cell::get));
+        let _turn = test_turn();
+        assert_eq!(headless_run().map(|r| r as *const _), before.map(|r| r as *const _));
+    }
 }

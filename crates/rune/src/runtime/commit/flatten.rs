@@ -10,8 +10,13 @@ pub(in crate::runtime) fn fit_room(own: &CompactStyle, parent_row: bool) -> Comp
     let raw = own.to_style();
     let zero = |d: LengthPercentageAuto| if d.is_auto() { length(0.0) } else { d };
     let main_max = if parent_row { raw.max_size.width } else { raw.max_size.height };
+    let size = if parent_row {
+        Size { width: main_max.into(), height: auto() }
+    } else {
+        Size { width: auto(), height: main_max.into() }
+    };
     CompactStyle::from_style(Style {
-        size: raw.max_size.map(Into::into),
+        size,
         min_size: Size { width: zero(raw.min_size.width), height: zero(raw.min_size.height) },
         flex_grow: 1.0,
         flex_shrink: 1.0,
@@ -77,65 +82,11 @@ enum Picture {
 /// A measured picture's measure key: its ratio, so a new one measures again.
 fn picture_key(ratio: f32) -> u64 { 0x7069_6300_0000_0000 | u64::from(ratio.to_bits()) }
 
-// Build the owned path directly, without cloning a key or formatting an index into a
-// temporary segment first. Measurement and flattening must use the same identity rule.
-/// Whether `path` lies inside an element keyed `scope` (always, without one).
-pub(crate) fn in_scope(path: &str, scope: Option<&str>) -> bool {
-    scope.is_none_or(|s| path.split('/').any(|seg| seg == s))
-}
-
-pub(in crate::runtime) fn node_path(parent: &str, key: Option<&str>, index: usize) -> String {
-    match (parent.is_empty(), key) {
-        (true, Some(key)) => key.to_owned(),
-        (true, None) => format!("#{index}"),
-        // Sized up front: `format!` guesses short and reallocates every deep path, twice a
-        // commit per element.
-        (false, Some(key)) => {
-            let mut path = String::with_capacity(parent.len() + 1 + key.len());
-            path.push_str(parent);
-            path.push('/');
-            path.push_str(key);
-            path
-        }
-        (false, None) => {
-            use std::fmt::Write;
-            let mut path = String::with_capacity(parent.len() + 22);
-            path.push_str(parent);
-            let _ = write!(path, "/#{index}");
-            path
-        }
-    }
-}
-
-#[inline(always)]
-fn push_usize(buf: &mut String, mut n: usize) {
-    if n < 10 {
-        buf.push((b'0' + n as u8) as char);
-        return;
-    }
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    while n > 0 {
-        i -= 1;
-        digits[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    // SAFETY: `digits[i..]` contains ASCII `'0'..='9'`.
-    buf.push_str(unsafe { std::str::from_utf8_unchecked(&digits[i..]) });
-}
-
-fn push_segment(path: &mut String, key: Option<&str>, index: usize) {
-    if !path.is_empty() {
-        path.push('/');
-    }
-    match key {
-        Some(k) => path.push_str(k),
-        None => {
-            path.push('#');
-            push_usize(path, index);
-        }
-    }
-}
+pub(crate) use super::path::in_scope;
+pub(in crate::runtime) use super::path::node_path;
+use super::path::push_segment;
+#[cfg(test)]
+use super::path::push_usize;
 
 #[inline]
 fn can_take_old_path(old: &Node, path_buf: &str) -> bool {
@@ -290,6 +241,7 @@ fn prepare_text(
 
 /// Text, an icon, and a text field's placeholder, caret and selection that weren't given a
 /// colour take the window's foreground ([`Cx::foreground`]), as CSS text takes `color`.
+/// A text field with its own [`El::color`] already derives its uninked defaults from that colour.
 fn take_foreground(
     text: &mut Option<crate::cold::SharedBox<TextSpec>>,
     input: Option<&mut InputSpec>,
@@ -297,18 +249,19 @@ fn take_foreground(
     foreground: Option<Color>,
 ) {
     let Some(fg) = foreground else { return };
+    let text_inked = text.as_ref().is_some_and(|t| t.inked);
     if let Some(t) = text && !t.inked && t.color != fg {
         t.color = fg;
     }
-    if let Some(i) = input {
+    if let Some(i) = input && !text_inked {
         if !i.placeholder_inked {
             i.placeholder_color = fg.alpha(0.4);
         }
         if !i.caret_inked {
             i.caret = fg;
-            if i.selection == crate::el::DEFAULT_SELECTION {
-                i.selection = fg.alpha(0.2);
-            }
+        }
+        if !i.selection_inked {
+            i.selection = fg.alpha(0.2);
         }
     }
     if !vis.icon_inked && vis.icon.is_some_and(|(_, c)| c != fg) && let Some((_, c)) = &mut vis.cold_mut().icon {
@@ -355,7 +308,7 @@ fn needs_node_cold(c: &crate::el::ElCold, meta: &ColdMeta) -> bool {
         || c.above.is_some() || c.growth.is_some() || c.sticky.is_some()
         || c.trace_name.is_some() || c.looping.is_some() || c.opacity_motion.is_some()
         || c.lead.is_some() || c.glide.is_some() || c.material.is_some()
-        || c.help_cut || c.help_side.is_some()
+        || c.help_cut || c.help_side.is_some() || c.help_open
         || c.scroll_axes != crate::el::ScrollAxes::Y
         || c.scroll_edges != crate::el::ScrollEdges::default()
         || c.a11y != crate::el::A11y::default();
@@ -372,7 +325,7 @@ fn node_cold_meta_only(meta: ColdMeta) -> NodeCold {
         transition: None, matched: None, above: None, scroll: None, scroll_axes: crate::el::ScrollAxes::Y,
         scroll_edges: crate::el::ScrollEdges::default(), wheel_scrolls: None, sticky: None, growth: None, glide: None,
         a11y: crate::el::A11y::EMPTY, pixel_aspect: meta.pixel_aspect, aspect_fit: meta.aspect_fit,
-        material: None, help: None, help_cut: false, help_side: None,
+        material: None, help: None, help_cut: false, help_side: None, help_open: false,
         #[cfg(debug_assertions)]
         scroll_source: None,
     }
@@ -433,6 +386,7 @@ macro_rules! node_cold_from {
         let mut above = take_field!($mode, $c.above);
         if $m.mirror && let Some(a) = &mut above { crate::el::mirror_anchor(a); }
         let matched = take_field!($mode, $c.matched).map(|id| (id, $c.motion));
+        let help_side = if $m.mirror { $c.help_side.map(crate::el::mirror_side) } else { $c.help_side };
         NodeCold {
             trace_name: $c.trace_name, trace_namespace: $m.trace_namespace,
             label: take_field!($mode, $c.label), live: take_field!($mode, $c.live),
@@ -444,7 +398,7 @@ macro_rules! node_cold_from {
             sticky: take_field!($mode, $c.sticky), growth: take_field!($mode, $c.growth),
             glide: $c.glide, a11y: take_field!($mode, $c.a11y),
             pixel_aspect: $m.pixel_aspect, aspect_fit: $m.aspect_fit, material: $c.material,
-            help: take_field!($mode, $c.help), help_cut: $c.help_cut, help_side: $c.help_side,
+            help: take_field!($mode, $c.help), help_cut: $c.help_cut, help_side, help_open: $c.help_open,
             #[cfg(debug_assertions)]
             scroll_source: $c.scroll_source,
         }
@@ -623,7 +577,9 @@ fn flatten_owned(
     taffy: &mut LayoutEngine, nodes: &mut Vec<Node>, scale: f32,
     memo_ctx: &mut memo_reuse::MemoFlattenCtx<'_>,
 ) -> (SlotId, bool) {
-    flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    rune_taffy::maybe_grow(|| {
+        flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    })
 }
 
 #[inline(never)]
@@ -634,7 +590,9 @@ fn flatten_ref(
     taffy: &mut LayoutEngine, nodes: &mut Vec<Node>, scale: f32,
     memo_ctx: &mut memo_reuse::MemoFlattenCtx<'_>,
 ) -> (SlotId, bool) {
-    flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    rune_taffy::maybe_grow(|| {
+        flatten_node(el, parent, path_buf, index, motion, in_row, parent_row, parent_sx, taffy, nodes, scale, memo_ctx)
+    })
 }
 
 #[inline(always)]
@@ -650,6 +608,9 @@ fn flatten_node<E: FlattenEl>(
         && let Some(slot) = memo_reuse::try_reuse_memo(el_ref, parent, path_buf, index, motion, in_row, scale, taffy, nodes, memo_ctx)
     {
         return (slot, false);
+    }
+    if el_ref.flags.has(ElFlags::HAS_VIRTUAL) && el_ref.memo.is_some() {
+        memo_ctx.missed_virtual_memo = true;
     }
     let record_built = parent_sx.is_none().then(|| {
         let built = el_ref.memo_built().filter(|b| b.reusable && memo_reuse::same_root_el(el_ref, b, false))
@@ -672,7 +633,8 @@ fn flatten_node<E: FlattenEl>(
     } else {
         in_row
     };
-    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || (parent.is_some_and(|p| nodes[p].instant_changes) && !el_ref.cold.animated_changes);
+    let animated_changes = el_ref.cold.animated_changes;
+    let instant_changes = flags.has(ElFlags::INSTANT_CHANGES) || (parent.is_some_and(|p| nodes[p].instant_changes) && !animated_changes);
     let trace_namespace = el_ref.cold.trace_namespace.or_else(|| parent.and_then(|p| nodes[p].trace_namespace));
     let parent_flow = parent.map_or(crate::el::Flow::Ltr, |p| nodes[p].flow);
     let (flow, dir_effect) = crate::el::step_direction(parent_flow, crate::el::DirEvent::of(el_ref));
@@ -737,6 +699,7 @@ fn flatten_node<E: FlattenEl>(
     let static_scale = el_r.scale;
     let time_scale = el_r.cold.time_scale;
     let option_as_alt = el_r.cold.option_as_alt;
+    let virtual_list = el_r.cold.virtual_estimate.is_some();
     let focus = el_r.cold.focus.clone();
     let (key, handlers, text, vis, cold, style, children) = el.finish(s);
     let cold = if E::cold_is_empty(&cold) && trace_namespace.is_none() && pixel_aspect.is_none() && aspect_fit.is_none() {
@@ -751,10 +714,12 @@ fn flatten_node<E: FlattenEl>(
         motion, static_scale, time_scale, in_row,
         width_leads: flags.has(ElFlags::WIDTH_LEADS),
         instant_changes,
+        animated_changes,
         streaming: flags.has(ElFlags::STREAMING),
         whole: flags.has(ElFlags::WHOLE),
         inert, flow, directed, pin, scale_track: false, group_fade: false,
         virtual_mount: flags.has(ElFlags::VIRTUAL_MOUNT),
+        virtual_list,
         selection_group: flags.has(ElFlags::SELECTION_GROUP),
         window_drag: flags.window_drag(),
         ime_cursor: flags.has(ElFlags::IME_CURSOR),

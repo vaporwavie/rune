@@ -82,7 +82,9 @@ pub(super) fn build(item: TabItemCore<'_>, at: Place, prev: Option<&str>, st: &S
     let composite = [st.base, overlay];
     let h = if two_line { st.two_line_height } else { st.row_height };
 
-    let mut pill = row().key("pill").w_full().h(h).radius(RADIUS).center_y();
+    // The keyboard ring goes on the pill, inside it: the strip scrolls and would clip a ring
+    // drawn outside, and a vertical slot reaches into the gaps (`tabs.css`, opencode#64909).
+    let mut pill = row().key("pill").w_full().h(h).radius(RADIUS).center_y().focus_ring(2.0, -2.0, c.border_focus);
     pill = if lifted { grounded(pill, composite, RADIUS) } else { pill.fill(if at.active || editing || item.marked { overlay } else { Color::TRANSPARENT }) };
     // The hover wash, instant as the web's `:hover` is: the slot's own on a horizontal tab; a
     // vertical slot reaches into the gaps, so its pill carries the wash as a layer.
@@ -185,6 +187,11 @@ pub(super) fn build(item: TabItemCore<'_>, at: Place, prev: Option<&str>, st: &S
     });
     // While its copy flies, the tab keeps only its place.
     slot = slot.child(if ghost.is_some() { el().key("pill").w_full().h(h).motion(rune::Spring::NONE) } else { pill });
+    if vertical {
+        // The row as drawn, without the half gaps the slot reaches into: what a card beside the
+        // tab lines up with, as a web hover card's `right-start` does with its trigger.
+        slot = slot.child(el().key(format!("t-{id}-pill")).pin(Some(0.0), Some(before), Some(0.0), None).h(h).a11y_hidden());
+    }
     if torn && bind.has_access() {
         // The pill's place, under a key no other strip uses: the floating copy's anchor, and,
         // mounted as the tab tears out, where it reports its width for the copy.
@@ -269,9 +276,17 @@ fn title(title: &str, editor: Option<El>, at: &Place, vertical: bool, emphasized
     // The fade ends 24 points before the link's end, clear of the slot, at the end of the title's
     // own words: a Latin title in a right-to-left tab starts at its left and fades at its right,
     // never hiding its first word under the slot (as Desktop's `flex-1` title does).
-    let faded = |label: El| label.truncate_fade_width(FADE / font.size);
+    // `tab-nav.css` applies the 16 pt linear mask unconditionally on active/hovered/focused/status
+    // tabs, so a title that enters the final 16 pt before the slot fades even if it does not
+    // overflow `wrap` (`Wide tables and long code`, 187 pt inside 188 pt).
+    let (fade_l, fade_r) = if rune::Direction::of(title) == Some(rune::Direction::Rtl) {
+        (FADE, 0.0)
+    } else {
+        (0.0, FADE)
+    };
+    let clipped = |label: El| label.truncate_fade_width(0.0);
     if emphasized {
-        return wrap.mr(room).child(faded(label));
+        return wrap.mr(room).clip_fade_linear(fade_l, 0.0, fade_r, 0.0).child(clipped(label));
     }
     // At rest it fades only an overflowing title, 4 points from a horizontal tab's end. A compact
     // tab's hover hides it; a wider tab's hover shows it faded clear of the slot instead, in the
@@ -282,8 +297,14 @@ fn title(title: &str, editor: Option<El>, at: &Place, vertical: bool, emphasized
         return wrap.mr(end).child(hidden(rest.group_opacity(1.0, 0.0)));
     }
     let rest = row().key("rest").grow(1.0).shrink().min_w(0.0).mr(end).child(hidden(rest.group_opacity(1.0, 0.0)));
-    let hovered = hidden(row().key("hovered").pin(Some(0.0), Some(0.0), Some(24.0), Some(0.0))
-        .group_opacity(0.0, 1.0).child(faded(label)));
+    let hovered = hidden(
+        row()
+            .key("hovered")
+            .pin(Some(0.0), Some(0.0), Some(24.0), Some(0.0))
+            .clip_fade_linear(fade_l, 0.0, fade_r, 0.0)
+            .group_opacity(0.0, 1.0)
+            .child(clipped(label)),
+    );
     wrap.child(rest).child(hovered)
 }
 
@@ -407,6 +428,7 @@ pub(super) fn drag_move(
     want_tear_move: bool,
     tx: &mut Tx,
 ) -> Option<TabTearMove> {
+    drag.note_travel([d.dx, d.dy]);
     // A strip that neither reorders nor lets a tab tear out (`TabStrip::tear_out`) only
     // selects: its tabs stay put under a drag.
     if !can_reorder && t.lane.tear.is_none() {
@@ -437,6 +459,7 @@ pub(super) fn drag_move(
 }
 
 pub(super) fn drag_up(drag: &mut TabDragState, d: &Drag, select_early: bool, tx: &mut Tx) -> Release {
+    drag.note_travel([d.dx, d.dy]);
     let on_tab = (0.0..=d.w).contains(&d.x) && (0.0..=d.h).contains(&d.y);
     // A press already selected the tab; its click needn't again.
     let release = drag.release(d.cancelled(), on_tab, select_early && on_tab);

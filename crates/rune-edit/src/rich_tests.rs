@@ -374,7 +374,7 @@ fn html_parsing_is_linear_on_hostile_input() {
         "<a href=\"".to_owned() + &"&#x6a;".repeat(n) + "\">x</a>",
     ];
     for html in &cases {
-        let t = std::time::Instant::now();
+        let t = rune_core::time::now();
         let e = TextEdit::from_html(html);
         assert_invariants(&e, &html[..20]);
         let _ = e.to_html();
@@ -572,7 +572,10 @@ fn the_caret_steps_over_a_pill_in_one_move() {
     assert_eq!(e.range(), (10, 10));
     e.set_caret(2);
     e.key(&KeyEvent { key: Key::Right, mods: Mods { alt: true, ..Mods::default() } }, None);
-    assert_eq!(e.range(), (10, 10), "a word move that stops inside the label steps over it");
+    // On macOS a word forward stops at the pill's end; elsewhere it lands past the trailing
+    // space at the next word's start, still stepping over the label in one move.
+    let after_pill = if cfg!(target_os = "macos") { 10 } else { 11 };
+    assert_eq!(e.range(), (after_pill, after_pill), "a word move that stops inside the label steps over it");
     e.set_caret(2);
     e.key(&KeyEvent { key: Key::Right, mods: Mods { shift: true, ..Mods::default() } }, None);
     assert_eq!((e.anchor, e.focus), (2, 10), "Shift+Right selects the whole pill");
@@ -636,12 +639,12 @@ fn undo_groups_keep_typing_coalescing_and_record_nothing_when_empty() {
 #[test]
 fn undo_group_is_unwind_safe_and_interacts_with_clear_history_paste_and_soft_breaks() {
     let mut e = TextEdit::new("base").rich();
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         e.undo_group(|e| {
             e.insert("!");
             panic!("boom");
         });
-    }));
+    })).ok();
     assert!(!e.group.is_open(), "unwinding clears the active group");
     e.insert("?");
     assert_eq!(e.history.undo.len(), 1, "edits after a caught panic record again");
@@ -652,12 +655,12 @@ fn undo_group_is_unwind_safe_and_interacts_with_clear_history_paste_and_soft_bre
     e.clear_history();
     e.undo_group(|e| {
         e.insert("1");
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             e.undo_group(|e| {
                 e.insert("2");
                 panic!("nested boom");
             });
-        }));
+        })).ok();
         e.insert("3");
     });
     assert_eq!((e.text.as_str(), e.history.undo.len()), ("base!123", 1));
@@ -834,7 +837,16 @@ fn pill_edge_cases_words_lines_bidi_and_direct_text_mutation() {
     e.key(&alt_right, None);
     assert_eq!(e.range(), (5, 5));
     e.key(&alt_right, None);
+    // The comma after a pill is a stop of its own, as Chromium's punctuation is.
     assert_eq!(e.range(), (10, 10));
+    e.key(&alt_right, None);
+    // On macOS a word forward ends at the comma's end; elsewhere it goes on past the space to
+    // the next pill's start.
+    let after_comma = if cfg!(target_os = "macos") { 11 } else { 12 };
+    assert_eq!(e.range(), (after_comma, after_comma));
+    e.key(&alt_right, None);
+    assert_eq!(e.range(), (21, 21), "steps over @Maya Lin as one word");
+    e.set_caret(10);
     e.key(&alt_bs, None);
     assert_eq!((e.text.as_str(), pills_of(&e)), ("@maya, @Maya Lin", vec![(0..5, "u:1".to_owned()), (7..16, "u:3".to_owned())]));
 

@@ -9,6 +9,8 @@
 //! producer may write the texture again once the fence reaches the value. A frame replaced before
 //! it was drawn is never read and signals nothing: the next frame's higher value covers it.
 
+#![allow(unsafe_code)]
+
 use super::*;
 use ::windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
 use ::windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_DIMENSION_TEXTURE2D, ID3D12Device, ID3D12Fence, ID3D12Resource};
@@ -80,6 +82,16 @@ static DEVICE: Mutex<Option<ID3D12Device>> = Mutex::new(None);
 
 pub(crate) fn presenting_device() -> Option<ID3D12Device> {
     DEVICE.lock().unwrap().clone()
+}
+
+/// Forgets the last window's device once it is removed. Decoders opening a clip then wait for
+/// the next one (`presenting_device` is None until a window notes it).
+pub(crate) fn release_removed_device() {
+    let mut device = DEVICE.lock().unwrap();
+    // SAFETY: a plain query on a device this slot holds.
+    if device.as_ref().is_some_and(|d| unsafe { d.GetDeviceRemovedReason() }.is_err()) {
+        *device = None;
+    }
 }
 
 /// Counts the windows' D3D12 devices Rune made: it moves when one replaces a lost one, so what
@@ -268,7 +280,7 @@ impl Importer {
         // SAFETY: `handle` is the live handle opened above; `object` receives a new reference.
         let opened = unsafe { device.OpenSharedHandle(handle, &mut object) };
         // SAFETY: `handle` is ours and closed once; the opened object keeps the resource alive.
-        let _ = unsafe { CloseHandle(handle) };
+        unsafe { CloseHandle(handle) }.ok();
         opened.map_err(|e| format!("open shared {name:?}: {e}"))?;
         object.ok_or_else(|| format!("open shared {name:?}: no object"))
     }
@@ -279,7 +291,7 @@ pub(crate) fn release_decoded(queue: &wgpu::Queue, planes: &DecodedPlanes, value
     // SAFETY: the raw queue only gets a signal, ordered after work wgpu already submitted.
     if let Some(raw) = unsafe { queue.as_hal::<Dx12>() } {
         // SAFETY: as above; the fence is live and belongs to this device.
-        let _ = unsafe { raw.as_raw().Signal(&planes.fences.release, value) };
+        unsafe { raw.as_raw().Signal(&planes.fences.release, value) }.ok();
     }
 }
 

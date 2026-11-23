@@ -21,11 +21,37 @@ fn decoded_pixels_wake_windows_only_once_the_image_reports_ready() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (probe, record) = (image.clone(), seen.clone());
     let wake = rune_core::live::Wake::new(Arc::new(move || {
-        record.lock().unwrap().push((probe.is_ready(), probe.size()));
+        record.lock().unwrap().push((probe.is_ready(), probe.size(), probe.pixels().size()));
     }));
     let _subscription = image.pixels().source.subscribe(&wake);
     image.finish(mip_chain(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255]));
-    assert_eq!(*seen.lock().unwrap(), [(true, Some([2, 1]))]);
+    assert_eq!(*seen.lock().unwrap(), [(true, Some([2, 1]), (2, 1))]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn image_wait_and_is_ready_see_decoded_pixels_already_stored() {
+    // Hold the pixels' frame lock while a worker finishes decoding: `is_ready` must stay false
+    // until the mips are stored, so `Image::wait` and `is_ready` never observe empty pixels.
+    let image = Image::new(Arc::new(State { id: [0; 32], pixels: Pixels::new(), decoded: OnceLock::new() }));
+    let decoded = mip_chain(2, 1, &[200, 30, 30, 255, 200, 30, 30, 255]);
+    let guard = image.pixels().hold_frame();
+    let (started_tx, started_rx) = mpsc::channel();
+    let worker = image.clone();
+    let finish = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        worker.finish(decoded);
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let ready_before_store = image.is_ready();
+    drop(guard);
+    finish.join().unwrap();
+    assert!(!ready_before_store, "image reported ready before its pixels held the decoded mips");
+    assert_eq!(image.wait(), Ok([2, 1]));
+    assert_eq!(image.pixels().size(), (2, 1));
+    let mut atlas = crate::pixels::ImageAtlas::default();
+    assert!(atlas.place(image.pixels(), [2.0, 1.0]).is_some(), "decoded pixels place immediately after wait");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,7 +60,7 @@ fn a_small_image_queued_behind_a_large_one_decodes_without_waiting_for_it() {
     if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 { return; }
     let (tx, rx) = mpsc::channel();
     let caller = std::thread::current().id();
-    let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(std::thread::current().id()); }));
+    let cache = ImageCache::new(Arc::new(move || { tx.send(std::thread::current().id()).ok(); }));
     let (release, gate) = mpsc::channel();
     let input = Input::Rgba(128, 128, vec![128; 128 * 128 * 4].into());
     let large = cache.request([8; 32], Input::Gated(Box::new(input), gate));
@@ -83,7 +109,7 @@ fn a_fetch_is_wanted_while_a_handle_or_its_drawn_pixels_live() {
 #[test]
 fn drawn_pixels_keep_their_image_cached_after_the_handle_drops() {
     let (tx, rx) = mpsc::channel();
-    let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(()); }));
+    let cache = ImageCache::new(Arc::new(move || { tx.send(()).ok(); }));
     let image = cache.rgba(1, 1, vec![20, 40, 60, 255]);
     assert_eq!(image.size(), Some([1, 1]));
     assert_eq!(rx.try_recv(), Ok(()), "a fresh inline decode wakes before returning");
@@ -275,7 +301,7 @@ fn a_small_app_icon_matches_the_large_one_scaled_down() {
     let app = synthetic_app(&dir);
     let small = app_icon_rgba(&app, 32).unwrap().2;
     let large = app_icon_rgba(&app, 256).unwrap().2;
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).ok();
     let (mut total, mut count) = (0u32, 0u32);
     for y in 0..32 {
         for x in 0..32 {

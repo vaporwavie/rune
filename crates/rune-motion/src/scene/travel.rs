@@ -15,24 +15,77 @@ impl Scene {
     /// scene rect, measured in `to`'s root space: a scroll offset the renderer applies outside the
     /// scene, which differs between the two places.
     pub fn match_geometry_offset(&mut self, from: NodeId, to: NodeId, offset: Vec2, anim: impl Into<LayoutAnim>) {
+        self.match_geometry_scaled(from, to, 1.0, Vec2::ZERO, Vec2::ZERO, offset, anim);
+    }
+
+    /// [`match_geometry`](Self::match_geometry) for a `from` drawn with `offset` added to its
+    /// scene rect and scaled by `scale` about `anchor` (mapping `anchor` to `anchor_to`): a
+    /// scroll offset and ancestor zoom the renderer applies outside the scene.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_geometry_scaled(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        scale: f32,
+        anchor: Vec2,
+        anchor_to: Vec2,
+        offset: Vec2,
+        anim: impl Into<LayoutAnim>,
+    ) {
+        let Some(a) = self.slot(from) else { return };
+        let (mut start, mut vel) = self.exact_world(a);
+        for k in 0..4 {
+            let (off, anc, anc_to) = if k % 2 == 0 {
+                (offset.x, anchor.x, anchor_to.x)
+            } else {
+                (offset.y, anchor.y, anchor_to.y)
+            };
+            start[k] = anc_to + (start[k] + off - anc) * scale;
+            vel[k] *= scale;
+        }
+        self.finish_match(from, to, start, vel, scale, anim.into());
+    }
+
+    /// [`match_geometry`](Self::match_geometry) for a `from` that was mid-flight with renderer
+    /// edge delta `delta` blended by `travel` (moving at `travel_vel`) and drawn radius scale
+    /// `radius_scale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_geometry_from_flight(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        delta: [f32; 4],
+        travel: Vec2,
+        travel_vel: Vec2,
+        radius_scale: f32,
+        anim: impl Into<LayoutAnim>,
+    ) {
+        let Some(a) = self.slot(from) else { return };
+        let (mut start, mut vel) = self.exact_world(a);
+        let t = [travel.x, travel.y];
+        let tv = [travel_vel.x, travel_vel.y];
+        for k in 0..4 {
+            start[k] += delta[k] * t[k % 2];
+            vel[k] += delta[k] * tv[k % 2];
+        }
+        self.finish_match(from, to, start, vel, radius_scale, anim.into());
+    }
+
+    fn finish_match(&mut self, from: NodeId, to: NodeId, start: [f32; 4], vel: [f32; 4], radius_scale: f32, anim: LayoutAnim) {
         let (Some(a), Some(b)) = (self.slot(from), self.slot(to)) else { return };
-        let anim = anim.into();
         if self.store.reduced_motion() {
             self.remove(from);
             let entrance = Anim::from(self.nodes[b].transition.springs.enter);
-            let acts = self.nodes[b].phase_step(PhaseEvent::FadeIn { entrance });
+            let acts = self.nodes[b].phase_step(&mut self.exiting, PhaseEvent::FadeIn { entrance });
             self.apply(b, acts);
             return;
         }
-        let (mut start, vel) = self.exact_world(a);
-        for (k, edge) in start.iter_mut().enumerate() {
-            *edge += if k % 2 == 0 { offset.x } else { offset.y };
-        }
         let radius = self.current::<Corners>(a, prop::RADIUS).unwrap_or(self.nodes[a].radius);
+        let radius = if (radius_scale - 1.0).abs() > 1e-5 { Corners(radius.0.map(|r| r * radius_scale)) } else { radius };
         let fill = self.current::<Color>(a, prop::FILL).unwrap_or(self.nodes[a].fill);
         let (to_radius, to_fill) = (self.nodes[b].radius, self.nodes[b].fill);
         // `to` is the one surface from now on: fully present, no presence effect.
-        let acts = self.nodes[b].phase_step(PhaseEvent::Appear);
+        let acts = self.nodes[b].phase_step(&mut self.exiting, PhaseEvent::Appear);
         self.apply(b, acts);
         self.start_path(b, start, vel, anim);
         self.track_set(b, prop::RADIUS, radius);
@@ -43,6 +96,14 @@ impl Scene {
         self.remove_now(a);
     }
 
+    /// Where node `id`'s screen path ends in scene root space (`end_local + parent_target_origin`),
+    /// or `None` when `id` is not on a screen path.
+    pub fn path_end(&self, id: NodeId) -> Option<Rect> {
+        let i = self.slot(id)?;
+        let path = self.nodes[i].path?;
+        Some(path.end_local.translated(self.parent_target_origin(i)))
+    }
+
     /// Starts `id`, fully present, at `start` (root space) on one straight root-space path to
     /// its own layout: [`match_geometry`](Self::match_geometry) from a place no node was.
     /// Under Reduce Motion it keeps its own entrance.
@@ -50,7 +111,7 @@ impl Scene {
         let Some(i) = self.slot(id) else { return };
         if self.store.reduced_motion() { return; }
         let anim = anim.into();
-        let acts = self.nodes[i].phase_step(PhaseEvent::Appear);
+        let acts = self.nodes[i].phase_step(&mut self.exiting, PhaseEvent::Appear);
         self.apply(i, acts);
         self.start_path(i, start.edges(), [0.0; 4], anim);
         self.intent(id, Intent::POSITION, anim.y.curve.logical_duration());

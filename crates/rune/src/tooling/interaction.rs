@@ -103,7 +103,7 @@ fn slow_ms() -> f64 {
     #[cfg(test)]
     if let Some(ms) = SLOW_MS_OVERRIDE.get() { return ms; }
     static MS: OnceLock<f64> = OnceLock::new();
-    *MS.get_or_init(|| std::env::var("RUNE_PERF_SLOW_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|ms: &f64| *ms > 0.0).unwrap_or(SLOW_MS))
+    *MS.get_or_init(|| rune_core::env::var("RUNE_PERF_SLOW_MS").and_then(|v| v.trim().parse().ok()).filter(|ms: &f64| *ms > 0.0).unwrap_or(SLOW_MS))
 }
 
 /// What one input action was, before the frame it lands in is built.
@@ -171,6 +171,9 @@ pub(crate) struct Tracker {
     /// The last commit's memo-reused node ranges (start, len), while a frame is timed.
     pub reused: Vec<(usize, usize)>,
     sent: (Option<Instant>, u32),
+    /// The thread's CPU clock, raw, when the timed frame began: Windows reads it before it knows
+    /// the cycles' rate (the first 20 ms after the process first asks) and converts it once it does.
+    cpu_mark: Option<crate::frame::profile::ThreadCpuMark>,
 }
 
 
@@ -194,7 +197,17 @@ impl Tracker {
     /// A frame starts; `queued` when input waits for it. A built frame no host presented
     /// (a bare `Runtime`, a window that skipped drawing) ends at its build.
     pub(crate) fn frame_begins(&mut self, queued: bool) -> Option<Finished> {
-        self.begin_with(queued, slow_ms(), Instant::now, crate::frame::profile::cpu_ms)
+        // The frame's CPU counts from 0 at a raw mark, converted when it is built: a reading in
+        // milliseconds would be `None` until Windows knows the cycles' rate, and so would the frame's.
+        // A second begin while a frame is open keeps that frame's mark, as it keeps its start.
+        let keep = matches!(self.frame, Frame::Open { .. });
+        let mark = std::cell::Cell::new(None);
+        let finished = self.begin_with(queued, slow_ms(), crate::time::now, || {
+            mark.set(crate::frame::profile::thread_cpu_mark());
+            mark.get().map(|_| 0.0)
+        });
+        if !keep { self.cpu_mark = mark.get(); }
+        finished
     }
 
     fn begin_with(&mut self, queued: bool, slow_ms: f64, now: impl FnOnce() -> Instant, cpu: impl FnOnce() -> Option<f64>) -> Option<Finished> {
@@ -231,7 +244,10 @@ impl Tracker {
     /// The frame, of `nodes` nodes, is built; `shaped` text runs it shaped. A slow frame no
     /// input caused comes back to send.
     pub(crate) fn built(&mut self, shaped: u32, nodes: usize) -> Option<SlowFrame> {
-        self.build_with(shaped, nodes, watchdog::disarm(), slow_ms(), Instant::now, crate::frame::profile::cpu_ms)
+        let mark = self.cpu_mark;
+        self.build_with(shaped, nodes, watchdog::disarm(), slow_ms(), crate::time::now, || {
+            mark.and_then(crate::frame::profile::thread_cpu_since).map(|ns| ns / 1e6)
+        })
     }
 
     fn build_with(&mut self, shaped: u32, nodes: usize, stacks: Option<Stacks>, slow_ms: f64, now: impl FnOnce() -> Instant, cpu: impl FnOnce() -> Option<f64>) -> Option<SlowFrame> {
@@ -287,7 +303,7 @@ impl Tracker {
     /// Sends the histograms when a minute has passed since the last, or `now` regardless.
     pub(crate) fn roll(&mut self, force: bool) {
         let Some(from) = self.rolled_since else { return };
-        let to = Instant::now();
+        let to = crate::time::now();
         if self.rollup.is_empty() || (!force && to.saturating_duration_since(from) < ROLLUP_EVERY) { return; }
         export::send(export::Message::Rollup { rolls: self.rollup.take(), from, to });
         self.rolled_since = None;

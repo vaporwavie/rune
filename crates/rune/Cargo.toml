@@ -4,6 +4,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 description = "GPU-rendered Rust UI framework (wgpu, winit) with keyed element trees, Taffy layout, analytic springs, and headless tooling."
+autotests = false
 
 [features]
 default = ["accessibility", "dbus", "embedded-fonts", "metal-backend", "ogg-audio", "svg", "rune-gpu/default", "rune-image/default", "rune-media/default", "rune-text/default"]
@@ -54,13 +55,13 @@ svg = ["rune-image/svg", "rune-text/svg"]
 # rav1d's assembly. Off, AVIF bytes resolve to `Image::error`. No effect on web, where the
 # browser decodes AVIF.
 avif = ["rune-image/avif"]
-# Linux desktop services over D-Bus (zbus, with a tokio runtime on each service's thread): the
-# desktop's light or dark preference (the Settings portal), the system tray (`Tray`), global
-# shortcuts on Wayland (the GlobalShortcuts portal) and, with `native-file-dialog`, the
-# FileChooser portal. Off, neither crate is compiled: a window winit gives no theme draws dark,
+# Linux desktop services over D-Bus (zbus over async-io): the desktop's light or dark preference
+# (the Settings portal), the system tray (`Tray`), global shortcuts on Wayland (the
+# GlobalShortcuts portal) and, with `native-file-dialog`, the FileChooser portal. Off, those
+# D-Bus crates are not compiled for Rune's own services: a window winit gives no theme draws dark,
 # `Tray::new` returns `TrayError::Unsupported` on Linux and a Wayland session's global shortcuts
 # return `ShortcutError::Unsupported`; X11 shortcuts keep working. No effect on other platforms.
-dbus = ["dep:serde", "dep:zbus", "dep:tokio", "dep:futures-util"]
+dbus = ["dep:async-channel", "dep:async-executor", "dep:async-io", "dep:futures-lite", "dep:serde", "dep:zbus"]
 # macOS and iOS: Rune's native Metal backend (research/34). Mac apps draw with it by default; an
 # app opts out with `App::gpu_backend(GpuBackend::Wgpu)`, or a launch with `RUNE_GPU_BACKEND=wgpu`,
 # and an app built with `default-features = false` draws with wgpu unless it adds this feature.
@@ -139,31 +140,29 @@ rfd = { version = "0.17", optional = true, default-features = false }
 
 # Metal on macOS and iOS: present timing and system materials on macOS.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-objc2-video = { package = "objc2", version = "0.6" }
+block2 = { workspace = true }
+objc2 = { workspace = true }
 objc2-core-foundation = { workspace = true, features = ["std", "CFArray", "CFCGTypes", "CFDictionary", "CFNumber", "CFPreferences", "CFString", "objc2"] }
+objc2-foundation = { workspace = true, features = ["std", "NSString"] }
 objc2-metal = { workspace = true, features = ["std", "MTLDrawable", "block2", "objc2-core-foundation"] }
 # wgpu's Metal backend on Apple targets alone: off Apple, wgpu compiles neither `wgpu-hal/metal`
 # nor `naga/msl-out`.
 wgpu = { workspace = true, features = ["metal"] }
-objc2-foundation-video = { package = "objc2-foundation", version = "0.3", default-features = false, features = ["std", "NSString"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accesskit_macos = { version = "0.27.2", optional = true }
 # Names for the interaction watchdog's stack samples (`tooling::interaction::stack`).
 rustc-demangle = "0.1"
-objc2 = { workspace = true }
-block2 = { workspace = true }
-objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSAttributedString", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSObject", "NSRange", "NSValue", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSUserDefaults"] }
-objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSPanel", "NSScreen", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSAttributedString"] }
+objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSAttributedString", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSObject", "NSRange", "NSValue", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
+objc2-app-kit = { workspace = true, features = ["std", "bitflags", "objc2-core-foundation", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSPanel", "NSScreen", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSAttributedString"] }
 objc2-core-video = { workspace = true, features = ["std", "CVBase", "CVDisplayLink", "CVHostTime", "CVReturn", "objc2-core-graphics"] }
-block2-metal = { package = "block2", version = "0.6" }
 objc2-core-graphics = { workspace = true, features = ["std", "CGColorSpace"] }
 
 [target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))'.dependencies]
 raw-window-handle = "0.6"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 x11rb = { version = "0.13", features = ["shape", "xinput", "randr", "allow-unsafe-code", "dl-libxcb"] }
 xkbcommon = "0.9"
@@ -185,12 +184,14 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Wind
 [target.'cfg(target_os = "linux")'.dependencies]
 # AT-SPI over D-Bus on its own async-io thread, started only when the desktop's accessibility bus is on.
 accesskit_unix = { version = "0.24.1", optional = true }
+async-channel = { version = "2", optional = true }
+async-executor = { version = "1", optional = true }
+async-io = { version = "2", optional = true }
+futures-lite = { version = "2", default-features = false, features = ["std"], optional = true }
 libc = { workspace = true }
 libloading = "0.8"
 serde = { workspace = true, optional = true }
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"], optional = true }
-tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
-futures-util = { version = "0.3", optional = true }
+zbus = { version = "5.19", default-features = false, features = ["async-io"], optional = true }
 
 # wgpu's Vulkan backend everywhere but Windows (D3D12 above) and Apple (Metal above).
 [target.'cfg(all(not(target_vendor = "apple"), not(target_arch = "wasm32"), not(target_os = "windows")))'.dependencies]
@@ -241,6 +242,21 @@ required-features = ["frame-profile"]
 [[example]]
 name = "scroll_commits"
 required-features = ["frame-profile"]
+
+[[test]]
+name = "integration"
+
+[[test]]
+name = "alloc"
+
+[[test]]
+name = "extra_args"
+
+[[test]]
+name = "measure_scope"
+
+[[test]]
+name = "pixels_streaming"
 
 [[test]]
 name = "macos_appearance_kvo"

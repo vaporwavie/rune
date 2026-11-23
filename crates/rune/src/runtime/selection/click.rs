@@ -152,14 +152,29 @@ impl RuntimeCore {
         let z = if valid { self.paint.drawn_scale.get(i).copied().unwrap_or(1.0).max(1e-4) } else { 1.0 };
         let [mut ox, oy] = links::origin(n, spec, flow, rect, s, z);
         if inp.single_line {
-            ox -= self.edit.input_scroll.get(&n.path).copied().unwrap_or(0.0) * z;
+            ox -= self.edit.single_line_scroll(&n.path) * z;
         }
         Some([(ux - ox) / z, (uy - oy) / z])
     }
 
+    /// Whether dragging from `from` to `to` in text field `i` selects a non-empty range.
+    pub(in crate::runtime) fn input_drag_selects(&self, i: usize, from: (f32, f32), to: (f32, f32)) -> bool {
+        if from == to {
+            return false;
+        }
+        let n = &self.tree.nodes[i];
+        let (Some(inp), Some(laid)) = (n.input.as_deref(), n.text_layout.as_ref()) else { return false };
+        let (Some([x0, y0]), Some([x1, y1])) = (self.input_text_point(i, from.0, from.1), self.input_text_point(i, to.0, to.1)) else { return false };
+        let flow = laid.view();
+        let s = self.env.scale;
+        let a = unit_at(&inp.edit, hit(&inp.edit, flow, x0, y0, s, inp.single_line), Unit::Char);
+        let b = unit_at(&inp.edit, hit(&inp.edit, flow, x1, y1, s, inp.single_line), Unit::Char);
+        a != b
+    }
+
     /// A press at (x, y) on text field `ji`, down at `down_at`; `second` when it's the second
-    /// of a double press.
-    pub(in crate::runtime) fn input_down(&mut self, ji: usize, x: f32, y: f32, down_at: f64, second: bool) {
+    /// of a double press; `link` when the press landed on a link in `ji`'s own text.
+    pub(in crate::runtime) fn input_down(&mut self, ji: usize, x: f32, y: f32, down_at: f64, second: bool, link: Option<usize>) {
         let now = self.now_clock();
         let shift = self.kbd.held_mods.shift;
         // Its text drew scaled or rotated with its box: map the press back to the rest layout.
@@ -173,6 +188,7 @@ impl RuntimeCore {
         } else {
             self.edit.input_click.presses.press(&path, now, (x, y), self.double_click_interval).min(3) as u8
         };
+        let link = link.filter(|_| !shift && clicks == 1);
         self.edit.input_click.capture = Capture::Held { dragging: Some(path.clone()) };
         self.edit.input_click.steps.push_back((path.clone(), Step::Down { clicks, shift }));
         self.frame.queue.push(Action::Focus(path.clone(), x, y));
@@ -192,7 +208,9 @@ impl RuntimeCore {
             window: [x, y],
             screen: self.screen_at(x, y),
         };
-        self.pointer.press.hold(capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), down_at, second, None));
+        self.pointer.hold_press(
+            capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), down_at, second, None).on_link(link),
+        );
     }
 
     /// Focuses text field `ji` with its caret at (x, y), as a single click does, but holds no
@@ -210,11 +228,11 @@ impl RuntimeCore {
             return;
         }
         let Some(path) = self.edit.input_click.dragging_path().map(str::to_owned) else { return };
-        if self.pointer.press.held().is_some_and(|h| !press_run::within_slop(h.at, (x, y))) {
+        if self.pointer.press_held().is_some_and(|h| !press_run::within_slop(h.at, (x, y))) {
             self.edit.input_click.presses.clear();
         }
         if !self.tree.nodes.iter().enumerate().any(|(i, n)| n.path == path && !self.subtree_exiting(i) && n.input.is_some()) {
-            self.edit.input_click.drop_drag();
+            self.edit.drop_input_drag();
             return;
         }
         self.edit.input_click.steps.push_back((path.clone(), Step::Drag));
@@ -234,11 +252,11 @@ impl RuntimeCore {
             .find(|&(i, n)| n.path == path && !self.subtree_exiting(i) && !self.subtree_unmounted(i))
             .map(|(i, _)| i)
         else {
-            self.edit.input_click.drop_drag();
+            self.edit.drop_input_drag();
             return false;
         };
         let Some(access) = self.tree.nodes[i].input.as_ref().and_then(|inp| inp.access.clone()) else {
-            self.edit.input_click.drop_drag();
+            self.edit.drop_input_drag();
             return false;
         };
         let single = self.tree.nodes[i].input.as_ref().is_some_and(|inp| inp.single_line);
@@ -257,7 +275,7 @@ impl RuntimeCore {
                 e.break_history_group();
                 e.clear_typing_style();
                 if e.preedit().is_some() {
-                    self.edit.input_click.clear();
+                    self.edit.clear_input_click();
                     one.commit = one.commit.instant();
                     return true;
                 }
@@ -275,6 +293,8 @@ impl RuntimeCore {
                             _ => Unit::Paragraph,
                         };
                         let origin = unit_at(e, h, unit);
+                        // Not after a pill: it is a word of its own.
+                        let origin = if unit == Unit::Word && e.pills().all(|(r, _)| (r.start, r.end) != origin) { super::selectable::with_trailing_space(&e.text, origin) } else { origin };
                         self.edit.input_click.unit = unit;
                         self.edit.input_click.origin = origin;
                         e.set_selection(origin.0, origin.1);
@@ -287,13 +307,13 @@ impl RuntimeCore {
             }
             Step::Drag => {
                 if self.kbd.focus.path() != Some(path.as_str()) {
-                    self.edit.input_click.drop_drag();
+                    self.edit.drop_input_drag();
                     return false;
                 }
                 let e = access(app.states());
                 e.set_single_line(single);
                 if e.preedit().is_some() {
-                    self.edit.input_click.clear();
+                    self.edit.clear_input_click();
                     return false;
                 }
                 let (Some(l), Some([tx, ty])) = (layout, point) else { return false };

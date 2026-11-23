@@ -1,7 +1,7 @@
 //! Accessibility on the OS side: each window and overlay gets an AccessKit platform adapter
 //! (UI Automation on Windows, NSAccessibility on macOS, AT-SPI on Linux). The adapter's
 //! handlers run wherever the OS calls them; they only queue what they heard and wake the host,
-//! whose thread then activates the runtime's tree (`runtime/a11y/tree.rs`), runs the actions
+//! whose thread then activates the runtime's tree (`a11y/tree.rs`), runs the actions
 //! and sends tree updates. Until a client asks, the runtime builds nothing.
 #![cfg_attr(not(all(feature = "accessibility", any(target_os = "windows", target_os = "macos", target_os = "linux"))), allow(dead_code))]
 
@@ -11,8 +11,18 @@ use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHan
 
 use crate::runtime::Runtime;
 
+pub(crate) mod actions;
+#[cfg(test)]
+mod actions_tests;
 pub(crate) mod dump;
+#[cfg(test)]
+mod dump_tests;
+mod node;
 pub(crate) mod roles;
+#[cfg(test)]
+mod tests;
+mod text;
+pub(crate) mod tree;
 
 #[cfg(all(feature = "accessibility", target_os = "macos"))]
 mod macos;
@@ -36,7 +46,7 @@ impl Announcement {
         self.text = text;
         self.how = how;
         self.said = self.said.wrapping_add(1);
-        self.at = Some(crate::time::Instant::now());
+        self.at = Some(crate::time::now());
     }
 
     pub(crate) fn said(&self) -> u32 { self.said }
@@ -164,10 +174,13 @@ impl AccessibilityLink {
     fn receive(&mut self, rt: &mut crate::runtime::RuntimeCore, name: &str) -> bool {
         self.adopt(rt);
         let inbox = self.take();
+        let mut queued = false;
         if inbox.settings {
+            let was_dirty = rt.commit.dirty;
             rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
             rt.set_system_contrast(crate::platform::preferences::contrast());
             rt.set_system_increased_contrast(crate::platform::preferences::increased_contrast());
+            queued |= !was_dirty && rt.commit.dirty;
         }
         match inbox.asked {
             Asked::Activate => rt.a11y_activate(name),
@@ -178,7 +191,6 @@ impl AccessibilityLink {
             let said = if inbox.asked == Asked::Activate { "activated" } else { "deactivated" };
             eprintln!("rune: a11y {name:?}: {said}");
         }
-        let mut queued = false;
         for request in &inbox.actions {
             let ran = rt.a11y_action(request);
             if log() { eprintln!("rune: a11y {name:?}: {:?} on {:?} {}", request.action, request.target_node, if ran { "queued" } else { "refused" }); }
@@ -189,7 +201,7 @@ impl AccessibilityLink {
 
     fn update(&mut self, rt: &mut crate::runtime::RuntimeCore) -> Option<TreeUpdate> {
         self.adopt(rt);
-        let started = log().then(crate::time::Instant::now);
+        let started = log().then(crate::time::now);
         let update = rt.a11y_update()?;
         if let Some(t) = started { eprintln!("rune: a11y update: {} nodes in {:.0} us", update.nodes.len(), t.elapsed().as_secs_f64() * 1e6); }
         Some(update)
@@ -282,7 +294,7 @@ impl Adapter {
     /// adapter existed asks again.
     pub(crate) fn notify_structure(&self) {
         #[cfg(all(feature = "accessibility", target_os = "windows"))]
-        self.inner.notify(crate::runtime::a11y_tree::Changes { structure: true, moved: false });
+        self.inner.notify(tree::Changes { structure: true, moved: false });
     }
 
     /// Sends the tree's changes since the last update, when a client listens.

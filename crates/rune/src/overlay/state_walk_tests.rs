@@ -160,7 +160,7 @@ fn ours_gate(decided: Turn, prewarm: bool, backoff: &mut Backoff, now: Instant) 
             if recheck { backoff.step(BackoffEvent::Missed { missed: Missed::Occluded, paced: false, now }); }
             (true, recheck, backoff.deadline())
         }
-        Turn::Rest | Turn::BackedOff => (true, false, backoff.deadline()),
+        Turn::Rest | Turn::BackedOff | Turn::AwaitingFrame => (true, false, backoff.deadline()),
         Turn::Draw => {
             if !prewarm { backoff.step(BackoffEvent::Lapsed); }
             (false, false, backoff.deadline())
@@ -185,7 +185,7 @@ fn occluded_wait(backoff: Backoff, now: Instant) -> Duration {
 
 #[test]
 fn turn_matches_dev_for_every_gate() {
-    let now = Instant::now();
+    let now = crate::time::now();
     let ms = Duration::from_millis(1);
     let retries = [None, Some(now - ms), Some(now), Some(now + ms)];
     let waits = [OCCLUDED_RETRY, Duration::from_millis(600), OCCLUDED_MAX];
@@ -196,7 +196,7 @@ fn turn_matches_dev_for_every_gate() {
             for start_wait in waits {
                 cases += 1;
                 let reads = std::cell::Cell::new(0);
-                let decided = turn(Gate { prewarm, occluded, dirty, idle, retry: start, missed_this_turn: false }, || { reads.set(reads.get() + 1); now });
+                let decided = turn(Gate { prewarm, occluded, awaiting_frame: false, dirty, idle, retry: start, missed_this_turn: false }, || { reads.set(reads.get() + 1); now });
                 let (mut dev_retry, mut dev_wait) = (start, start_wait);
                 let mut ours = backoff_start(start, start_wait);
                 let arms = ours_gate(decided, prewarm, &mut ours, now);
@@ -216,7 +216,7 @@ struct TurnOp { delta: Duration, occluded: bool }
 
 #[test]
 fn occluded_misses_back_off_like_dev() {
-    let base = Instant::now();
+    let base = crate::time::now();
     let alphabet = [
         TurnOp { delta: Duration::ZERO, occluded: true },
         TurnOp { delta: Duration::from_millis(100), occluded: true },
@@ -230,7 +230,7 @@ fn occluded_misses_back_off_like_dev() {
         let mut now = base;
         for (i, &op) in seq.iter().enumerate() {
             now = now + op.delta;
-            let decided = turn(Gate { prewarm: false, occluded: op.occluded, dirty: false, idle: true, retry: ours.deadline(), missed_this_turn: false }, || now);
+            let decided = turn(Gate { prewarm: false, occluded: op.occluded, awaiting_frame: false, dirty: false, idle: true, retry: ours.deadline(), missed_this_turn: false }, || now);
             let ours_arms = ours_gate(decided, false, &mut ours, now);
             let dev_arms = dev_gate(false, op.occluded, false, true, &mut dev.0, &mut dev.1, now);
             assert_eq!(ours_arms, dev_arms, "{seq:?} at {i}");
@@ -284,7 +284,7 @@ enum BackoffOp {
 /// Both sides take `seq` on a manual clock, checked after every event. `prewarm`: a prewarm
 /// frame, which leaves the wait alone. `scale`: how far each event is from the last.
 fn holds_up(seq: &[BackoffOp], prewarm: bool, scale: u32) {
-    let t0 = Instant::now();
+    let t0 = crate::time::now();
     let mut dev = DevBackoff::new(OCCLUDED_RETRY);
     let mut ours = Backoff::default();
     for (k, &op) in seq.iter().enumerate() {
@@ -623,4 +623,134 @@ fn surface_matches_dev_for_every_sequence() {
     assert!(parked_after_attach > 0, "an attach that fails leaves its window parked");
     assert!(live_after_rescale > 0, "a rescale that fails leaves the overlay live");
     assert!(released_live > 0 && released_parked > 0, "release gives a live or a parked window back");
+}
+
+#[test]
+fn park_after_wayland_hide_releases_gpu_renderer_and_surface_description() {
+    use std::sync::Arc;
+    use super::{AppSpec, Overlay, OverlaySpec};
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Renderer};
+    use crate::{Cx, El};
+
+    fn view(_: &(), _: &mut Cx<()>) -> El { crate::el().size(16.0, 16.0) }
+    let app = AppSpec::new("wayland-park", (16.0, 16.0), || (), view);
+    let make = || {
+        Overlay::new(
+            OverlaySpec::new("wayland-park", app.size, view).options(Default::default()).release_gpu_when_hidden(),
+            (),
+            &app,
+        )
+    };
+
+    // Shared device: another surface keeps an Arc<Gpu> clone alive.
+    let shared_gpu = Arc::new(Gpu::headless());
+    let (mut overlay, handle) = make();
+    overlay.core.gpu = Some(shared_gpu.clone());
+    overlay.core.renderer = Some(Renderer::new(&shared_gpu.device, OFFSCREEN_FORMAT));
+    *overlay.shared.core.surface.lock().unwrap() = Some("Vulkan on mock".into());
+    // On Wayland, hide_window already dropped the surface (self.surface is Surface::None).
+    assert!(overlay.core.surface.live().is_none());
+    overlay.core.park();
+    assert!(overlay.core.gpu.is_none(), "park must release its shared GPU handle when the surface is already gone");
+    assert!(overlay.core.renderer.is_none(), "park must drop its renderer when the surface is already gone");
+    assert!(handle.surface_description().is_none(), "park must clear the surface description");
+    assert_eq!(Arc::strong_count(&shared_gpu), 1, "only the external holder keeps the shared device alive");
+
+    // Sole device: Arc::try_unwrap succeeds and parks the device and renderer.
+    let sole_gpu = Arc::new(Gpu::headless());
+    let (mut overlay, handle) = make();
+    overlay.core.renderer = Some(Renderer::new(&sole_gpu.device, OFFSCREEN_FORMAT));
+    overlay.core.gpu = Some(sole_gpu);
+    *overlay.shared.core.surface.lock().unwrap() = Some("Vulkan on mock".into());
+    overlay.core.park();
+    assert!(overlay.core.gpu.is_none(), "park must release its sole GPU handle when the surface is already gone");
+    assert!(overlay.core.renderer.is_none(), "park must release its renderer when the surface is already gone");
+    assert!(handle.surface_description().is_none(), "park must clear the surface description");
+    crate::render::discard_prewarm();
+}
+
+#[test]
+fn wayland_hide_drops_pixels_references_atlas_pages_and_gpu_textures_and_reuploads_on_next_frame() {
+    use std::sync::Arc;
+    use super::{AppSpec, Overlay, OverlaySpec};
+    use crate::el::InlineImage;
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    use crate::{Cx, El, Pixels};
+
+    struct State {
+        frame: Option<Pixels>,
+        memo_frame: Option<Pixels>,
+        inline_frame: Option<Pixels>,
+    }
+    fn view(s: &State, _: &mut Cx<State>) -> El {
+        let mut root = crate::el().size(16.0, 16.0);
+        if let Some(px) = &s.frame {
+            root = root.child(crate::el().key("shot").size(4.0, 4.0).pixels(px));
+        }
+        if let Some(px) = &s.memo_frame {
+            let px = px.clone();
+            root = root.child(crate::memo("memo-shot", 1u64, move || crate::el().size(4.0, 4.0).pixels(&px)));
+        }
+        if let Some(px) = &s.inline_frame {
+            root = root.child(crate::text("x").inline_image(0..1, InlineImage::new(px.clone(), 4.0, 4.0, 0.0)));
+        }
+        root
+    }
+    let make_px = |rgba: [u8; 4]| {
+        let p = Pixels::new();
+        p.set(4, 4, rgba.repeat(16));
+        p
+    };
+    let shot = make_px([200, 40, 20, 255]);
+    let memo_shot = make_px([20, 200, 40, 255]);
+    let inline_shot = make_px([20, 40, 200, 255]);
+    let weak_shot = Arc::downgrade(&shot.source);
+    let weak_memo = Arc::downgrade(&memo_shot.source);
+    let weak_inline = Arc::downgrade(&inline_shot.source);
+
+    let app = AppSpec::new("wayland-images", (16.0, 16.0), || State { frame: None, memo_frame: None, inline_frame: None }, view);
+    let spec = OverlaySpec::new("wayland-images", app.size, view).options(Default::default());
+    let (mut overlay, _) = Overlay::new(spec, State {
+        frame: Some(shot),
+        memo_frame: Some(memo_shot),
+        inline_frame: Some(inline_shot),
+    }, &app);
+    let gpu = Arc::new(Gpu::headless());
+    overlay.core.renderer = Some(Renderer::new(&gpu.device, OFFSCREEN_FORMAT));
+    overlay.core.gpu = Some(gpu.clone());
+    overlay.rt.frame(0.0);
+    overlay.warm_offscreen((16, 16));
+    assert!(!overlay.rt.images.pages.is_empty(), "frame uploaded image pages");
+    assert!(overlay.core.renderer.as_ref().unwrap().has_images(), "renderer holds uploaded image textures");
+
+    // Hide drops CPU atlas pages, GPU textures and tree/memo Pixels references with no extra frame.
+    overlay.drop_hidden_images();
+    overlay.rt.state = State { frame: None, memo_frame: None, inline_frame: None };
+    assert!(overlay.rt.images.pages.is_empty(), "hidden overlay drops CPU image atlas pages");
+    assert!(!overlay.core.renderer.as_ref().unwrap().has_images(), "hidden overlay drops GPU image textures");
+    assert!(weak_shot.upgrade().is_none(), "tree no longer pins El::pixels handle");
+    assert!(weak_memo.upgrade().is_none(), "memo cache no longer pins El::pixels handle");
+    assert!(weak_inline.upgrade().is_none(), "text pills no longer pin inline image handle");
+
+    // Showing again with unchanged state rebuilds the view and re-uploads its image.
+    let kept = make_px([12, 180, 90, 255]);
+    overlay.rt.state.frame = Some(kept);
+    overlay.rt.invalidate();
+    overlay.rt.frame(0.0);
+    overlay.warm_offscreen((16, 16));
+    overlay.drop_hidden_images();
+    assert!(overlay.rt.images.pages.is_empty());
+    assert!(!overlay.core.renderer.as_ref().unwrap().has_images());
+    // State is unchanged: next frame must still rebuild and draw the kept image.
+    overlay.rt.frame(0.0);
+    let target = Offscreen::new(&gpu.device, 16, 16);
+    let mut enc = gpu.device.create_command_encoder(&Default::default());
+    overlay.render_offscreen(&gpu, &mut enc, &target.view, OFFSCREEN_FORMAT, (16, 16), 0.0);
+    target.copy(&mut enc);
+    overlay.core.renderer.as_mut().unwrap().submit(&gpu.queue, enc);
+    let out = target.read(&gpu.device);
+    assert!(overlay.core.renderer.as_ref().unwrap().has_images(), "next show re-uploads the image");
+    for (got, want) in out[..4].iter().zip([12u8, 180, 90, 255]) {
+        assert!(got.abs_diff(want) <= 1, "expected kept image pixel {want}, got {got}");
+    }
 }

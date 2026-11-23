@@ -27,7 +27,7 @@ pub(crate) struct KeyInput {
 }
 
 /// Host-neutral wheel input in window points (before dividing by `rt.zoom()`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WheelInput {
     pub dx: f32,
     pub dy: f32,
@@ -35,7 +35,7 @@ pub(crate) struct WheelInput {
     pub phase: crate::GesturePhase,
     pub precise: bool,
     pub notch: bool,
-    /// Whether Ctrl+wheel tries `pinch_wheel` before scrolling (true off macOS).
+    /// Whether Ctrl+wheel tries `pinch_wheel` before scrolling.
     pub pinch: bool,
 }
 
@@ -168,6 +168,7 @@ pub(crate) fn gesture_phase(phase: TouchPhase) -> crate::GesturePhase {
 /// Whether the mouse message being handled is one Windows synthesized from a touch or pen
 /// (`GetMessageExtraInfo` carries `MI_WP_SIGNATURE`).
 #[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
 pub(crate) fn touch_promoted() -> bool {
     const MI_WP_SIGNATURE: u32 = 0xFF51_5700;
     // SAFETY: reads the calling thread's current message info; no pointers involved.
@@ -401,7 +402,10 @@ pub(crate) fn wheel(
             phase,
             precise,
             notch,
-            pinch: !cfg!(target_os = "macos"),
+            // On macOS too: Chromium hands a page Ctrl + wheel and a trackpad pinch alike, as a
+            // wheel with `ctrlKey`, so a zoom handler hears both (`MagnifyEvent::wheel` tells them
+            // apart); a real pinch still arrives as its own gesture.
+            pinch: true,
         },
     );
 }
@@ -441,10 +445,83 @@ pub(crate) fn ime_core(rt: &mut RuntimeCore, select: Option<Range<usize>>, ime: 
     rt.ime(ime);
 }
 
+/// Host-side record of what was last sent to the native window's input method, so unchanged
+/// frames don't re-submit the cursor area. On Wayland each `set_ime_cursor_area` commits
+/// `zwp_text_input_v3`, which prompts a `done` reply and wakes the window for another frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) enum ImeSync {
+    #[default]
+    Disabled,
+    Enabled { sent: Option<([f32; 4], f32)> },
+}
+
+/// Native window IME calls needed for one frame or focus sync.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct ImeStep {
+    pub(crate) cancel: bool,
+    pub(crate) set_allowed: Option<bool>,
+    pub(crate) cursor_area: Option<[f32; 4]>,
+}
+
+impl ImeSync {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    /// Clears host IME state when the window disables IME directly (focus loss, hide, creation).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn clear(&mut self) {
+        *self = Self::Disabled;
+    }
+
+    /// Drops the last-sent cursor area while keeping the current enabled state, so the next sync
+    /// resends it (for example after `Ime::Enabled` when Wayland's `text_input` enters after
+    /// `set_ime_allowed(true)` already ran).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn invalidate_area(&mut self) {
+        if let Self::Enabled { sent } = self {
+            *sent = None;
+        }
+    }
+
+    /// Advances host IME state for one sync and returns the window calls to issue.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn step(
+        &mut self,
+        reset: bool,
+        area: Option<[f32; 4]>,
+        secure_focus: bool,
+        focused: bool,
+        scale: f32,
+    ) -> ImeStep {
+        let allowed = area.is_some() && !secure_focus && focused;
+        let set_allowed = if reset || allowed != self.is_enabled() {
+            *self = if allowed { Self::Enabled { sent: None } } else { Self::Disabled };
+            Some(allowed)
+        } else {
+            None
+        };
+        let cursor_area = match (self, area) {
+            (Self::Enabled { sent }, Some(a)) if *sent != Some((a, scale)) => {
+                *sent = Some((a, scale));
+                Some(a)
+            }
+            _ => None,
+        };
+        ImeStep { cancel: reset, set_allowed, cursor_area }
+    }
+}
+
 /// Translates a winit `Ime` event (plus any native reconversion range and clauses) into the
 /// runtime.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) fn ime(rt: &mut RuntimeCore, window: &Window, ime: WIme) {
+pub(crate) fn ime(rt: &mut RuntimeCore, window: &Window, ime_state: &mut ImeSync, ime: WIme) {
+    if matches!(ime, WIme::Enabled | WIme::Disabled) {
+        ime_state.invalidate_area();
+    }
     let select = crate::platform::ime::take_select(window);
     let event = match ime {
         WIme::Preedit(s, cur) => {
@@ -503,16 +580,22 @@ pub(crate) fn pointer_cancel(
     true
 }
 
+/// Computes the IME sync step for `rt` and advances `ime_state`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn ime_sync_step(rt: &mut RuntimeCore, ime_state: &mut ImeSync, focused: bool) -> ImeStep {
+    let (reset, area) = ime_sync_state(rt);
+    ime_state.step(reset, area, rt.has_secure_focus(), focused, rt.window_scale())
+}
+
 /// Synchronizes a window's OS IME allowance, cursor area, and published text with the runtime.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) fn sync_ime(window: &Window, rt: &mut RuntimeCore, ime_state: &mut bool, focused: bool) {
-    let (reset, area) = ime_sync_state(rt);
-    let ime_allowed = area.is_some() && !rt.has_secure_focus() && focused;
-    if reset { crate::platform::ime::cancel(window); }
-    if reset || ime_allowed != *ime_state {
+pub(crate) fn sync_ime(window: &Window, rt: &mut RuntimeCore, ime_state: &mut ImeSync, focused: bool) {
+    let step = ime_sync_step(rt, ime_state, focused);
+    let ime_allowed = ime_state.is_enabled();
+    if step.cancel { crate::platform::ime::cancel(window); }
+    if let Some(allowed) = step.set_allowed {
         window.set_ime_allowed(false);
-        window.set_ime_allowed(ime_allowed);
-        *ime_state = ime_allowed;
+        if allowed { window.set_ime_allowed(true); }
     }
     #[cfg(target_os = "macos")]
     {
@@ -523,7 +606,7 @@ pub(crate) fn sync_ime(window: &Window, rt: &mut RuntimeCore, ime_state: &mut bo
         }
     }
     crate::platform::ime::sync(window, if ime_allowed { rt.ime_text() } else { None });
-    if let Some(a) = area {
+    if let Some(a) = step.cursor_area {
         window.set_ime_cursor_area(
             LogicalPosition::new(a[0] as f64, a[1] as f64),
             LogicalSize::new(a[2] as f64, a[3] as f64),

@@ -25,6 +25,9 @@ struct OverlayFrame<'a> {
     target: Option<Instant>,
     #[cfg(target_os = "macos")]
     materials_checked: bool,
+    /// This frame draws presuming the panel on screen (`OverlayCore::prime`).
+    #[cfg(target_os = "macos")]
+    presume: bool,
     now: Option<Instant>,
     more: bool,
 }
@@ -38,9 +41,10 @@ impl OverlayFrame<'_> {
         ) else {
             return false;
         };
+        let ok = crate::window::reblend_core(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, self.app.rt_mut());
         #[cfg(target_os = "windows")]
-        live.slot.reset();
-        crate::window::reblend_core(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, self.app.rt_mut())
+        live.slot.reconfigured(ok);
+        ok
     }
 }
 
@@ -73,7 +77,7 @@ impl FrameHost for OverlayFrame<'_> {
             }
             if self.core.surface.live().is_some_and(|l| l.scale == 0.0) && let Some(gpu) = self.core.gpu.clone() {
                 // Read before `app` is reborrowed for `rescale`.
-                let scale = self.app.rt().env.scale;
+                let scale = layer_resize_scale(self.app.rt());
                 self.core.rescale(self.app, &gpu, scale);
             }
         }
@@ -99,12 +103,13 @@ impl FrameHost for OverlayFrame<'_> {
         let gate = frame::Gate {
             prewarm: self.prewarm,
             occluded: cfg!(target_os = "macos") && self.core.presence.occluded(),
+            awaiting_frame: self.core.awaiting_layer_frame(),
             dirty: self.core.dirty,
             idle: self.core.idle,
             retry: self.core.backoff.deadline(),
             missed_this_turn: self.core.turn_frame.missed(),
         };
-        match frame::turn(gate, Instant::now) {
+        match frame::turn(gate, crate::time::now) {
             frame::Turn::Occluded { recheck } => {
                 if recheck {
                     self.core.meter.skipped();
@@ -114,6 +119,14 @@ impl FrameHost for OverlayFrame<'_> {
             }
             // `wake_due` runs due timers while it backs off.
             frame::Turn::Rest | frame::Turn::BackedOff => return Gate::Skip,
+            frame::Turn::AwaitingFrame => {
+                if self.app.rt().has_pending_input() {
+                    self.core.commit_at(self.app, crate::time::now());
+                }
+                self.core.meter.skipped();
+                self.core.meter.set_pacing(self.core.pacing_state(true));
+                return Gate::Skip;
+            }
             frame::Turn::Draw => if !self.prewarm { self.core.backoff_step(crate::window::BackoffEvent::Lapsed); },
         }
         // The swap chain still holds a frame the compositor hasn't shown: this one draws when it
@@ -126,6 +139,8 @@ impl FrameHost for OverlayFrame<'_> {
                 return Gate::Skip;
             }
         }
+        #[cfg(target_os = "macos")]
+        { self.presume = !self.prewarm && self.core.prime.presumes(); }
         let (Some(live), Some(renderer)) = (self.core.surface.live_mut(), self.core.renderer.as_ref()) else {
             return Gate::Skip;
         };
@@ -137,7 +152,7 @@ impl FrameHost for OverlayFrame<'_> {
             && !self.app.rt().has_pending_input()
             && renderer.srgb_blend() == self.app.rt().srgb_blend();
         #[cfg(target_os = "macos")]
-        let quiet = quiet && live.pacing.as_ref().is_none_or(|p| p.defers_start(Instant::now()));
+        let quiet = quiet && live.pacing.as_ref().is_none_or(|p| p.defers_start(crate::time::now()));
         if quiet {
             return Gate::QuietTimer;
         }
@@ -157,6 +172,8 @@ impl FrameHost for OverlayFrame<'_> {
         }
         // The present queue's vsync paces redraws where no display link does.
         if !self.prewarm { self.core.meter.redraw(self.paced || !cfg!(target_os = "macos")); }
+        #[cfg(target_os = "macos")]
+        if self.presume { self.core.prime.spend(); }
         Gate::Draw
     }
 
@@ -167,11 +184,11 @@ impl FrameHost for OverlayFrame<'_> {
     fn reblend(&mut self) -> bool { self.reblend_surface() }
 
     fn step_quiet(&mut self) -> StepInfo {
-        let now = Instant::now();
+        let now = crate::time::now();
         self.now = Some(now);
         #[cfg(target_os = "macos")]
         if let Some(live) = self.core.surface.live() {
-            self.app.rt_mut().paint.native_materials = live.materials.native();
+            self.app.rt_mut().paint.set_native_materials(live.materials.native());
         }
         let (animating, dt) = self.app.clock_advance(&mut self.core.clock, now, false);
         StepInfo { runtime_animating: animating, animating, dt, update_ms: 0.0, presents_at: None }
@@ -183,7 +200,7 @@ impl FrameHost for OverlayFrame<'_> {
         };
         #[cfg(target_os = "macos")]
         let next_tick = {
-            let now = self.now.unwrap_or_else(Instant::now);
+            let now = self.now.unwrap_or_else(crate::time::now);
             live.pacing.as_ref().map(|p| p.tick_after(now))
         };
         #[cfg(not(target_os = "macos"))]
@@ -210,12 +227,17 @@ impl FrameHost for OverlayFrame<'_> {
             }
         }
         if !self.prewarm { self.core.meter.redraw(self.paced || !cfg!(target_os = "macos")); }
+        #[cfg(target_os = "macos")]
+        if self.presume { self.core.prime.spend(); }
     }
 
     fn acquire(&mut self) -> Acquire<wgpu::SurfaceTexture> {
         let (Some(live), Some(gpu)) = (self.core.surface.live(), self.core.gpu.as_ref()) else {
             return Acquire::Missed(crate::window::Missed::Unconfigured);
         };
+        // wgpu checks the panel's occlusion itself before it hands out a drawable.
+        #[cfg(target_os = "macos")]
+        let _shown = if self.presume { crate::platform::macos::PresumeShown::new(&live.surface) } else { None };
         match crate::window::acquire_checked(
             &live.surface,
             gpu,
@@ -231,7 +253,7 @@ impl FrameHost for OverlayFrame<'_> {
     }
 
     fn step_runtime(&mut self) -> StepInfo {
-        let now = Instant::now();
+        let now = crate::time::now();
         self.now = Some(now);
         #[cfg(not(target_os = "macos"))]
         let frame_time = now;
@@ -239,7 +261,7 @@ impl FrameHost for OverlayFrame<'_> {
         let frame_time = self.target.unwrap_or(now);
         #[cfg(target_os = "macos")]
         if let Some(live) = self.core.surface.live() {
-            self.app.rt_mut().paint.native_materials = live.materials.native();
+            self.app.rt_mut().paint.set_native_materials(live.materials.native());
         }
         let (animating, dt) = if !self.prewarm && frame::rests(self.app, self.core.runtime_idle, self.core.dirty) {
             frame::rest(self.app, &mut self.core.clock, frame_time)
@@ -259,7 +281,7 @@ impl FrameHost for OverlayFrame<'_> {
             self.materials_checked = true;
             if let Some(live) = self.core.surface.live_mut() {
                 let Backing::Window(window) = &live.backing;
-                if live.materials.update(self.app.rt().transparent, !self.app.rt().paint.materials.is_empty(), window, &live.surface) {
+                if live.materials.update(self.app.rt().transparent, !self.app.rt().paint.materials().is_empty(), window, &live.surface) {
                     return PostStepCheck::Reacquire(ReacquireReason::NativeMaterials);
                 }
             }
@@ -276,7 +298,7 @@ impl FrameHost for OverlayFrame<'_> {
             ReacquireReason::NativeMaterials => {
                 // This drawable presents without the views: build again natively into a new one,
                 // so prewarm and reveal show the material from this frame.
-                self.app.rt_mut().paint.native_materials = true;
+                self.app.rt_mut().paint.set_native_materials(true);
                 let more = self.app.frame(0.0);
                 info.runtime_animating |= more;
                 info.animating |= more;
@@ -295,7 +317,7 @@ impl FrameHost for OverlayFrame<'_> {
     }
 
     fn sync_after_step(&mut self, info: &mut StepInfo) {
-        let now = self.now.unwrap_or_else(Instant::now);
+        let now = self.now.unwrap_or_else(crate::time::now);
         info.update_ms = if self.app.has_compositor() { now.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
         super::input::drop_window_requests(self.app.rt_mut());
         self.core.clipboard.flush_core(self.app.rt_mut());
@@ -360,14 +382,15 @@ impl FrameHost for OverlayFrame<'_> {
             self.core.renderer.as_ref(),
             self.core.gpu.as_ref(),
         ) else {
-            return Instant::now();
+            return crate::time::now();
         };
         frame::submit_and_present(live, renderer, gpu, self.app.rt(), prepared.encoder, prepared.frame, self.prewarm);
         // The next frame waits for the room this one took (`slot`).
         #[cfg(target_os = "windows")]
-        live.slot.presented_surface(&live.surface);
+        live.slot.presented();
+        frame::record_presented(self.prewarm);
         crate::render::gpu_events::presented();
-        Instant::now()
+        crate::time::now()
     }
 
     fn present_targets(&mut self) -> (Option<&mut FrameClock>, &mut RuntimeCore) {
@@ -375,6 +398,17 @@ impl FrameHost for OverlayFrame<'_> {
     }
 
     fn settle(&mut self, submitted: Instant, info: &StepInfo) {
+        // If the device was lost during a layer surface's own present, Mesa never committed the
+        // buffer or the `wl_surface.frame` callback we just requested, so take the surface down
+        // instead of waiting on a callback that will never arrive.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if matches!(self.core.surface.live().map(|l| &l.backing), Some(Backing::Layer(_)))
+            && self.core.gpu.as_ref().is_some_and(|gpu| gpu.is_lost())
+        {
+            self.core.surface_refused(self.app, "its GPU device was lost".into());
+            self.more = false;
+            return;
+        }
         if !self.prewarm { self.core.meter.presented(); }
         self.core.dirty = false;
         let Some(live) = self.core.surface.live_mut() else {
@@ -415,8 +449,8 @@ impl FrameHost for OverlayFrame<'_> {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = submitted;
-            if !self.prewarm { self.core.meter.set_pacing(if self.core.idle { crate::Pacing::Idle } else { crate::Pacing::Vsync }); }
-            self.more = !self.core.idle;
+            if !self.prewarm { self.core.meter.set_pacing(self.core.pacing_state(!self.core.idle)); }
+            self.more = frame::wants_more(self.core.idle, self.core.awaiting_layer_frame());
         }
     }
 }
@@ -424,7 +458,7 @@ impl FrameHost for OverlayFrame<'_> {
 impl OverlayCore {
     /// Draws a frame if one is due; true while it needs more (animating).
     pub(super) fn draw(&mut self, app: &mut dyn OverlayApp) -> bool {
-        self.presence_due(app, Instant::now());
+        self.presence_due(app, crate::time::now());
         if !self.presence.drawing() {
             self.drain_hidden(app);
             return false;
@@ -434,11 +468,20 @@ impl OverlayCore {
         more
     }
 
-    /// A layer surface kept while hidden (prewarmed, not shown yet) still hears the compositor.
+    /// A layer or XWayland surface kept while hidden (prewarmed, not shown yet) still drains its
+    /// connection so nothing queues for the first show.
     fn drain_hidden(&mut self, app: &mut dyn OverlayApp) {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() && layer.drain() {
-            self.hide(app);
+        {
+            let closed = match self.surface.live_mut().map(|l| &mut l.backing) {
+                Some(Backing::Layer(layer)) => layer.drain(),
+                Some(Backing::Xwayland(surface)) => {
+                    surface.drain();
+                    false
+                }
+                _ => false,
+            };
+            if closed { self.hide(app); }
         }
         #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
         let _ = app;
@@ -459,6 +502,14 @@ impl OverlayCore {
                 if down { app.pointer_down(x, y); } else { app.pointer_up(x, y); }
             },
             Input::Secondary(down) => if let Some((x, y)) = app.rt().pointer() { if down { app.rt_mut().secondary_down(x, y) } else { app.secondary_up(x, y) } },
+            Input::ExtraButton(button, down) => if let Some((x, y)) = app.rt().pointer() {
+                if down { app.button_down(x, y, button); } else { app.button_up(x, y, button); }
+            },
+            Input::Wheel(wheel) => {
+                if crate::input::host_events::wheel_core(app.rt_mut(), wheel) == crate::input::host_events::WheelOutcome::Ignored {
+                    return;
+                }
+            }
             Input::Focus(focused) => {
                 app.window_focus(focused);
                 app.rt_mut().ignore_minimize("an overlay");
@@ -468,6 +519,7 @@ impl OverlayCore {
                 }
             }
             Input::Key(key) => app.rt_mut().key(key),
+            Input::KeyRepeat(key) => app.rt_mut().repeat_key(key),
             Input::KeyUp(key) => {
                 self.dirty |= app.key_up(key);
                 return;
@@ -501,7 +553,7 @@ impl OverlayCore {
             let focused = self.panel.as_ref().map_or_else(|| window.has_focus(), |p| p.is_key());
             #[cfg(not(target_os = "macos"))]
             let focused = window.has_focus();
-            crate::input::host_events::sync_ime(window, app.rt_mut(), &mut self.ime_allowed, focused);
+            crate::input::host_events::sync_ime(window, app.rt_mut(), &mut self.ime, focused);
         }
     }
 
@@ -516,6 +568,8 @@ impl OverlayCore {
             target: None,
             #[cfg(target_os = "macos")]
             materials_checked: false,
+            #[cfg(target_os = "macos")]
+            presume: false,
             now: None,
             more: false,
         };
@@ -586,7 +640,17 @@ impl OverlayCore {
     pub(super) fn sync_occlusion(&mut self, app: &mut dyn OverlayApp) {
         if std::mem::replace(&mut self.occlusion_read, true) { return; }
         let occluded = self.panel.as_ref().is_some_and(|p| p.occluded());
+        let occluded = self.occlusion_reading(occluded);
         self.set_occluded(app, occluded);
+    }
+
+    /// What a reading of the panel's occlusion means now. Right after a show AppKit may not yet
+    /// report the panel on screen, so a primed overlay stays shown and its first frames draw
+    /// (`prime`); a visible reading ends that.
+    #[cfg(target_os = "macos")]
+    pub(super) fn occlusion_reading(&mut self, occluded: bool) -> bool {
+        if !occluded { self.prime.stop(); }
+        occluded && !self.prime.presumes()
     }
 
     /// Applies an occlusion reading when it changes what the panel holds.
@@ -612,7 +676,7 @@ impl OverlayCore {
         app.frame(0.0);
         app.rt_mut().settle_all();
         app.frame(0.0);
-        self.clock.hold(Instant::now());
+        self.clock.hold(crate::time::now());
         self.warm_frame(app);
     }
 
@@ -623,7 +687,7 @@ impl OverlayCore {
             let _prewarm = panel.prewarm();
             self.dirty = true;
             self.draw_frame(app, true);
-            if let Some(gpu) = &self.gpu { let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely()); }
+            if let Some(gpu) = &self.gpu { rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok(); }
             return;
         }
         let Some(live) = self.surface.live() else { return };
@@ -645,6 +709,22 @@ impl OverlayCore {
             dt: 0.0, update_ms: 0.0, ui: renderer,
         });
         renderer.submit(&gpu.queue, enc);
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
     }
 }
+
+/// Backing scale (device pixels per window point) to pass to `OverlayCore::rescale` when a
+/// layer-shell surface resizes without a scale change. `rescale` sizes the surface buffer and
+/// updates the runtime via `RuntimeCore::set_viewport`, both of which take `window_scale()`
+/// rather than `env.scale` (`window_scale * zoom`).
+#[cfg_attr(
+    not(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))),
+    allow(dead_code)
+)]
+fn layer_resize_scale(rt: &RuntimeCore) -> f32 {
+    rt.window_scale()
+}
+
+#[cfg(test)]
+#[path = "draw_tests.rs"]
+mod tests;

@@ -57,7 +57,7 @@ fn font_key(f: TextStyle) -> (u32, u32, u32, u32, String) {
 
 /// `features` with tabular figures on, interned so the result is `'static` like a
 /// [`TextStyle`]'s features (a style has few distinct feature lists).
-fn with_tnum(features: &'static str) -> &'static str {
+pub(super) fn with_tnum(features: &'static str) -> &'static str {
     if features.is_empty() {
         return "'tnum' 1";
     }
@@ -439,12 +439,12 @@ impl Renderer {
                 a => a,
             };
             let content = self
-                .with_reveal(
-                    rich(inl.text.clone(), self.spans(inl, font))
-                        .font(font)
-                        .color(color)
-                        .align(align),
-                )
+                .with_reveal(self.with_math(
+                    rich(inl.text.clone(), self.spans(inl, font)).font(font).color(color).align(align),
+                    inl,
+                    font,
+                    color,
+                ))
                 .w_full();
             let content = super::bidi::directed(super::bidi::isolated(content, inl), dir);
             // Full width: each column's share of the row is its share of the natural width, so
@@ -524,11 +524,15 @@ impl Renderer {
                 // padding in the cell's widths.
                 let ends_code = |end: usize| inl.text[end..].chars().next().is_none_or(char::is_whitespace);
                 let pad = |hit: bool| if hit { self.s.inline_code_pad } else { 0.0 };
-                let pads = inl.spans.iter().filter(|s| s.2 == Style::CodePad && inl.spans.iter().any(|c| c.2 == Style::Code && c.1 == s.0));
+                let in_link = |a: usize, b: usize| inl.links.iter().any(|l| l.0 <= a && b <= l.1);
+                let pads = inl.spans.iter().filter(|s| {
+                    s.2 == Style::CodePad
+                        && inl.spans.iter().any(|c| c.2 == Style::Code && c.1 == s.0 && !in_link(c.0, c.1))
+                });
                 let (last, word) = pads.fold((false, false), |(last, word), s| (last || s.1 == inl.text.len(), word || ends_code(s.1)));
                 // Code that ends the cell lost its end padding with the line's trailing space
                 // (`parser::trimmed_len`), but a page still counts it: the cell is as wide as the chip.
-                let ends = inl.spans.iter().any(|c| c.2 == Style::Code && c.1 >= inl.text.len());
+                let ends = inl.spans.iter().any(|c| c.2 == Style::Code && c.1 >= inl.text.len() && !in_link(c.0, c.1));
                 let (last, word) = (last || ends, word || ends);
                 natural[j] = max + pad(last) + 0.01;
                 fit[j] = min + pad(word) + 0.01;

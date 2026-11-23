@@ -28,6 +28,41 @@ function replacement(old, next, composition, caret) {
     return { start, end, text: next.slice(start, nextEnd) };
 }
 
+// HTML <textarea> normalizes CRLF and lone CR to LF in its API value. Track the normalized mirror
+// and the raw UTF-16 offsets of each CRLF so diffs leave untouched line breaks intact and offsets
+// translate cleanly between DOM coordinates and Rune's text.
+function normalizeTextarea(raw) {
+    if (!raw.includes('\r')) return { dom: raw, crlfs: null };
+    const crlfs = [];
+    const dom = raw.replace(/\r\n?/g, (match, offset) => {
+        if (match.length === 2) crlfs.push(offset);
+        return '\n';
+    });
+    return { dom, crlfs: crlfs.length ? crlfs : null };
+}
+
+function rawToDom(offset, crlfs) {
+    if (!crlfs) return offset;
+    let lo = 0, hi = crlfs.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (crlfs[mid] < offset) lo = mid + 1;
+        else hi = mid;
+    }
+    return offset - lo;
+}
+
+function domToRaw(offset, crlfs) {
+    if (!crlfs) return offset;
+    let lo = 0, hi = crlfs.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (crlfs[mid] - mid < offset) lo = mid + 1;
+        else hi = mid;
+    }
+    return offset + lo;
+}
+
 function browserShortcut(event) {
     const chord = (event.metaKey || event.ctrlKey) && !event.getModifierState?.('AltGraph');
     if (event.key === 'F5' || event.key === 'F12') return true;
@@ -51,6 +86,52 @@ function appWindow() {
 
 // Keys that scroll a page when nothing in Rune has focus.
 const SCROLL_KEYS = [' ', 'PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown'];
+// Function keys Rune parses (`named_key_from_str`: F1–F24).
+const FUNCTION_KEY = /^F([1-9]|1\d|2[0-4])$/;
+
+const graphemeSegmenter = typeof Intl?.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+    : null;
+
+function isAutofilled(input) {
+    if (typeof input?.matches !== 'function') return false;
+    for (const selector of [':autofill', ':-webkit-autofill']) {
+        try { if (input.matches(selector)) return true; } catch {}
+    }
+    return false;
+}
+
+function moreThanOneGrapheme(text, segmenter) {
+    if (!segmenter || !text) return false;
+    let count = 0;
+    for (const _ of segmenter.segment(text)) {
+        if (++count > 1) return true;
+    }
+    return false;
+}
+
+// Classifies a password `input` event as whole-value replacement ('secure_replace') for browser or
+// password-manager fills, or incremental typing ('secure') for single-grapheme keystrokes.
+export function secureKind(event, input, segmenter = graphemeSegmenter) {
+    if (isAutofilled(input)) return 'secure_replace';
+    const type = event?.inputType;
+    if (!type || type === 'insertReplacementText') return 'secure_replace';
+    if (type === 'insertText') {
+        const added = event.data ?? input?.value ?? '';
+        if (moreThanOneGrapheme(added, segmenter)) return 'secure_replace';
+    }
+    return 'secure';
+}
+
+// Handles one `input` event on the hidden password input: always empties the DOM value, ignores
+// events while no Rune field has focus, and sends fills even when empty so a clear reaches Rust.
+export function passwordInput(event, input, key, send) {
+    const kind = secureKind(event, input);
+    const text = input.value;
+    input.value = '';
+    if (!key) return;
+    if (kind === 'secure_replace' || text) send({ kind, key, text });
+}
 
 // What a page's mirror needs: focus rings on its links and buttons, and a selection highlight
 // over its transparent text. The page can restyle both.
@@ -69,7 +150,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     const password = document.createElement('input');
     password.type = 'password';
     password.setAttribute('aria-label', 'Password input');
-    password.autocomplete = 'off';
+    password.autocomplete = 'current-password';
     password.setAttribute('autocorrect', 'off');
     password.setAttribute('autocapitalize', 'off');
     password.spellcheck = false;
@@ -77,6 +158,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         field.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px;resize:none;pointer-events:none;';
         field.tabIndex = -1;
         field.inputMode = coarse() ? 'none' : 'text';
+        field.inert = true;
         document.body.append(field);
     }
     // The mirror's text is transparent over the canvas. `forced-color-adjust:none` keeps it so in
@@ -107,8 +189,8 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         a11y.style.cssText = 'position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:1;color:transparent;forced-color-adjust:none;';
         document.body.append(a11y);
     }
-    const h = { canvas, textarea, password, a11y, a11yNodes: new Map(), field: textarea, key: '', base: 0, value: '',
-        copyText: '', composing: false, composition: '', shift: false, modBits: 0, listeners: [], syncing: false, disposed: false,
+    const h = { canvas, textarea, password, a11y, a11yNodes: new Map(), field: textarea, key: '', base: 0, value: '', domValue: '', crlfs: null,
+        selection: null, copyText: '', composing: false, composition: '', shift: false, modBits: 0, listeners: [], syncing: false, disposed: false,
         embedded, fitHeight, page, focused: false, presented: false, swapped: false, touchDown: false,
         lastScrollAt: 0, staticTimer: 0, scrollEls: new Map(), band };
     const send = event => {
@@ -147,10 +229,21 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     listen(document, 'visibilitychange', () => { if (document.hidden) h.modBits = 0; });
     function changed(preedit = false) {
         const backward = textarea.selectionDirection === 'backward';
+        const edit = replacement(h.domValue, textarea.value, preedit ? h.composition : '', textarea.selectionEnd);
+        const start = domToRaw(edit.start, h.crlfs);
+        const end = domToRaw(edit.end, h.crlfs);
+        const mapNext = pos => {
+            const insertedEnd = edit.start + edit.text.length;
+            if (pos <= edit.start) return domToRaw(pos, h.crlfs);
+            if (pos <= insertedEnd) return start + (pos - edit.start);
+            return start + edit.text.length + (domToRaw(edit.end + (pos - insertedEnd), h.crlfs) - end);
+        };
+        const selStart = mapNext(textarea.selectionStart);
+        const selEnd = mapNext(textarea.selectionEnd);
         send({ kind: preedit ? 'preedit' : 'edit', key: h.key, base: h.base, expected: h.value,
-            ...replacement(h.value, textarea.value, preedit ? h.composition : '', textarea.selectionEnd),
-            anchor: backward ? textarea.selectionEnd : textarea.selectionStart,
-            focus: backward ? textarea.selectionStart : textarea.selectionEnd });
+            start, end, text: edit.text,
+            anchor: backward ? selEnd : selStart,
+            focus: backward ? selStart : selEnd });
     }
     const key = (name, event = {}) => send({ kind: 'key', key: name, code: event.code ?? '', shift: !!event.shiftKey,
         ctrl: !!event.ctrlKey, alt: !!event.altKey, meta: !!event.metaKey, repeat: !!event.repeat });
@@ -169,11 +262,7 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         h.composing = false; h.composition = '';
         send({ kind: 'sync' });
     });
-    listen(password, 'input', () => {
-        const text = password.value;
-        password.value = '';
-        if (text) send({ kind: 'secure', key: h.key, text });
-    });
+    listen(password, 'input', event => passwordInput(event, password, h.key, send));
     for (const field of [textarea, password]) {
         listen(field, 'paste', event => {
             // Only a paste into a Rune field is Rune's; the browser keeps the rest.
@@ -197,6 +286,15 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
                 const forward = event.inputType.endsWith('Forward');
                 key(forward ? 'Delete' : 'Backspace',
                     { altKey: event.inputType.includes('Word'), code: forward ? 'Delete' : 'Backspace' });
+            } else if (field === textarea && !h.composing && !event.isComposing && event.inputType.startsWith('delete')) {
+                if (field.selectionStart === 0 && field.selectionEnd === 0 && event.inputType.endsWith('Backward')) {
+                    event.preventDefault();
+                    key('Backspace', { altKey: event.inputType.includes('Word'), code: 'Backspace' });
+                } else if (field.selectionStart === field.value.length && field.selectionEnd === field.value.length
+                    && event.inputType.endsWith('Forward')) {
+                    event.preventDefault();
+                    key('Delete', { altKey: event.inputType.includes('Word'), code: 'Delete' });
+                }
             }
         });
         listen(field, 'keydown', event => {
@@ -206,7 +304,17 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
             const chord = (event.metaKey || event.ctrlKey) && !event.getModifierState?.('AltGraph');
             const editing = ['Enter', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'];
             if (field === password) editing.push('Backspace', 'Delete');
-            if (!chord && !editing.includes(event.key)) return;
+            else {
+                // At either boundary with nothing selected, the browser deletes nothing and fires
+                // no `input` event, so forward Backspace or Delete as a key as native platforms
+                // and password fields do.
+                if (field.selectionStart === 0 && field.selectionEnd === 0) editing.push('Backspace');
+                if (field.selectionStart === field.value.length && field.selectionEnd === field.value.length) editing.push('Delete');
+            }
+            // Forward function keys other than what `browserShortcut` leaves to the browser so
+            // focused fields receive them as canvas focus does.
+            const functionKey = FUNCTION_KEY.test(event.key) && !browserShortcut(event);
+            if (!chord && !functionKey && !editing.includes(event.key)) return;
             if (chord && event.key.toLowerCase() === 'v') return;
             event.preventDefault();
             key(event.key, event);
@@ -217,9 +325,11 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
     listen(textarea, 'select', () => {
         if (h.syncing || h.composing || document.activeElement !== textarea) return;
         const backward = textarea.selectionDirection === 'backward';
+        const selStart = domToRaw(textarea.selectionStart, h.crlfs);
+        const selEnd = domToRaw(textarea.selectionEnd, h.crlfs);
         send({ kind: 'selection', key: h.key, base: h.base, expected: h.value,
-            anchor: backward ? textarea.selectionEnd : textarea.selectionStart,
-            focus: backward ? textarea.selectionStart : textarea.selectionEnd });
+            anchor: backward ? selEnd : selStart,
+            focus: backward ? selStart : selEnd });
     });
     // Synchronous copy support for read-only `El::selectable` selections (`Edit › Copy` / ⌘C).
     listen(document, 'copy', event => {
@@ -250,6 +360,10 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         if (file.type.startsWith('text/') || file.size < 1048576 && !file.type) send({ kind: 'paste', text: await file.text(), html: '', image: false });
     });
     listen(canvas, 'pointerdown', event => event.preventDefault(), { capture: true });
+    // WebKit on iOS 27 still fires a tap's compatibility mousedown to the canvas after a
+    // prevented pointerdown; preventing it keeps the canvas's tabindex from taking focus
+    // back from the hidden field that activate() just focused on pointerup.
+    listen(canvas, 'mousedown', event => event.preventDefault(), { capture: true });
     // winit's web backend ignores pointercancel for mouse/pen and does not listen to
     // lostpointercapture; forward non-touch cancellations so held presses and drags never stick.
     listen(canvas, 'pointercancel', event => {
@@ -355,33 +469,59 @@ export function mount(canvas, callback, embedded, fitHeight, page) {
         listen(window, name, event => { if (name !== 'pointerdown' || !isSecondaryPress(event)) disarmMenu(h); }, { capture: true, passive: true });
     }
     queueMicrotask(() => {
-        if (!h.disposed && !embedded && !page && document.activeElement === document.body) canvas.focus({ preventScroll: true });
+        if (!h.disposed && !embedded && !page && document.activeElement === document.body) {
+            (h.key ? h.field : canvas).focus({ preventScroll: true });
+            if (h.key) reselect(h);
+        }
     });
     return h;
+}
+
+// Reapplies the synced non-secure selection after focus moves to the hidden textarea (browsers
+// collapse an unfocused textarea's selection to 0), without disturbing an active composition.
+function reselect(h) {
+    if (!h.selection || h.field !== h.textarea || h.composing) return;
+    const [start, end, direction] = h.selection;
+    if (h.textarea.selectionStart !== start || h.textarea.selectionEnd !== end || h.textarea.selectionDirection !== direction) {
+        const syncing = h.syncing;
+        h.syncing = true;
+        try { h.textarea.setSelectionRange(start, end, direction); }
+        finally { h.syncing = syncing; }
+    }
 }
 
 export function sync(h, key, text, base, anchor, focus, secure) {
     if (h.composing && key === h.key) return;
     h.composing = false;
     h.syncing = true;
-    const editing = document.activeElement === h.textarea || document.activeElement === h.password;
-    h.key = key; h.base = base; h.value = text;
+    const active = document.activeElement;
+    const editing = active === h.textarea || active === h.password;
+    const { dom, crlfs } = key && !secure ? normalizeTextarea(text) : { dom: '', crlfs: null };
+    h.key = key; h.base = base; h.value = text; h.domValue = dom; h.crlfs = crlfs;
     h.password.value = '';
     h.field = secure ? h.password : h.textarea;
     if (!key) {
+        h.selection = null;
         h.textarea.value = '';
         if (editing) h.canvas.focus({ preventScroll: true });
+        h.textarea.inert = true;
+        h.password.inert = true;
         h.textarea.inputMode = h.password.inputMode = coarse() ? 'none' : 'text';
     } else {
-        if (h.textarea.value !== text) h.textarea.value = text;
-        if (!secure) {
-            const start = Math.min(anchor, focus), end = Math.max(anchor, focus);
-            const direction = anchor > focus ? 'backward' : 'forward';
-            if (h.textarea.selectionStart !== start || h.textarea.selectionEnd !== end || h.textarea.selectionDirection !== direction) {
-                h.textarea.setSelectionRange(start, end, direction);
-            }
+        h.field.inert = false;
+        if (h.textarea.value !== dom) h.textarea.value = dom;
+        if (secure) {
+            h.selection = null;
+        } else {
+            const domAnchor = rawToDom(anchor, crlfs), domFocus = rawToDom(focus, crlfs);
+            const start = Math.min(domAnchor, domFocus), end = Math.max(domAnchor, domFocus);
+            const direction = domAnchor > domFocus ? 'backward' : 'forward';
+            h.selection = [start, end, direction];
         }
-        if (editing && document.activeElement !== h.field) activate(h);
+        if (editing && active !== h.field) activate(h);
+        else if (active === h.canvas) h.field.focus({ preventScroll: true });
+        reselect(h);
+        (secure ? h.textarea : h.password).inert = true;
     }
     h.syncing = false;
 }
@@ -710,12 +850,46 @@ function webLink(url) {
     return url.startsWith('https://') || url.startsWith('http://') || url.startsWith('mailto:');
 }
 
-const TAGS = { heading: null, button: 'button', link: 'a', image: 'div', text: 'p', scroll_x: 'div' };
+// Matches Rust's `open_url::check_href`: allows http:, https:, mailto:, or a relative
+// path/query/fragment that isn't scheme-relative (`//`).
+function safeHref(url) {
+    if (typeof url !== 'string') return null;
+    const s = url.trim();
+    if (!s || s.length > 8192 || /[\s\u0000-\u001f\u007f-\u009f\\"<>^`{|}]/.test(s)) return null;
+    if (/%(?![0-9a-fA-F]{2})|%00/.test(s)) return null;
+    const delim = s.search(/[:/?#]/);
+    if (!s.startsWith('//') && (delim === -1 || s[delim] !== ':')) return s;
+    const colon = s.indexOf(':');
+    if (colon <= 0) return null;
+    const scheme = s.slice(0, colon).toLowerCase();
+    const rest = s.slice(colon + 1);
+    if (scheme === 'http' || scheme === 'https') {
+        if (!rest.startsWith('//')) return null;
+        const after = rest.slice(2);
+        const end = after.search(/[/?#]/);
+        const auth = end === -1 ? after : after.slice(0, end);
+        const tail = end === -1 ? '' : after.slice(end);
+        if (!auth || /[\[\]]/.test(tail)) return null;
+        const at = auth.lastIndexOf('@');
+        const hp = at === -1 ? auth : auth.slice(at + 1);
+        if (at !== -1 && (!auth.slice(0, at) || /[\[\]@]/.test(auth.slice(0, at)))) return null;
+        if (!hp || hp.startsWith('.') || hp.includes('..')) return null;
+        return `${scheme}:${rest}`;
+    }
+    if (scheme === 'mailto') {
+        if (!rest || rest.startsWith('//') || /[\[\]]/.test(rest)) return null;
+        return `${scheme}:${rest}`;
+    }
+    return null;
+}
+
+const TAGS = { heading: null, button: 'button', link: 'a', image: 'div', progressbar: 'div', text: 'p', scroll_x: 'div' };
 
 function family(name) {
     if (name === 'sans') return 'var(--rune-sans,sans-serif)';
     if (name === 'mono') return 'var(--rune-mono,monospace)';
-    return `"${name.replace(/["\\]/g, '')}",var(--rune-sans,sans-serif)`;
+    const clean = String(name).replace(/[\u0000-\u001f\u007f-\u009f"'\\;{}<>]/g, '').trim();
+    return clean ? `"${clean}",var(--rune-sans,sans-serif)` : 'var(--rune-sans,sans-serif)';
 }
 
 // The mirror's first item element, after its stylesheet.
@@ -727,12 +901,13 @@ function firstItem(el) {
 
 function runs(h, el, item) {
     for (const run of item.u) {
-        if (!run.h) { el.append(document.createTextNode(run.t)); continue; }
+        const href = run.h ? safeHref(run.h) : null;
+        if (!href) { el.append(document.createTextNode(run.t)); continue; }
         const a = document.createElement('a');
         a.textContent = run.t;
         a.style.cssText = `color:transparent;text-decoration:none;pointer-events:${h.page ? 'auto' : 'none'};`;
-        if (webLink(run.h)) {
-            a.href = run.h;
+        if (webLink(href)) {
+            a.href = href;
             a.target = '_blank';
             a.rel = 'noopener noreferrer';
         } else {
@@ -755,7 +930,7 @@ function itemStyle(h, item, origin) {
     // page.
     if (item.k === 'scroll_x') return css + 'overflow-x:auto;overflow-y:hidden;pointer-events:auto;touch-action:pan-x pan-y pinch-zoom;scrollbar-width:none;';
     if (item.k === 'link') return css + 'display:block;overflow:hidden;text-decoration:none;cursor:pointer;pointer-events:auto;font:14px/1.25 sans-serif;';
-    if (item.k === 'image' || item.k === 'button') return css + 'overflow:hidden;pointer-events:none;font:14px/1.25 sans-serif;';
+    if (item.k === 'image' || item.k === 'button' || item.k === 'progressbar') return css + 'overflow:hidden;pointer-events:none;font:14px/1.25 sans-serif;';
     const fs = item.s || 14;
     if (!item.f) return css + `font:${fs}px/1.25 sans-serif;overflow:hidden;white-space:pre-wrap;pointer-events:none;`;
     const [fam, weight, lh, tracking, italic, align] = item.f;
@@ -791,7 +966,7 @@ export function syncA11y(h, json) {
                 // container says it is.
                 el.addEventListener('scroll', () => {
                     const path = el._path;
-                    if (path && !h.disposed) h.send({ kind: 'scroll_x', path, x: el.scrollLeft });
+                    if (path && !h.disposed) h.send({ kind: 'scroll_x', path, x: readScrollX(el) });
                 }, { passive: true });
             }
             h.a11yNodes.set(key, el);
@@ -806,35 +981,76 @@ export function syncA11y(h, json) {
         if (item.i) el.id = item.i; else el.removeAttribute('id');
         // `El::description` and `El::described_by`'s words: what a reader says after the name.
         if (item.d) el.setAttribute('aria-description', item.d); else el.removeAttribute('aria-description');
-        // A table's parts: the role says what the div is (`aria_role`).
-        if ((el.getAttribute('role') ?? undefined) !== item.o && item.k === 'group') {
-            if (item.o) el.setAttribute('role', item.o); else el.removeAttribute('role');
+        // Role-carrying containers, live text (`status`, `alert`, `log`) and progressbars.
+        if (item.k !== 'image' && tag !== 'button') {
+            const role = item.o ?? (item.k === 'progressbar' ? 'progressbar' : null);
+            if (role === null) {
+                if (el.getAttribute('role') !== null) el.removeAttribute('role');
+            } else if (el.getAttribute('role') !== role) {
+                el.setAttribute('role', role);
+            }
+        }
+        if (item.lv === undefined) {
+            if (el.getAttribute('aria-live') !== null) el.removeAttribute('aria-live');
+        } else if (el.getAttribute('aria-live') !== item.lv) {
+            el.setAttribute('aria-live', item.lv);
+        }
+        const rangeAttrs = [
+            ['aria-valuemin', item.rg ? String(item.rg[0]) : undefined],
+            ['aria-valuemax', item.rg ? String(item.rg[1]) : undefined],
+            ['aria-valuenow', item.rg ? String(item.rg[2]) : undefined],
+            ['aria-valuetext', item.vt],
+        ];
+        for (const [name, value] of rangeAttrs) {
+            if (value === undefined) {
+                if (el.getAttribute(name) !== null) el.removeAttribute(name);
+            } else if (el.getAttribute(name) !== value) {
+                el.setAttribute(name, value);
+            }
         }
         if (tag === 'button') {
             if (item.x === true || item.x === false) el.setAttribute('aria-expanded', String(item.x));
             else el.removeAttribute('aria-expanded');
-            // A control's role and states (a palette's option, a tab, a switch): `control_role`.
-            const states = [['role', item.o], ['aria-selected', item.se === undefined ? undefined : String(item.se)], ['aria-checked', item.c],
+            // A control's role and states (a palette's option, a tab, a switch, a toggle button).
+            const states = [['role', item.o], ['aria-selected', item.se === undefined ? undefined : String(item.se)],
+                ['aria-checked', item.c], ['aria-pressed', item.pr],
                 ['aria-posinset', item.n ? String(item.n[0]) : undefined], ['aria-setsize', item.n ? String(item.n[1]) : undefined]];
             for (const [name, value] of states) {
                 if (value === undefined) el.removeAttribute(name);
                 else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
             }
         }
-        if (item.k === 'group' || item.k === 'image') {
-            if (item.t) el.setAttribute('aria-label', item.t); else el.removeAttribute('aria-label');
+        if (item.k === 'group' || item.k === 'image' || item.k === 'progressbar') {
+            if (item.t) {
+                if (el.getAttribute('aria-label') !== item.t) el.setAttribute('aria-label', item.t);
+            } else if (el.getAttribute('aria-label') !== null) {
+                el.removeAttribute('aria-label');
+            }
         } else if (item.k === 'link') {
-            el.href = item.h;
-            if (!h.page && webLink(item.h)) { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
+            const href = safeHref(item.h);
+            if (href) {
+                el.href = href;
+                if (!h.page && webLink(href)) { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
+                else { el.removeAttribute('target'); el.removeAttribute('rel'); }
+            } else {
+                el.removeAttribute('href');
+                el.removeAttribute('target');
+                el.removeAttribute('rel');
+            }
         }
         const container = item.k === 'group' || item.k === 'scroll_x';
+        const noContent = container || item.k === 'image' || item.k === 'progressbar';
         if (item.k === 'scroll_x' && el._path !== item.p) { el._path = item.p; h.scrollEls.set(item.p, el); }
-        const sig = container || item.k === 'image' ? '' : item.u?.length ? JSON.stringify(item.u) : item.t ?? '';
-        if (!container && el._sig !== sig) {
+        const sig = noContent ? '' : item.u?.length ? JSON.stringify(item.u) : item.t ?? '';
+        if (!noContent && el._sig !== sig) {
             el._sig = sig;
-            el.replaceChildren();
-            if (item.u?.length) runs(h, el, item);
-            else if (item.k !== 'image') el.textContent = item.t ?? '';
+            if (item.u?.length) {
+                el.replaceChildren();
+                runs(h, el, item);
+            } else {
+                if (el.firstElementChild) el.replaceChildren();
+                el.textContent = item.t ?? '';
+            }
         }
         els.push(el);
         if (container && !cursors.has(el)) cursors.set(el, el.firstElementChild);
@@ -885,6 +1101,7 @@ export function focusA11y(h, json) {
     el.setAttribute('aria-label', f.t ?? '');
     if (f.d) el.setAttribute('aria-description', f.d);
     if (f.c) el.setAttribute('aria-checked', f.c);
+    if (f.pr) el.setAttribute('aria-pressed', f.pr);
     if (f.s !== undefined) el.setAttribute('aria-selected', String(f.s));
     if (f.x !== undefined) el.setAttribute('aria-expanded', String(f.x));
     if (f.n) { el.setAttribute('aria-posinset', String(f.n[0])); el.setAttribute('aria-setsize', String(f.n[1])); }
@@ -939,12 +1156,82 @@ export function syncPage(h, height, focused) {
     if (h.band && h.band.style.height !== `${height}px`) h.band.style.height = `${height}px`;
 }
 
+// Detects how this browser represents `Element.scrollLeft` on a `direction: rtl` container:
+// - 'negative': 0 at the right (start) edge, -(scrollWidth - clientWidth) at the left (end) edge
+//   (CSSOM View standard: Chromium >= 85, Firefox, Safari >= 15.4).
+// - 'reverse':  0 at the right (start) edge, +(scrollWidth - clientWidth) at the left (end) edge
+//   (legacy Edge / IE).
+// - 'default':  +(scrollWidth - clientWidth) at the right (start) edge, 0 at the left (end) edge
+//   (legacy Blink / WebKit).
+let rtlScrollType = null;
+function detectRtlScrollType() {
+    if (rtlScrollType) return rtlScrollType;
+    const host = document.body ?? document.documentElement;
+    if (!host) return 'negative';
+    const outer = document.createElement('div');
+    outer.dir = 'rtl';
+    outer.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:40px;height:40px;overflow-x:scroll;overflow-y:hidden;scrollbar-width:none;visibility:hidden;pointer-events:none;';
+    const inner = document.createElement('div');
+    inner.style.cssText = 'width:80px;height:1px;';
+    outer.append(inner);
+    host.append(outer);
+    let type = 'negative';
+    if (outer.scrollWidth > outer.clientWidth) {
+        if (outer.scrollLeft > 0) {
+            type = 'default';
+        } else {
+            outer.scrollLeft = 1;
+            type = outer.scrollLeft === 0 ? 'negative' : 'reverse';
+        }
+        rtlScrollType = type;
+    }
+    outer.remove();
+    return type;
+}
+
+function isRtl(el) {
+    if (el.dir === 'rtl') return true;
+    if (el.dir === 'ltr') return false;
+    return getComputedStyle(el).direction === 'rtl';
+}
+
+// Normalizes `el.scrollLeft` into Rune's logical horizontal scroll offset (0 at the inline-start
+// edge, growing toward the inline-end edge up to `scrollWidth - clientWidth`).
+function readScrollX(el) {
+    const raw = el.scrollLeft;
+    if (!Number.isFinite(raw)) return 0;
+    const max = Math.max(0, el.scrollWidth - el.clientWidth);
+    if (!isRtl(el)) return Math.min(Math.max(raw, 0), max);
+    const type = detectRtlScrollType();
+    const logical = type === 'negative' ? -raw : type === 'default' ? max - raw : raw;
+    return Math.min(Math.max(logical, 0), max);
+}
+
+// Converts Rune's logical horizontal scroll offset (`0..=max`) into the DOM `scrollLeft` value
+// expected by `el`'s direction and browser RTL scroll model.
+function domScrollLeft(el, x) {
+    if (!Number.isFinite(x)) return 0;
+    const max = Math.max(0, el.scrollWidth - el.clientWidth);
+    const clamped = Math.min(Math.max(x, 0), max);
+    if (!isRtl(el)) return clamped;
+    const type = detectRtlScrollType();
+    if (type === 'negative') return clamped === 0 ? 0 : -clamped;
+    if (type === 'default') return max - clamped;
+    return clamped;
+}
+
 // A horizontal viewport Rune scrolled itself (a wheel, a key): move the mirror's container to
 // match, so the two stay the same text. The container's own scroll event echoes back the same
 // offset, which Rune ignores.
-export function syncScrollX(h, path, x) {
+export function syncScrollX(h, path, x, rtl) {
     const el = h.scrollEls.get(path);
-    if (el && Math.abs(el.scrollLeft - x) > 0.5) el.scrollLeft = x;
+    if (!el) return;
+    if (rtl !== undefined) {
+        const dir = rtl ? 'rtl' : 'ltr';
+        if (el.dir !== dir) el.dir = dir;
+    }
+    const target = domScrollLeft(el, x);
+    if (Math.abs(el.scrollLeft - target) > 0.5) el.scrollLeft = target;
 }
 
 // Rune's first frame is on screen: the canvas announces `runepresent`, and a page swaps its
@@ -1011,6 +1298,7 @@ export function activate(h) {
     const field = h.key ? h.field : h.canvas;
     if (h.key) field.inputMode = 'text';
     if (document.activeElement !== field) field.focus({ preventScroll: true });
+    if (h.key) reselect(h);
 }
 
 export async function pastedImage(h, max) {
@@ -1026,7 +1314,7 @@ export function destroy(h) {
     clearTimeout(h.staticTimer);
     clearTimeout(h.a11yTimer);
     for (const remove of h.listeners) remove();
-    h.password.value = ''; h.textarea.value = ''; h.copyText = '';
+    h.password.value = ''; h.textarea.value = ''; h.value = ''; h.domValue = ''; h.crlfs = null; h.copyText = ''; h.selection = null;
     h.a11yNodes.clear();
     h.scrollEls.clear();
     h.a11y.remove();

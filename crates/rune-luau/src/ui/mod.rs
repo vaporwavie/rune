@@ -72,6 +72,21 @@ pub(crate) struct Callback {
     pub(crate) script: Weak<Inner>,
 }
 
+/// A prop a node doesn't have (a typo, or one wished for: `autofocus` on a button did nothing,
+/// rune-desktop #664): an error in debug builds, so it can't pass unseen, and a warning once per
+/// script in release, where the node still draws without it.
+pub(crate) fn unknown_prop(env: &Env, node: Option<&str>, name: &str) -> Result<(), String> {
+    let message = match node {
+        Some(node) => format!("ui.{node}: unknown prop `{name}`"),
+        None => format!("unknown prop `{name}`"),
+    };
+    if cfg!(debug_assertions) {
+        return Err(message);
+    }
+    env.warn_once(format!("{message} (ignored)"));
+    Ok(())
+}
+
 /// What a render needs from its script.
 pub(crate) struct Env {
     pub(crate) script: Weak<Inner>,
@@ -154,7 +169,7 @@ impl Templates {
 
     /// Keeps a node built from the frozen table at stack slot `idx` as `key`'s template: `under`
     /// with its pending `props`, and `el`, the two finished.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unsafe_code)]
     pub(crate) unsafe fn put(&mut self, state: *mut ffi::lua_State, idx: c_int, key: (usize, u8), env: &Env, el: El, under: El, props: props::Props, colors: Vec<(Box<str>, Color)>) {
         if self.0.len() >= TEMPLATES {
             self.0.clear();
@@ -187,13 +202,17 @@ pub(crate) fn attach<S: 'static>() -> &'static Attach {
 }
 
 fn press<S: 'static>(el: &mut El, cb: Rc<Callback>, key: Option<Rc<str>>, fields: Fields) {
-    el.set_on_press_tx(move |s: &mut S, tx| {
-        if let Some(script) = cb.script.upgrade() {
-            let mods = tx.mods();
-            let event = Event { fields: fields.clone(), ..Event::press(key.as_deref(), mods.shift, mods.alt, mods.cmd) };
-            script.around_write(s, Some(tx), |tx| script.handle(&cb, event, tx));
-        }
-    });
+    el.set_on_press_tx(move |s: &mut S, tx| run_press(s, tx, &cb, key.as_deref(), &fields));
+}
+
+/// Runs `cb` as a `press` of the node keyed `key`, with the modifier keys held now and `fields`
+/// added to its event.
+pub(crate) fn run_press<S: 'static>(s: &mut S, tx: &mut rune::Tx, cb: &Rc<Callback>, key: Option<&str>, fields: &Fields) {
+    if let Some(script) = cb.script.upgrade() {
+        let mods = tx.mods();
+        let event = Event { fields: fields.clone(), ..Event::press(key, mods.shift, mods.alt, mods.cmd) };
+        script.around_write(s, Some(tx), |tx| script.handle(cb, event, tx));
+    }
 }
 
 /// `onMiddlePress`: a middle click on the node (`El::on_middle_press`), as a `middle-press` event
@@ -456,6 +475,7 @@ impl Env {
     }
 
     /// A registry reference to the function at stack slot `idx`.
+    #[allow(unsafe_code)]
     pub(crate) unsafe fn reference(&self, state: *mut ffi::lua_State, idx: c_int) -> Rc<Callback> {
         // SAFETY: the caller checked slot `idx` holds a function.
         let r = unsafe { ffi::lua_ref(state, idx) };
@@ -469,6 +489,7 @@ impl Env {
 
 /// Runs a C function body: its error becomes a Lua error once every Rust value it held is
 /// dropped, and a Rust panic becomes an error too, where the target can catch one.
+#[allow(unsafe_code)]
 pub(crate) unsafe fn guard(state: *mut ffi::lua_State, body: impl FnOnce() -> Result<c_int, String>) -> c_int {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     let message = match result {

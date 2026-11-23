@@ -12,6 +12,14 @@ pub(crate) enum AppComposition {
     Composing(String),
 }
 
+/// What stepping [`AppComposition`] asks the runtime to do before delivering the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::runtime) enum AppImeEffect {
+    /// The input method turned off mid-composition: clear the app's drawn preedit before
+    /// delivering `Ime::Disabled`, and stop suppressing key releases for that composition.
+    ClearPreedit,
+}
+
 impl AppComposition {
     /// Whether an app-level composition is open.
     pub(in crate::runtime) fn composing(&self) -> bool {
@@ -19,15 +27,26 @@ impl AppComposition {
     }
 
     /// Steps the composition with what the app is about to hear.
-    fn step(&mut self, ev: &Ime) {
+    pub(in crate::runtime) fn step(&mut self, ev: &Ime) -> crate::machine::Effects<AppImeEffect> {
         match ev {
-            Ime::Preedit(s, ..) => self.replace(if s.is_empty() { AppComposition::Idle } else { AppComposition::Composing(s.clone()) }),
-            Ime::Commit(_) => self.replace(AppComposition::Idle),
-            Ime::Select(_) | Ime::Enabled | Ime::Disabled => {}
+            Ime::Preedit(s, ..) => {
+                self.replace(if s.is_empty() { AppComposition::Idle } else { AppComposition::Composing(s.clone()) });
+                crate::machine::Effects::none()
+            }
+            Ime::Commit(_) => {
+                self.replace(AppComposition::Idle);
+                crate::machine::Effects::none()
+            }
+            Ime::Disabled => {
+                let was = self.composing();
+                self.replace(AppComposition::Idle);
+                if was { crate::machine::Effects::one(AppImeEffect::ClearPreedit) } else { crate::machine::Effects::none() }
+            }
+            Ime::Select(_) | Ime::Enabled => crate::machine::Effects::none(),
         }
     }
 
-    fn take_composing(&mut self) -> Option<String> {
+    pub(in crate::runtime) fn take_composing(&mut self) -> Option<String> {
         match std::mem::take(self) {
             AppComposition::Composing(text) => Some(text),
             AppComposition::Idle => None,
@@ -48,7 +67,7 @@ pub(in crate::runtime) fn area(r: [f32; 4], s: f32) -> [f32; 4] {
 impl RuntimeCore {
     /// Whether the app's own editor currently holds an open composition.
     pub(in crate::runtime) fn app_ime_composing(&self, app: &dyn AppDriver) -> bool {
-        app.has_on_ime() && self.edit.app_ime_comp.composing()
+        app.has_on_ime() && self.edit.app_ime_composing()
     }
 
     /// An input method event goes to the focused text field, else to `App::on_ime`. A
@@ -56,10 +75,20 @@ impl RuntimeCore {
     /// method turning on or off is only the app's to hear.
     pub(in crate::runtime) fn run_ime(&mut self, app: &mut dyn AppDriver, ev: Ime, one: &mut Tx) -> bool {
         let app_target = self.app_ime_composing(app) || matches!(ev, Ime::Enabled | Ime::Disabled) || self.focused_input().is_none();
-        let active = self.composing(app) || matches!(&ev, Ime::Preedit(s, ..) | Ime::Commit(s) if !s.is_empty());
+        let composing = self.composing(app);
+        // An empty preedit or commit while the focused field has no open composition changes
+        // nothing (`TextEdit::commit_composed` returns early on an empty string). Routing it
+        // through `with_focused` would clear the last input click (breaking a double-click) and
+        // set `caret_follow` (pulling a scrolled viewport back to the caret, as with Wayland's
+        // empty preedit replies to cursor-area updates).
+        if !app_target && !composing && matches!(&ev, Ime::Preedit(s, ..) | Ime::Commit(s) if s.is_empty()) {
+            return false;
+        }
+        let active = !matches!(ev, Ime::Enabled | Ime::Disabled)
+            && (composing || matches!(&ev, Ime::Preedit(s, ..) | Ime::Commit(s) if !s.is_empty()));
         let ran = if app_target { self.app_ime_event(app, &ev, one) } else { self.with_focused(app, |e| e.ime(&ev), one) };
         // The key that confirmed or cancelled a composition comes back up unheard.
-        if ran && active { self.kbd.key_releases.ime_took_key(); }
+        if ran && active { self.kbd.ime_took_key(); }
         ran
     }
 
@@ -67,7 +96,7 @@ impl RuntimeCore {
     /// app's editor hears its last preedit committed.
     pub(in crate::runtime) fn finish_ime(&mut self, app: &mut dyn AppDriver, one: &mut Tx) -> bool {
         if self.app_ime_composing(app) {
-            let Some(text) = self.edit.app_ime_comp.take_composing() else { return false };
+            let Some(text) = self.edit.take_app_ime_composing() else { return false };
             return self.app_ime_event(app, &Ime::Commit(text), one);
         }
         self.finish_field_composition(app, one)
@@ -85,7 +114,15 @@ impl RuntimeCore {
 
     fn app_ime_event(&mut self, app: &mut dyn AppDriver, ev: &Ime, one: &mut Tx) -> bool {
         if !app.has_on_ime() { return false; }
-        self.edit.app_ime_comp.step(ev);
-        app.on_ime(ev, one)
+        let mut cleared = false;
+        for effect in self.edit.step_app_ime(ev) {
+            match effect {
+                AppImeEffect::ClearPreedit => {
+                    self.kbd.clear_ime_key_up();
+                    cleared |= app.on_ime(&Ime::Preedit(String::new(), None, Vec::new()), one);
+                }
+            }
+        }
+        cleared | app.on_ime(ev, one)
     }
 }

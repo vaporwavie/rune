@@ -60,7 +60,8 @@ impl RuntimeCore {
             .is_some_and(|v| self.scroll.requests.reveals().any(|r| r.viewport == v.scroll_path));
         let revealed_now = self.commit.virtuals.get(&nodes[c].path).is_some_and(|v| {
             tx.scroll_to.iter().any(|r| {
-                nodes.iter().enumerate().find(|(_, n)| n.named(&r.key)
+                in_scope(&v.scroll_path, r.scope.as_deref())
+                    && nodes.iter().enumerate().find(|(_, n)| n.named(&r.key)
                     && n.parent.is_none_or(|p| in_scope(&nodes[p].path, r.scope.as_deref())))
                     .is_some_and(|(i, _)| {
                         std::iter::successors(nodes[i].parent, |&p| nodes[p].parent)
@@ -212,12 +213,12 @@ impl RuntimeCore {
                     if let Some((above, header)) = hidden.filter(|_| shutting && g.shutting_fold()) {
                         held_folds.push((id, before - g.h));
                         hidden_cut += g.hide_above(above);
-                        self.motion.fold_headers.insert(id, header);
+                        self.motion.insert_fold_header(id, header);
                     }
                 }
             }
         }
-        if !tx.commit.lands() && !first && !self.reduced_motion { self.link_growth_runs(&mut stack, &order, &opened, &shut); } else { stack.runs.clear(); }
+        if !tx.commit.lands() && !first && !self.reduced_motion { self.motion.link_growth_runs(&mut stack, &order, &opened, &shut); } else { stack.runs.clear(); }
         if hidden_cut > 0.0 { self.scroll_by_cut(nodes, c, hidden_cut); }
         if !held_folds.is_empty() { self.give_way(nodes, c, &std::mem::take(&mut held_folds)); }
         for (j, giving) in reopened.drain(..) { self.ride_from_end(nodes, c, j, giving); }

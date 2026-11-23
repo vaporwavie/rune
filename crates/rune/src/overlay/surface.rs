@@ -148,6 +148,7 @@ impl Surface {
 
 impl OverlayCore {
     /// Creates the wgpu surface (and the GPU device, if this is the first surface).
+    #[allow(unsafe_code)]
     pub(super) fn attach(&mut self, app: &mut dyn OverlayApp, backing: Backing, scale: f32) -> Option<Live> {
         // First, before the surface binds the view (macOS may observe it).
         let a11y = self.shared.wake.lock().unwrap().clone().and_then(|wake| match &backing {
@@ -310,23 +311,30 @@ impl OverlayCore {
             return;
         }
         live.scale = scale;
-        live.config.width = (self.at.size.0 * scale).round().max(1.0) as u32;
-        live.config.height = (self.at.size.1 * scale).round().max(1.0) as u32;
+        let max_dim = gpu.device.limits().max_texture_dimension_2d;
+        (live.config.width, live.config.height) = overlay_rescale_size(self.at.size, scale, max_dim);
         live.settle();
-        // `configure` waits for the present queue to drain, so unregister any outstanding wait
-        // before reconfiguring the swap chain (and keep it cleared if `configure` fails).
-        #[cfg(target_os = "windows")]
-        live.slot.reset();
+        // DX12 `configure` calls `ResizeBuffers` on the same swap chain, preserving its waitable
+        // semaphore and count; on failure `surface_refused` -> `release` resets the slot.
         if let Err(error) = crate::window::configure(&live.surface, gpu, &live.config) {
             self.surface_refused(app, format!("could not resize its GPU surface: {error}"));
             return;
         }
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::sync_contents_scale(&live.surface, scale);
         if let Some(alpha) = &mut live.alpha {
             alpha.resize(&gpu.device, (live.config.width, live.config.height));
         }
         app.rt_mut().set_viewport(self.at.size, scale);
         self.dirty = true;
     }
+}
+
+/// Physical drawable size for an overlay rescale, clamped to `1..=max_dim`.
+pub(crate) fn overlay_rescale_size(size: (f32, f32), scale: f32, max_dim: u32) -> (u32, u32) {
+    let max_dim = max_dim.max(1);
+    let clamp = |v: f32| ((v * scale).round().max(1.0) as u32).clamp(1, max_dim);
+    (clamp(size.0), clamp(size.1))
 }
 
 impl Drop for OverlayCore {

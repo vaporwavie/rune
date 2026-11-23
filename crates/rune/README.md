@@ -745,6 +745,27 @@ Staying fast afterwards is "Fast apps" (`site/src/FastApps.tsx`) and "Smooth scr
 - **Reuse a hidden window.** `keep_running()` / `windowless()` plus `AppHandle::hide()`, `show()` and `open()`
   (or `WindowOptions::launcher_panel()` for a retained panel that reveals cached pixels) make a re-summon cost a
   show instead of a launch.
+- **Windows: the first frame needs no GPU.** A window opens on the CPU renderer: its first frame is painted into
+  a buffer, copied to the window with GDI while it is cloaked, and shown; a below-normal thread then makes the
+  adapter, device, swap chain and pipelines and takes the frames over. What is left before that frame is the
+  loader, the event loop's first window, `CreateWindowExW` and the view itself, so keep the DLLs a first frame
+  doesn't call out of the import table (`/DELAYLOAD` in the app's `build.rs`: a linker argument a library can't
+  pass for an app).
+- **Windows: start the app without the setup's compatibility layer.** Windows starts anything it takes for a
+  setup program (a file named `*-setup.exe`, for one) with `__COMPAT_LAYER=DetectorsAppHealth` in its
+  environment, and every process created with that variable runs with ntdll's shim engine: `apphelp.dll` loads
+  and hooks each module's imports before `main` (a plain Rune window: 13,272 µs to `main` without it, 24,424 µs
+  with it). The variable is inherited, so an app its setup starts has it, and so does everything that app starts,
+  an update's relaunch included. Have the setup start the app with the variable removed
+  (`Command::env_remove("__COMPAT_LAYER")`), and drop the assistant's layers (`DetectorsAppHealth`, `Installer`)
+  from the app's own environment first thing in `main`. A terminal inside an app started that way carries it too:
+  remove it from the environment of anything you time.
+- **The floor**: `examples/launch-floor` is one window with the least a first frame can hold (`LAUNCH_FLOOR=bare`)
+  or a desktop app's first screen (`LAUNCH_FLOOR=shell`); it prints every `rune::marks` step in µs from the
+  process's start (`rune::process_age`). `perf/launch.bench.ts` times it with strobe
+  (`strobe bench perf/launch.bench.ts --base exe:<old> --head exe:<new> --target shell --filter warm`). On a
+  12th-generation laptop's integrated GPU the bare window's first frame is 20 ms after the process starts and the
+  shell-shaped one 27 ms, 10 of them before `main`; from a new exe file nothing of which is in memory, 65 and 82 ms.
 - **Measuring**: launch with `open` on a quiet Mac, interleave base and changed builds for 5 to 10 rounds, and
   report medians for window-visible and first-content times, cold and warm. Cold means deleting the app's Metal
   shader caches under `getconf DARWIN_USER_CACHE_DIR`: `com.apple.metal/<bundle id>` and
@@ -912,6 +933,10 @@ scripts/mac-app --name Example --id com.example.app --exe example --bin target/r
   permission answers across rebuilds. Without it the bundle is signed ad hoc, which macOS treats
   as a new app each build.
 
+`--bin` builds a development bundle (version `0.0.1`, macOS 13.0+, no Hardened Runtime, timestamp,
+or entitlements) that cannot be notarized; see [`scripts/mac-app.md`](../../scripts/mac-app.md) for
+the bundle details and how `--bundle` installs a pre-signed release bundle unchanged.
+
 The `rune-mac` crate holds the app's side (all no-ops off macOS):
 
 - `rune_mac::launch()`, first thing in `main`, keeps a relaunch behind the app in front from
@@ -977,7 +1002,11 @@ close/recreation. On Wayland, use `activate(token)` for authorized focus; tokenl
 also restores them. On macOS, no-focus show uses `orderFrontRegardless`, rather than winit's
 `makeKeyAndOrderFront`. Window-manager focus policy still applies. `WindowHandle`
 also provides show/hide/focus, placement and topmost control on the event thread.
-The app owns its tray; Rune supplies the window lifetime and handles.
+`rune::Tray` provides a system tray icon and menu on Windows (`Shell_NotifyIcon`) and
+Linux (StatusNotifierItem / `dbusmenu`, with the default `dbus` feature). On macOS (and
+other platforms), `Tray::new` returns `Err(TrayError::Unsupported)` because macOS status
+items are not implemented yet, so a macOS app still owns its status item while Rune
+supplies the window lifetime and handles.
 `RunOptions::accessory` applies the macOS process policy before the event loop is
 created: no Dock icon/default menu and no activation at launch. Other platforms
 ignore it; `run_windows` keeps its regular-launch default.
@@ -1237,6 +1266,12 @@ A root `.on_window_focus(|state: &mut State, focused, tx| ...)` receives native
 activation/deactivation in order. It applies to regular windows and interactive
 overlays, independently of text-field focus. Headless tests inject the same events
 with `Runtime::window_focus(bool)`.
+
+`tx.window_visible()` says, in a handler or `poll`, whether the window is on screen: false
+while it's hidden, minimised, covered whole by other windows where the system says so, or its
+browser tab is hidden. Such a window draws no frames, but each change wakes `poll` once, so
+work no one sees (a live preview, a ticker) can pause there and resume when it shows;
+`App::on_visibility` hears the same changes.
 
 `Live<T>` is a cloneable, thread-safe latest-wins handle (`f32`, `[f32; 2]`,
 `[f32; 4]`, `Color`). Call `set(value)` from a producer thread; Rune coalesces a
@@ -1827,9 +1862,11 @@ PNGs. See [`examples/overlay`](../../examples/overlay) for a normal control wind
 one overlay per monitor, a shared remote cursor, a stroke and hit-test toggling.
 
 Monitor enumeration is a startup snapshot. Winit platform/window-manager support
-still governs transparency, placement and topmost behavior. Non-activating macOS
-`NSPanel`s, all-Spaces/fullscreen-space policy and status items need Rune's own Mac
-shell; they are not implemented here.
+still governs transparency, placement and topmost behavior. On macOS, non-activating
+`NSPanel`s with all-Spaces and full-screen policy are available through `App::overlay`
+(see "Edge overlays" below), `WindowOptions::launcher_panel()`, and
+`MacWindowOptions::nonactivating_panel(true)` (ordinary windows can also set
+`MacWindowOptions::collection_behavior`); macOS status items are not implemented.
 Unsupported transparency falls back to opaque rendering; unsupported click-through
 prints the platform error. Metal surfaces retain premultiplied colour for Core Animation.
 
@@ -2648,6 +2685,8 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
   previous presented frame, written only when that frame asked for this one right away, so idle
   time isn't counted.
   `present_ms` is `null` when the system skipped the drawable and absent when no time arrived.
+  A frame carries `hz` when the display's refresh rate differs from the last one written (the
+  header's, at first), so the summary below uses the rate the display settled at.
   Lines are written once their present time arrives, two or three frames late. When the trace
   ends, stderr gets a summary: present-interval p50/p95/max, intervals under 2 ms (frames
   bunched onto the screen together) and over 1.5 refresh periods (missed refreshes), and the

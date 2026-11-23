@@ -1,5 +1,8 @@
 //! Windows' spell checking API: one checker per chosen dictionary (`super::languages`), made on
 //! each thread that checks and made again when the choice changes.
+
+#![allow(unsafe_code)]
+
 use std::cell::RefCell;
 
 use windows::Win32::Globalization::{
@@ -31,7 +34,7 @@ fn factory() -> Option<ISpellCheckerFactory> {
     // SAFETY: COM calls on this thread's apartment.
     unsafe {
         // The window's thread already has an apartment; a headless one may not.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok();
         CoCreateInstance(&SpellCheckerFactory, None, CLSCTX_INPROC_SERVER).ok()
     }
 }
@@ -280,7 +283,7 @@ pub(super) fn learn(word: &str) {
     with_checkers(|checkers| {
         for checker in checkers {
             // SAFETY: the checker is this thread's, and the word outlives the call.
-            let _ = unsafe { checker.Add(&HSTRING::from(word)) };
+            unsafe { checker.Add(&HSTRING::from(word)) }.ok();
         }
     });
 }

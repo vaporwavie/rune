@@ -119,7 +119,7 @@ impl Win {
 
     /// Asks for a frame: now, or at the turn's end while the window paints (`Redraw`).
     #[cfg_attr(feature = "frame-profile", track_caller)]
-    pub(in crate::window) fn request_redraw(&self) { self.redraw_step(RedrawEvent::Ask(Instant::now())); }
+    pub(in crate::window) fn request_redraw(&self) { self.redraw_step(RedrawEvent::Ask(crate::time::now())); }
 
     #[cfg_attr(feature = "frame-profile", track_caller)]
     pub(in crate::window) fn redraw_step(&self, event: RedrawEvent) {
@@ -130,22 +130,24 @@ impl Win {
         if effect == RedrawEffect::Request { self.window.request_redraw(); }
     }
 
-    /// Matches the drawable to the window's size; false when it already did. A surface that
-    /// refuses the new size is marked so its next frame replaces it (`Host::reattach`) rather
-    /// than drawing into a surface wgpu has no presentation for.
+    /// Matches the drawable to the window's size; false when it already did or when the reported
+    /// size is zero or exceeds the texture limit (keeping the previous drawable until a valid size
+    /// arrives). A surface that refuses the new size is marked so its next frame replaces it
+    /// (`Host::reattach`) rather than drawing into a surface wgpu has no presentation for.
     pub(in crate::window) fn resize_surface(&mut self, gpu: Option<&Gpu>, size: winit::dpi::PhysicalSize<u32>) -> bool {
-        let (width, height) = (size.width.max(1), size.height.max(1));
+        let (width, height) = super::drawable_size(Some((self.config.width, self.config.height)), (size.width, size.height), super::max_surface_dim(gpu));
         if (self.config.width, self.config.height) == (width, height) { return false; }
         self.config.width = width;
         self.config.height = height;
         // No surface: `Host::reattach` is between the old one and the new, and takes this size
         // from the window itself; or the CPU renderer draws it, whose buffer follows this size.
         let (Some(surface), Some(gpu)) = (&self.surface, gpu) else { return true };
-        // `configure` drains the present queue and reconfigures the swap chain; unregister any
-        // outstanding wait before it touches the swap chain.
+        let configured = super::configure(surface, gpu, &self.config);
+        // DX12 `configure` calls `ResizeBuffers` on the same swap chain, preserving its waitable
+        // semaphore and count; only a failed configure drops the swap chain.
         #[cfg(target_os = "windows")]
-        self.native.slot.reset();
-        if let Err(error) = super::configure(surface, gpu, &self.config) {
+        self.native.slot.reconfigured(configured.is_ok());
+        if let Err(error) = configured {
             eprintln!("rune: a window's surface refused its new size: {error}");
             self.surface_ok = false;
         }
@@ -158,7 +160,7 @@ impl Win {
 
 #[test]
 fn launcher_first_frame_holds_reveal_and_hide_cancels_late_completion() {
-    let now = Instant::now();
+    let now = crate::time::now();
     let mut frame = FirstFrame::default();
     frame.prepare(now);
     assert!(!frame.request_reveal(false, false, now));
@@ -178,7 +180,7 @@ fn launcher_first_frame_holds_reveal_and_hide_cancels_late_completion() {
 
 #[test]
 fn launcher_stale_reveal_waits_for_an_unsettled_hidden_frame() {
-    let now = Instant::now();
+    let now = crate::time::now();
     let mut frame = FirstFrame::drawn_notified();
     assert!(!frame.complete());
     assert!(frame.request_reveal(false, false, now), "unchanged state reveals the cached frame at once");
@@ -207,7 +209,7 @@ fn launcher_stale_reveal_waits_for_an_unsettled_hidden_frame() {
 
 #[test]
 fn launcher_refresh_with_no_drawable_retries_and_never_reveals_stale_pixels() {
-    let now = Instant::now();
+    let now = crate::time::now();
     let mut frame = FirstFrame::drawn_notified();
     let mut backoff = Backoff::default();
     let missed = |frame: &mut FirstFrame, backoff: &mut Backoff| {
@@ -230,14 +232,33 @@ fn launcher_refresh_with_no_drawable_retries_and_never_reveals_stale_pixels() {
     assert!(shown.deadline().is_none() && shown.ready());
 }
 
+#[test]
+fn launcher_hidden_resize_holds_reveal_until_the_resized_frame_draws() {
+    let now = crate::time::now();
+    let mut frame = FirstFrame::drawn_notified();
+    assert!(!frame.request_reveal(true, false, now), "changed state refreshes hidden first");
+    let deadline = frame.deadline();
+    assert!(deadline.is_some());
+    frame.gpu_done(); // Hidden refresh drew at the old height and queued a fit_content_height resize.
+    assert!(frame.pending());
+    frame.missed(); // The hidden surface resized, invalidating the old-height cached pixels.
+    assert!(!frame.pending() && !frame.ready() && frame.revealing(), "reveal waits for the resized draw");
+    assert_eq!(frame.deadline(), deadline, "keeps the original reveal deadline");
+    frame.gpu_done(); // Hidden frame drew at the new height.
+    assert!(frame.pending() && frame.complete(), "reveals once the new-height frame finishes");
+}
+
 impl Win {
-    pub(in crate::window) fn show(&self, focus: bool) {
+    pub(in crate::window) fn show(&mut self, focus: bool) {
         #[cfg(target_os = "macos")]
         {
             if let Some(shadow) = &self.native.shadow { shadow.shown(); }
             if let Some(panel) = &self.native.panel {
                 panel.show(std::time::Duration::ZERO);
                 if focus { panel.request_keys(); }
+                // A frame right after order-in can read as occluded before AppKit's commit
+                // lands, and launchers drop native occlusion events.
+                self.native.prime.arm();
                 return;
             }
             if !focus { crate::platform::macos::show_without_focus(&self.window); return; }
@@ -245,7 +266,7 @@ impl Win {
         // What it presented before it was hidden is gone, or never was: cloaked until it draws.
         #[cfg(target_os = "windows")]
         {
-            self.native.cloak.hold(&self.window, Instant::now() + READY_FALLBACK, false);
+            self.native.cloak.hold(&self.window, crate::time::now() + READY_FALLBACK, false);
             self.request_redraw();
         }
         self.window.set_visible(true);
@@ -373,7 +394,7 @@ impl Win {
 /// when no frame comes at all; a window on screen still runs it after its first frame.
 #[test]
 fn on_ready_runs_for_a_window_launched_occluded_or_hidden() {
-    let now = Instant::now();
+    let now = crate::time::now();
     let ms = Duration::from_millis;
     let mut shown = FirstFrame::opened(now);
     assert!(!shown.ready_due(now + ms(16)), "a window on screen waits for its first frame");

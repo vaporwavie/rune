@@ -1,28 +1,32 @@
 //! StatusNotifierItem (`org.kde.StatusNotifierItem`) with a `com.canonical.dbusmenu` menu, on
 //! its own session-bus connection and thread. The watcher is asked to show the item, again
 //! whenever a new watcher takes the name (a bar that starts later or restarts).
-use super::{Handler, TrayError, TrayEvent, TrayItem, TraySpec};
-use futures_util::StreamExt;
+use super::{DBUSMENU_ROOT as ROOT, DbusMenu, DbusMenuValue, Handler, TrayError, TrayEvent, TrayItem, TraySpec};
+use crate::platform::portal;
+use async_channel::{Sender, unbounded};
+use futures_lite::{FutureExt, StreamExt};
 use std::{collections::HashMap, sync::{Arc, Mutex, mpsc}, thread::JoinHandle, time::Duration};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, object_server::SignalEmitter};
+use zbus::{
+    Connection, Proxy,
+    object_server::SignalEmitter,
+    zvariant::{OwnedObjectPath, OwnedValue, Str, Value},
+};
 
 const ITEM_PATH: &str = "/StatusNotifierItem";
 const MENU_PATH: &str = "/MenuBar";
 const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const ROOT: i32 = 0;
 
 type Pixmaps = Vec<(i32, i32, Vec<u8>)>;
 /// One dbusmenu node, `(ia{sv}av)`; children are variants holding the same shape.
-type Layout = (i32, HashMap<String, OwnedVariant>, Vec<OwnedVariant>);
+type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
 
-struct Model { id: String, title: String, tooltip: String, icon_name: String, pixmaps: Pixmaps, menu: Vec<TrayItem>, revision: u32, token: Option<String> }
+struct Model { id: String, title: String, tooltip: String, icon_name: String, pixmaps: Pixmaps, menu: DbusMenu, token: Option<String> }
 type Shared = Arc<Mutex<Model>>;
 
 enum Command { Menu(Vec<TrayItem>), Tooltip(String) }
-pub(super) struct Native { commands: Option<UnboundedSender<Command>>, worker: Option<JoinHandle<()>> }
+pub(super) struct Native { commands: Option<Sender<Command>>, worker: Option<JoinHandle<()>> }
 
 fn backend(e: impl std::fmt::Display) -> TrayError { TrayError::Backend(e.to_string()) }
 
@@ -32,23 +36,16 @@ fn pixmaps(spec: &TraySpec) -> Pixmaps {
     vec![(spec.icon.width as i32, spec.icon.height as i32, argb)]
 }
 
-/// Menu ids are the item's position plus one; 0 is the root.
-fn properties(menu: &[TrayItem], id: i32) -> HashMap<String, OwnedVariant> {
-    let mut map = HashMap::new();
-    if id == ROOT { map.insert("children-display".into(), OwnedVariant::from(zbus::Str::from_static("submenu"))); return map; }
-    match menu.get(id as usize - 1) {
-        Some(TrayItem::Action { label, enabled, .. }) => {
-            map.insert("label".into(), OwnedVariant::from(zbus::Str::from(super::dbusmenu_label(label))));
-            if !enabled { map.insert("enabled".into(), OwnedVariant::from(false)); }
-        }
-        Some(TrayItem::Separator) => { map.insert("type".into(), OwnedVariant::from(zbus::Str::from_static("separator"))); }
-        None => {}
-    }
-    map
+fn properties(menu: &DbusMenu, id: i32) -> HashMap<String, OwnedValue> {
+    menu.properties(id).into_iter().map(|(k, v)| (k.into(), match v {
+        DbusMenuValue::StaticStr(s) => OwnedValue::from(Str::from_static(s)),
+        DbusMenuValue::Str(s) => OwnedValue::from(Str::from(s)),
+        DbusMenuValue::Bool(b) => OwnedValue::from(b),
+    })).collect()
 }
-fn layout(menu: &[TrayItem], id: i32) -> Layout {
+fn layout(menu: &DbusMenu, id: i32) -> Layout {
     let children = if id == ROOT {
-        (1..=menu.len() as i32).filter_map(|child| OwnedVariant::try_from(Variant::from(layout(menu, child))).ok()).collect()
+        menu.ids().filter_map(|child| OwnedValue::try_from(Value::from(layout(menu, child))).ok()).collect()
     } else { Vec::new() };
     (id, properties(menu, id), children)
 }
@@ -98,10 +95,7 @@ struct Menu { model: Shared, on_event: Handler }
 impl Menu {
     fn clicked(&self, id: i32, event: &str) {
         if event != "clicked" || id <= ROOT { return; }
-        let picked = match self.model.lock().unwrap().menu.get(id as usize - 1) {
-            Some(TrayItem::Action { id, enabled: true, .. }) => id.clone(),
-            _ => return,
-        };
+        let Some(picked) = self.model.lock().unwrap().menu.action_id(id).map(str::to_owned) else { return };
         (self.on_event)(TrayEvent::Menu(picked));
     }
 }
@@ -110,20 +104,20 @@ impl Menu {
 impl Menu {
     fn get_layout(&self, parent_id: i32, _recursion_depth: i32, _property_names: Vec<String>) -> (u32, Layout) {
         let model = self.model.lock().unwrap();
-        (model.revision, layout(&model.menu, parent_id))
+        (model.menu.revision(), layout(&model.menu, parent_id))
     }
-    fn get_group_properties(&self, ids: Vec<i32>, _property_names: Vec<String>) -> Vec<(i32, HashMap<String, OwnedVariant>)> {
+    fn get_group_properties(&self, ids: Vec<i32>, _property_names: Vec<String>) -> Vec<(i32, HashMap<String, OwnedValue>)> {
         let model = self.model.lock().unwrap();
         // No ids asks for every item.
-        let ids = if ids.is_empty() { (1..=model.menu.len() as i32).collect() } else { ids };
+        let ids = if ids.is_empty() { model.menu.ids().collect() } else { ids };
         ids.into_iter().map(|id| (id, properties(&model.menu, id))).collect()
     }
-    fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedVariant> {
+    fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedValue> {
         properties(&self.model.lock().unwrap().menu, id).remove(&name)
             .ok_or_else(|| zbus::fdo::Error::InvalidArgs("no such menu property".into()))
     }
-    fn event(&self, id: i32, event_id: String, _data: OwnedVariant, _timestamp: u32) { self.clicked(id, &event_id); }
-    fn event_group(&self, events: Vec<(i32, String, OwnedVariant, u32)>) -> Vec<i32> {
+    fn event(&self, id: i32, event_id: String, _data: OwnedValue, _timestamp: u32) { self.clicked(id, &event_id); }
+    fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
         for (id, event, _, _) in events { self.clicked(id, &event); }
         Vec::new()
     }
@@ -149,88 +143,89 @@ async fn register(conn: &Connection) {
         let watcher = Proxy::new(conn, WATCHER, WATCHER_PATH, WATCHER).await?;
         watcher.call::<_, _, ()>("RegisterStatusNotifierItem", &(name.as_str(),)).await
     };
-    let _ = tokio::time::timeout(RPC_TIMEOUT, call).await;
+    let _ = portal::timeout(RPC_TIMEOUT, call).await;
 }
 
 impl Native {
     pub(super) fn new(spec: TraySpec, on_event: Handler) -> Result<Self, TrayError> {
         let model = Arc::new(Mutex::new(Model { pixmaps: pixmaps(&spec), id: spec.id, title: spec.title, tooltip: spec.tooltip,
-            icon_name: spec.icon_name, menu: spec.menu, revision: 1, token: None }));
-        let (commands, mut receiver) = unbounded_channel();
+            icon_name: spec.icon_name, menu: DbusMenu::new(spec.menu), token: None }));
+        let (commands, receiver) = unbounded();
         let (ready, result) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new().name("rune-tray".into()).spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(r) => r, Err(e) => { let _ = ready.send(Err(backend(e))); return; }
-            };
-            runtime.block_on(async move {
+            async_io::block_on(async move {
                 let setup = async {
-                    let conn = zbus::connection::Builder::session()
-                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })
-                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })
+                    let conn = zbus::connection::Builder::session()?
+                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })?
+                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })?
                         .build().await?;
                     let bus = Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").await?;
                     let owners = bus.receive_signal_with_args("NameOwnerChanged", &[(0, WATCHER)]).await?;
                     Ok::<_, zbus::Error>((conn, owners))
                 };
-                let (conn, mut owners) = match tokio::time::timeout(RPC_TIMEOUT, setup).await {
-                    Ok(Ok(v)) => { let _ = ready.send(Ok(())); v }
-                    Ok(Err(e)) => { let _ = ready.send(Err(backend(e))); return; }
-                    Err(_) => { let _ = ready.send(Err(backend("session bus timed out"))); return; }
+                let (conn, mut owners) = match portal::timeout(RPC_TIMEOUT, setup).await {
+                    Some(Ok(v)) => { ready.send(Ok(())).ok(); v }
+                    Some(Err(e)) => { ready.send(Err(backend(e))).ok(); return; }
+                    None => { ready.send(Err(backend("session bus timed out"))).ok(); return; }
                 };
                 register(&conn).await;
+                enum Wake {
+                    Command(Option<Command>),
+                    Owner(Option<zbus::Message>),
+                }
                 loop {
-                    tokio::select! {
-                        command = receiver.recv() => {
-                            let Some(command) = command else { break };
-                            match command {
-                                Command::Menu(menu) => {
-                                    let revision = { let mut m = model.lock().unwrap(); m.menu = menu; m.revision += 1; m.revision };
-                                    if let Ok(emitter) = SignalEmitter::new(&conn, MENU_PATH) { let _ = Menu::layout_updated(&emitter, revision, ROOT).await; }
-                                }
-                                Command::Tooltip(tooltip) => {
-                                    model.lock().unwrap().tooltip = tooltip;
-                                    if let Ok(emitter) = SignalEmitter::new(&conn, ITEM_PATH) { let _ = Item::new_tool_tip(&emitter).await; }
-                                }
-                            }
+                    let next = async { Wake::Command(receiver.recv().await.ok()) }
+                        .or(async { Wake::Owner(owners.next().await) })
+                        .await;
+                    match next {
+                        Wake::Command(Some(Command::Menu(menu))) => {
+                            let revision = model.lock().unwrap().menu.update(menu);
+                            if let Ok(emitter) = SignalEmitter::new(&conn, MENU_PATH) { Menu::layout_updated(&emitter, revision, ROOT).await.ok(); }
                         }
-                        changed = owners.next() => {
-                            let Some(changed) = changed else { break };
+                        Wake::Command(Some(Command::Tooltip(tooltip))) => {
+                            model.lock().unwrap().tooltip = tooltip;
+                            if let Ok(emitter) = SignalEmitter::new(&conn, ITEM_PATH) { Item::new_tool_tip(&emitter).await.ok(); }
+                        }
+                        Wake::Command(None) | Wake::Owner(None) => break,
+                        Wake::Owner(Some(changed)) => {
                             let owner = changed.body().deserialize::<(String, String, String)>().map(|(_, _, new)| new);
                             if owner.is_ok_and(|new| !new.is_empty()) { register(&conn).await; }
                         }
                     }
                 }
                 // Closing the connection removes the icon at once.
-                let _ = conn.close().await;
+                conn.close().await.ok();
             });
         }).map_err(backend)?;
         match result.recv() {
             Ok(Ok(())) => Ok(Self { commands: Some(commands), worker: Some(worker) }),
-            Ok(Err(e)) => { let _ = worker.join(); Err(e) }
-            Err(_) => { let _ = worker.join(); Err(backend("tray thread exited")) }
+            Ok(Err(e)) => { worker.join().ok(); Err(e) }
+            Err(_) => { worker.join().ok(); Err(backend("tray thread exited")) }
         }
     }
     pub(super) fn set_menu(&self, menu: Vec<TrayItem>) {
-        if let Some(c) = &self.commands { let _ = c.send(Command::Menu(menu)); }
+        if let Some(c) = &self.commands { c.try_send(Command::Menu(menu)).ok(); }
     }
     pub(super) fn set_tooltip(&self, tooltip: String) {
-        if let Some(c) = &self.commands { let _ = c.send(Command::Tooltip(tooltip)); }
+        if let Some(c) = &self.commands { c.try_send(Command::Tooltip(tooltip)).ok(); }
     }
 }
 
 impl Drop for Native {
     fn drop(&mut self) {
         self.commands.take();
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() { worker.join().ok(); }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::Type;
+    use zbus::zvariant::Type;
 
-    fn menu() -> Vec<TrayItem> { vec![TrayItem::action("show", "Show"), TrayItem::Separator, TrayItem::action("quit", "Quit").enabled(false)] }
+    fn menu() -> DbusMenu {
+        DbusMenu::new(vec![TrayItem::action("show", "Show"), TrayItem::Separator, TrayItem::action("quit", "Quit").enabled(false)])
+    }
 
     #[test]
     fn the_layout_has_the_dbusmenu_shape() {
@@ -244,13 +239,59 @@ mod tests {
     #[test]
     fn items_carry_label_type_and_enabled() {
         let menu = menu();
-        assert!(properties(&menu, 1).contains_key("label"));
-        assert!(properties(&menu, 2).contains_key("type"));
-        assert!(properties(&menu, 3).contains_key("enabled"));
+        let ids: Vec<i32> = menu.ids().collect();
+        let show = properties(&menu, ids[0]);
+        assert_eq!(<&str>::try_from(show.get("type").unwrap()).ok(), Some("standard"));
+        assert_eq!(<&str>::try_from(show.get("label").unwrap()).ok(), Some("Show"));
+        assert_eq!(bool::try_from(show.get("enabled").unwrap()).ok(), Some(true));
+        let sep = properties(&menu, ids[1]);
+        assert_eq!(<&str>::try_from(sep.get("type").unwrap()).ok(), Some("separator"));
+        let quit = properties(&menu, ids[2]);
+        assert_eq!(<&str>::try_from(quit.get("type").unwrap()).ok(), Some("standard"));
+        assert_eq!(bool::try_from(quit.get("enabled").unwrap()).ok(), Some(false));
         assert!(properties(&menu, 9).is_empty());
-        let underscored = vec![TrayItem::action("open", "open_file")];
-        let props = properties(&underscored, 1);
+        let underscored = DbusMenu::new(vec![TrayItem::action("open", "open_file")]);
+        let props = properties(&underscored, underscored.ids().next().unwrap());
         assert_eq!(<&str>::try_from(props.get("label").unwrap()).ok(), Some("open__file"));
+    }
+
+    #[test]
+    fn menu_updates_preserve_item_ids_and_dispatch_clicks_by_assigned_id() {
+        let spec = TraySpec::new("t", "T", super::super::TrayIcon::rgba(1, 1, vec![1, 2, 3, 4]))
+            .menu(vec![TrayItem::action("show", "Show"), TrayItem::Separator, TrayItem::action("quit", "Quit")]);
+        let pixmaps = pixmaps(&spec);
+        let model = Arc::new(Mutex::new(Model {
+            id: spec.id, title: spec.title, tooltip: spec.tooltip, icon_name: spec.icon_name,
+            pixmaps, menu: DbusMenu::new(spec.menu), token: None,
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let dbus_menu = Menu { model: model.clone(), on_event: Arc::new(move |e| seen.lock().unwrap().push(e)) };
+
+        let before: Vec<i32> = dbus_menu.get_group_properties(Vec::new(), Vec::new()).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(before.len(), 3);
+        let (show_id, sep_id, quit_id) = (before[0], before[1], before[2]);
+
+        model.lock().unwrap().menu.update(vec![
+            TrayItem::action("show", "Show"),
+            TrayItem::action("disconnect", "Disconnect"),
+            TrayItem::Separator,
+            TrayItem::action("quit", "Quit"),
+        ]);
+        let (rev, _) = dbus_menu.get_layout(ROOT, -1, Vec::new());
+        assert_eq!(rev, 2);
+        let after: Vec<i32> = dbus_menu.get_group_properties(Vec::new(), Vec::new()).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(after.len(), 4);
+        let disconnect_id = after[1];
+        assert_eq!(after[0], show_id);
+        assert_eq!(after[2], sep_id);
+        assert_eq!(after[3], quit_id);
+        assert!(!before.contains(&disconnect_id));
+
+        dbus_menu.clicked(disconnect_id, "clicked");
+        dbus_menu.clicked(sep_id, "clicked");
+        dbus_menu.clicked(quit_id, "clicked");
+        assert_eq!(*events.lock().unwrap(), vec![TrayEvent::Menu("disconnect".into()), TrayEvent::Menu("quit".into())]);
     }
 
     #[test]
@@ -263,7 +304,7 @@ mod tests {
         let spec = TraySpec::new("t", "T", super::super::TrayIcon::rgba(1, 1, vec![1, 2, 3, 4])).icon_name(icon_name);
         let pixmaps = pixmaps(&spec);
         let model = Model { id: spec.id, title: spec.title, tooltip: spec.tooltip, icon_name: spec.icon_name,
-            pixmaps, menu: spec.menu, revision: 1, token: None };
+            pixmaps, menu: DbusMenu::new(spec.menu), token: None };
         Item { model: Arc::new(Mutex::new(model)), on_event: Arc::new(|_| {}) }
     }
 

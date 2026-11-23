@@ -12,6 +12,7 @@ use crate::render::cpu_boot::{CpuPainter, HalfRounding, NeedsGpu, Scene, Target}
 use crate::runtime::RuntimeCore;
 
 pub(super) struct CpuCanvas {
+    over: web_sys::HtmlCanvasElement,
     canvas: web_sys::HtmlCanvasElement,
     ctx: web_sys::CanvasRenderingContext2d,
     painter: CpuPainter,
@@ -58,12 +59,31 @@ impl CpuCanvas {
         let css = over.style().css_text();
         // The GPU's canvas starts see-through: this one shows.
         canvas.style().set_css_text(&format!("{css};pointer-events:none;opacity:1"));
-        let _ = canvas.set_attribute("aria-hidden", "true");
+        canvas.set_attribute("aria-hidden", "true").ok();
+        canvas.set_attribute("data-rune-cpu", "").ok();
         over.parent_node()?.insert_before(&canvas, Some(over)).ok()?;
         let options = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&options, &"alpha".into(), &JsValue::FALSE);
-        let ctx = canvas.get_context_with_context_options("2d", &options).ok()??.dyn_into().ok()?;
-        Some(CpuCanvas { canvas, ctx, painter: CpuPainter::new(1), buffer: Vec::new(), size: (0, 0), rows: Vec::new(), staged: js_sys::Uint8ClampedArray::new_with_length(0), half: HalfRounding::default() })
+        js_sys::Reflect::set(&options, &"alpha".into(), &JsValue::FALSE).ok();
+        let ctx: web_sys::CanvasRenderingContext2d = canvas.get_context_with_context_options("2d", &options).ok()??.dyn_into().ok()?;
+        ctx.set_image_smoothing_enabled(false);
+        Some(CpuCanvas { over: over.clone(), canvas, ctx, painter: CpuPainter::new(1), buffer: Vec::new(), size: (0, 0), rows: Vec::new(), staged: js_sys::Uint8ClampedArray::new_with_length(0), half: HalfRounding::default() })
+    }
+
+    /// Keeps the CPU canvas's CSS bounds aligned with `over` if its inline box changed outside
+    /// `platform.js::viewport`.
+    fn sync_bounds(&self) {
+        let src = self.over.style();
+        let dst = self.canvas.style();
+        for prop in ["width", "height", "left", "top"] {
+            let value = src.get_property_value(prop).unwrap_or_default();
+            if dst.get_property_value(prop).unwrap_or_default() != value {
+                if value.is_empty() {
+                    dst.remove_property(prop).ok();
+                } else {
+                    dst.set_property(prop, &value).ok();
+                }
+            }
+        }
     }
 
     /// Paints the runtime's last frame at `size` physical pixels and puts what changed on the
@@ -71,9 +91,12 @@ impl CpuCanvas {
     pub(super) fn paint(&mut self, rt: &mut RuntimeCore, size: (u32, u32)) -> Result<Cost, NeedsGpu> {
         let (w, h) = (size.0.max(1), size.1.max(1));
         if self.size != (w, h) {
+            self.sync_bounds();
             // A new size clears the canvas, and the buffer starts again: every tile paints.
             self.canvas.set_width(w);
             self.canvas.set_height(h);
+            // Resizing resets the 2D context state back to defaults.
+            self.ctx.set_image_smoothing_enabled(false);
             self.buffer.clear();
             self.buffer.resize(w as usize * h as usize * 4, 0);
             self.painter.forget();
@@ -84,14 +107,37 @@ impl CpuCanvas {
         let filled = crate::time::Instant::now();
         let scene = Scene::new(&rt.instances, &rt.text.atlas, &rt.images, (w, h), rt.clear_color())
             .srgb_blend(rt.srgb_blend())
+            .fade_stops(rt.fade_stops())
             .native_surfaces(!rt.surfaces.is_empty())
             .half_rounding(self.half)
             .font_smoothing(rt.font_smoothing());
         let painted = self.painter.paint(&scene, &mut Target::new(&mut self.buffer, w, h))?;
         let put = crate::time::Instant::now();
+        let plan = self.painter.upload_plan(&painted, (w, h));
+        // When the frame scrolled cleanly, shift the moved region inside the opaque 2D canvas
+        // directly (exact 1:1 copy without readback or putImageData) and upload only the dirty
+        // tiles; fall back to uploading `painted.rects` if the self-blit fails.
+        let rects = match plan.blit {
+            Some(b)
+                if self
+                    .ctx
+                    .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                        &self.canvas,
+                        f64::from(b.src_x),
+                        f64::from(b.src_y),
+                        f64::from(b.width),
+                        f64::from(b.height),
+                        f64::from(b.dst_x),
+                        f64::from(b.dst_y),
+                        f64::from(b.width),
+                        f64::from(b.height),
+                    )
+                    .is_ok() => plan.uploads,
+            _ => &painted.rects,
+        };
         let mut px = 0u64;
         let mut swizzle = std::time::Duration::ZERO;
-        for &[x0, y0, x1, y1] in &painted.rects {
+        for &[x0, y0, x1, y1] in rects {
             let (rw, rh) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
             if rw == 0 || rh == 0 { continue; }
             let began = crate::time::Instant::now();
@@ -111,7 +157,7 @@ impl CpuCanvas {
             swizzle += began.elapsed();
             let staged = self.staged.subarray(0, len as u32);
             if let Ok(image) = web_sys::ImageData::new_with_js_u8_clamped_array_and_sh(&staged, rw, rh) {
-                let _ = self.ctx.put_image_data(&image, f64::from(x0), f64::from(y0));
+                self.ctx.put_image_data(&image, f64::from(x0), f64::from(y0)).ok();
             }
             px += u64::from(rw) * u64::from(rh);
         }
@@ -135,19 +181,17 @@ impl CpuCanvas {
 }
 
 /// `bgra`'s pixels as R, G, B, A, into `out` (as long).
+#[allow(unsafe_code)]
 fn rgba(bgra: &[u8], out: &mut [u8]) {
     let swap = |v: u32| (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16);
     // Whole pixels as words where both sides line up (they do: rows start on whole pixels of
     // buffers the allocator aligns).
-    // SAFETY: any bit pattern is a valid u32 and u8; `align_to` keeps the parts it can't align.
-    let (dh, dm, dt) = unsafe { out.align_to_mut::<u32>() };
-    let (sh, sm, st) = unsafe { bgra.align_to::<u32>() };
-    if !(dh.is_empty() && sh.is_empty() && dt.is_empty() && st.is_empty()) {
+    let (Ok(dm), Ok(sm)) = (bytemuck::try_cast_slice_mut::<u8, u32>(out), bytemuck::try_cast_slice::<u8, u32>(bgra)) else {
         for (d, s) in out.chunks_exact_mut(4).zip(bgra.chunks_exact(4)) {
             d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
         }
         return;
-    }
+    };
     #[cfg(target_feature = "simd128")]
     {
         use core::arch::wasm32::{i8x16, u8x16_swizzle, v128, v128_load, v128_store};

@@ -37,7 +37,12 @@ pub enum Label<'a> {
     Menu(&'a str),
     /// The Window menu's items.
     Minimize,
+    Zoom,
     Close,
+    BringAllToFront,
+    /// The Edit menu's system items (macOS).
+    StartDictation,
+    EmojiAndSymbols,
     /// The app menu's items; some carry the app's name.
     About(&'a str),
     Services,
@@ -117,7 +122,11 @@ fn english(label: Label<'_>) -> String {
         Label::Language(tag) => tag.into(),
         Label::Menu(name) => name.into(),
         Label::Minimize => "Minimize".into(),
+        Label::Zoom => "Zoom".into(),
         Label::Close => "Close".into(),
+        Label::BringAllToFront => "Bring All to Front".into(),
+        Label::StartDictation => "Start Dictation…".into(),
+        Label::EmojiAndSymbols => "Emoji & Symbols".into(),
         Label::About(app) => format!("About {app}"),
         Label::Services => "Services".into(),
         Label::Hide(app) => format!("Hide {app}"),

@@ -33,6 +33,8 @@ const SPARE_KEEPS: usize = 8;
 enum Callback {
     Map(BufferMapCallback),
     Done(BoxSubmittedWorkDoneCallback),
+    /// The device's loss, heard before the callbacks of what failed.
+    Lost(BoxDeviceLostCallback, String),
 }
 
 /// A committed command buffer and the resources it references without retaining.
@@ -71,6 +73,14 @@ struct Uploads {
     blit: Obj<dyn MTLBlitCommandEncoder>,
     cb: Obj<dyn MTLCommandBuffer>,
     keep: Keep,
+}
+
+/// `cb`'s error, when it ended with one: the device is lost, whatever the error, as in Dawn and
+/// WebGPU ("lose the device"). Work that failed, a buffer the GPU discarded while recovering from a
+/// hang included, didn't run, and a GPU that timed out on a queue ignores what it commits after.
+fn failed(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Option<String> {
+    if cb.status() != MTLCommandBufferStatus::Error { return None }
+    Some(cb.error().map_or_else(|| "a Metal command buffer failed".to_owned(), |e| e.localizedDescription().to_string()))
 }
 
 fn completed(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
@@ -163,16 +173,39 @@ impl Shared {
         uploads.keep.extend(keep);
     }
 
+    /// `callback` once the work submitted so far finished; at once (in order) on a lost device.
     fn after(&self, callback: Callback) {
-        let mut st = self.lock();
-        let at = st.last;
-        st.callbacks.push_back((at, callback));
+        let lost = {
+            let mut st = self.lock();
+            let at = st.last;
+            st.callbacks.push_back((at, callback));
+            self.lost.lock().message.is_some()
+        };
+        if lost { self.dispatch(); }
     }
 
     /// Releases what completed command buffers used and runs the callbacks waiting on them.
     /// One at a time, outside the lock: callbacks may call back into the device. Returns the
     /// value it retired up to.
     pub(super) fn retire(&self) -> u64 { self.retire_inner(false) }
+
+    /// The front command buffer, taken off once complete (`check_unsignaled`: see
+    /// `retire_inner`). One that failed loses the device under the same lock where the retired
+    /// value moves past it: no one sees the work retired before the loss, and the loss's callback
+    /// goes first in line.
+    fn pop_completed(&self, st: &mut State, signaled: u64) -> Option<Pending> {
+        if !st.retire.front().is_some_and(|p| p.value <= signaled && completed(&p.cb)) { return None }
+        let p = st.retire.pop_front()?;
+        if let Some(message) = failed(&p.cb) {
+            let mut lost = self.lost.lock();
+            if lost.message.is_none() {
+                lost.message = Some(message.clone());
+                if let Some(f) = lost.callback.take() { st.callbacks.push_front((0, Callback::Lost(f, message))); }
+            }
+        }
+        st.retired = st.retired.max(p.value);
+        Some(p)
+    }
 
     /// Retires completed command buffers from the front of `st.retire`. When `check_unsignaled`
     /// is false, skips `cb.status()` on command buffers whose shared-event value has not yet
@@ -181,7 +214,7 @@ impl Shared {
     fn retire_inner(&self, check_unsignaled: bool) -> u64 {
         let signaled = if check_unsignaled { u64::MAX } else { self.event.signaledValue() };
         let mut emptied: Option<Keep> = None;
-        let (done, has_callbacks) = loop {
+        let done = loop {
             let pending = {
                 let mut st = self.lock();
                 if let Some(keep) = emptied.take()
@@ -189,40 +222,43 @@ impl Shared {
                 {
                     st.spare.push(keep);
                 }
-                if st.retire.front().is_some_and(|p| p.value <= signaled && completed(&p.cb)) {
-                    if let Some(p) = st.retire.pop_front() {
-                        st.retired = st.retired.max(p.value);
-                        Some(p)
-                    } else {
-                        None
-                    }
-                } else {
-                    let done = st.retired;
-                    let has_cb = st.callbacks.front().is_some_and(|(at, _)| *at <= done);
-                    break (done, has_cb);
+                match self.pop_completed(&mut st, signaled) {
+                    Some(p) => p,
+                    None => break st.retired,
                 }
             };
-            let Some(Pending { cb, mut keep, drawable, .. }) = pending else { continue };
+            let Pending { cb, mut keep, drawable, .. } = pending;
             // Drop the completed command buffer before any object it referenced without retaining.
             drop(cb);
             drop(drawable);
             keep.clear();
             if keep.capacity() > 0 { emptied = Some(keep); }
         };
-        if has_callbacks {
-            loop {
-                let next = {
-                    let mut st = self.lock();
-                    if st.callbacks.front().is_some_and(|(at, _)| *at <= done) { st.callbacks.pop_front() } else { None }
-                };
-                match next {
-                    Some((_, Callback::Map(f))) => f(Ok(())),
-                    Some((_, Callback::Done(f))) => f(),
-                    None => break,
-                }
+        self.dispatch();
+        done
+    }
+
+    /// Runs the callbacks retired work owes, in order, outside the state lock (they may call back
+    /// into the device), on one thread at a time: one that finds another (or itself, from a
+    /// callback) running them leaves them to it, which runs what retires meanwhile too. On a lost
+    /// device every one runs, as WebGPU's "lose the device" completes what waits on it: work-done
+    /// callbacks as done, mappings failing (their data can't be right).
+    fn dispatch(&self) {
+        let Some(_turn) = self.dispatch.try_lock() else { return };
+        loop {
+            let (next, lost) = {
+                let mut st = self.lock();
+                let (retired, lost) = (st.retired, self.lost.lock().message.is_some());
+                let next = if st.callbacks.front().is_some_and(|(at, _)| lost || *at <= retired) { st.callbacks.pop_front() } else { None };
+                (next, lost)
+            };
+            match next {
+                Some((_, Callback::Map(f))) => f(if lost { Err(wgpu::BufferAsyncError) } else { Ok(()) }),
+                Some((_, Callback::Done(f))) => f(),
+                Some((_, Callback::Lost(f, message))) => f(wgpu::DeviceLostReason::Unknown, message),
+                None => break,
             }
         }
-        done
     }
 
     pub(super) fn poll(&self, poll: wgpu::wgt::PollType<u64>) -> Result<wgpu::PollStatus, wgpu::PollError> {
@@ -298,6 +334,14 @@ impl Shared {
         self.retire();
     }
 
+    /// Takes the front command buffer off if complete, as one thread's retire does, and nothing
+    /// more (no callbacks): for tests.
+    #[cfg(test)]
+    pub(super) fn retire_one(&self) -> bool {
+        let mut st = self.lock();
+        self.pop_completed(&mut st, u64::MAX).is_some()
+    }
+
     /// Pending command buffers waiting for completion, for tests.
     #[cfg(test)]
     pub(super) fn pending_cbs(&self) -> Vec<(u64, Obj<dyn MTLCommandBuffer>)> {
@@ -331,6 +375,7 @@ impl Drop for Shared {
 pub(crate) struct MetalQueue(pub(super) Arc<Shared>);
 
 impl QueueInterface for MetalQueue {
+    #[allow(unsafe_code)]
     fn write_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, data: &[u8]) {
         if data.is_empty() { return }
         let store = &buffer.as_custom::<MetalBuffer>().expect("a Metal buffer").store;

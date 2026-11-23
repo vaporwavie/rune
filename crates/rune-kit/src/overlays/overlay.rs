@@ -167,6 +167,7 @@ pub struct Popover {
     placement: Placement,
     gutter: f32,
     padding: f32,
+    width: Option<f32>,
     close: Acts,
     dismiss: Option<El>,
 }
@@ -184,6 +185,7 @@ impl Popover {
             placement: Placement::Bottom,
             gutter: 4.0,
             padding: 12.0,
+            width: None,
             close: Acts::default(),
             dismiss: None,
         }
@@ -227,6 +229,11 @@ impl Popover {
         self.gutter = g;
         self
     }
+    /// Fixes the surface width in points in place of the default 200..320 clamp.
+    pub(crate) fn width(mut self, w: f32) -> Self {
+        self.width = Some(w);
+        self
+    }
     /// Close requests: the close button and presses outside.
     pub fn on_close<S: 'static>(mut self, f: impl Fn(&mut S) + Clone + 'static) -> Self {
         self.dismiss = Some(scrim(scrim_key(&self.key), f.clone()));
@@ -245,7 +252,11 @@ impl Popover {
         }
         let mut content = col().key(content_key(&self.key)).role("dialog")
             .description(self.description.clone().unwrap_or_default())
-            .focus_return(&anchor_key).min_w(200.0).max_w(320.0);
+            .focus_return(&anchor_key);
+        content = match self.width {
+            Some(w) => content.w(w),
+            None => content.min_w(200.0).max_w(320.0),
+        };
         if let Some(l) = &self.label {
             content = content.label(l.clone());
         }
@@ -263,13 +274,13 @@ impl Popover {
                     .gap(8.0)
                     .center_y()
                     .justify_between()
-                    .child(text(t.clone()).key("title").font(k.ty.body_medium).color(c.text_strong).grow(1.0))
+                    .child(text(t.clone()).key("title").font(k.ty.body_medium).color(c.text_strong).truncate())
                     .child(close),
             );
         }
         if let Some(d) = &self.description {
             content = content.child(
-                row().key("description").px(12.0).child(text(d.clone()).font(k.ty.text_small).color(c.std_text)),
+                row().key("description").px(12.0).child(text(d.clone()).font(k.ty.text_small).color(c.std_text).wrap().shrink()),
             );
         }
         content = content.child(col().key("body").padding(self.padding).shrink().min_h(0.0).children(self.body));
@@ -313,6 +324,8 @@ pub struct TooltipStyle {
     motion: Spring,
     /// A keybind's keys (`keybind-v2` neutral): their fill and label colour.
     keys: (Color, Color),
+    /// The positioner's line it sits on, for the `inline-flex` appearances (`tooltip.css`).
+    line: Option<TextStyle>,
 }
 
 impl TooltipStyle {
@@ -330,6 +343,8 @@ impl TooltipStyle {
             shadows: k.shadow_layers(&k.elevation.floating).collect(),
             motion: k.motion.overlay,
             keys: (c.layer_03, c.text_muted),
+            // The page's 13/24 line (`base.css` `html`, measured on the positioner).
+            line: Some(TextStyle { family: k.ty.small_medium.family, ..TextStyle::new(13.0, 400.0).lh(24.0) }),
         };
         match appearance {
             TooltipAppearance::Compact => base,
@@ -345,6 +360,8 @@ impl TooltipStyle {
                 font: k.ty.text_small_medium,
                 ink: c.text_invert_strong,
                 shadows: k.shadow_layers(&k.elevation.md).collect(),
+                // `display: block`: it doesn't sit on the positioner's line.
+                line: None,
                 ..base
             },
         }
@@ -405,16 +422,19 @@ impl TooltipStyle {
     }
     /// This look for Rune's own [`El::help`](rune::El::help) tooltips
     /// ([`Cx::help_look`](rune::Cx::help_look)), placed and timed as `@opencode/ui`'s
-    /// `Tooltip` sets Kobalte's: 4 pt from its element, 8 pt inside the window, after 400 ms,
-    /// and at once within 300 ms of the last one hiding; it fades and scales in from 0.96 over
+    /// `Tooltip` sets Kobalte's: 4 pt from its element, 8 pt inside the window, after 600 ms,
+    /// at once within 300 ms of the last one hiding, and at once when the keyboard focuses its
+    /// element (opencode#63834); it fades and scales in from 0.96 over
     /// 120 ms ease-out and out over 80 ms ease-in (`tooltip.css`). Its keycaps are `keybind-v2`'s
     /// neutral keys: 14 pt, 4 pt in, 2 pt corners and 2 pt apart, 6 pt after the text, their
     /// labels in uppercase 11/530. Rows ([`El::help_row`](rune::El::help_row)) stack 6 pt apart,
-    /// as a tooltip listing two commands does (`line-comment.tsx`, `flex-col gap-1.5`).
+    /// as a tooltip listing two commands does (`line-comment.tsx`, `flex-col gap-1.5`). Compact
+    /// and large sit on their positioner's 13/24 line (`display: inline-flex` in a block,
+    /// `tooltip.css`), so under its element one shows 1 or 2 pt lower than the 4 pt gap puts it.
     pub fn help_look(&self) -> rune::HelpLook {
         let (ring_w, ring) = self.border.unwrap_or((0.0, Color::TRANSPARENT));
         let key = TextStyle::new(11.0, 530.0).lh(11.0).tracking(0.05).features("'tnum' 1, 'lnum' 1");
-        rune::HelpLook::system(false)
+        let look = rune::HelpLook::system(false)
             .fill(self.fill)
             .ink(self.ink)
             .ring(ring_w, ring)
@@ -425,12 +445,17 @@ impl TooltipStyle {
             .shadows(self.shadows.iter().copied())
             .gap(4.0)
             .margin(8.0)
-            .delay(0.4)
+            .delay(0.6)
             .skip_delay(0.3)
+            .on_focus(true)
             .fade(0.12, 0.08, 0.96)
             .keycaps(self.keys.0, self.keys.1, TextStyle { family: self.font.family, ..key }, true)
             .keycap_shape(14.0, 4.0, 2.0, 2.0, 6.0)
-            .row_gap(6.0)
+            .row_gap(6.0);
+        match self.line {
+            Some(line) => look.sit_on_line(line),
+            None => look,
+        }
     }
 }
 

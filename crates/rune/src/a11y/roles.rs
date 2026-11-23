@@ -138,21 +138,21 @@ pub(crate) const ROLES: &[RoleSpec] = &[
     RoleSpec::role("heading", Role::Heading),
     RoleSpec::role("tab", Role::Tab).warn_nameless().web_control().pointer(),
     RoleSpec::role("region", Role::Region).container("section"),
-    RoleSpec::role("alert", Role::Alert).live(LiveRegion::Assertive),
+    RoleSpec::role("alert", Role::Alert).live(LiveRegion::Assertive).aria_container(),
     RoleSpec::role("mark", Role::Label),
     RoleSpec::role("switch", Role::Switch).warn_nameless().web_control().pointer(),
     RoleSpec::role("link", Role::Link).warn_nameless().pointer(),
     RoleSpec::role("menuitem", Role::MenuItem).warn_nameless().web_control().pointer(),
     RoleSpec::role("radio", Role::RadioButton).warn_nameless().web_control().pointer(),
     RoleSpec::role("menu", Role::Menu),
-    RoleSpec::role("status", Role::Status).live(LiveRegion::Polite),
+    RoleSpec::role("status", Role::Status).live(LiveRegion::Polite).aria_container(),
     RoleSpec::role("tree", Role::Tree),
     RoleSpec::role("main", Role::Main).container("main"),
     RoleSpec::role("row", Role::Row).aria_container(),
     RoleSpec::role("treeitem", Role::TreeItem).warn_nameless().web_control(),
     RoleSpec::role("checkbox", Role::CheckBox).warn_nameless().web_control().pointer(),
     RoleSpec::role("toolbar", Role::Toolbar),
-    RoleSpec::role("radiogroup", Role::RadioGroup),
+    RoleSpec::role("radiogroup", Role::RadioGroup).aria_container(),
     RoleSpec::role("progressbar", Role::ProgressIndicator),
     RoleSpec::role("note", Role::Note),
     RoleSpec::role("combobox", Role::ComboBox).warn_nameless().pointer(),
@@ -160,7 +160,7 @@ pub(crate) const ROLES: &[RoleSpec] = &[
     RoleSpec::role("code", Role::Code),
     RoleSpec::role("columnheader", Role::ColumnHeader).aria_container(),
     RoleSpec::new("separator", AkRole::Separator),
-    RoleSpec::role("tablist", Role::TabList),
+    RoleSpec::role("tablist", Role::TabList).aria_container(),
     RoleSpec::role("segment", Role::RadioButton).warn_nameless(),
     RoleSpec::role("window", Role::Window),
     RoleSpec::role("navigation", Role::Navigation).container("nav"),
@@ -187,7 +187,7 @@ pub(crate) const ROLES: &[RoleSpec] = &[
     RoleSpec::role("form", Role::Form),
     RoleSpec::role("contentinfo", Role::ContentInfo).container("footer"),
     RoleSpec::role("alertdialog", Role::AlertDialog).aria_container(),
-    RoleSpec::role("log", Role::Log).live(LiveRegion::Polite),
+    RoleSpec::role("log", Role::Log).live(LiveRegion::Polite).aria_container(),
     // Rune component aliases and less frequent ARIA roles.
     RoleSpec::new("toggle", AkRole::Button).warn_nameless(),
     RoleSpec::new("swatch", AkRole::Button).warn_nameless(),
@@ -244,6 +244,8 @@ pub(crate) fn map(role: &str, cx: &RoleCtx) -> Option<Role> {
     if cx.input {
         return Some(if cx.secure { Role::PasswordInput }
             else if role == "searchbox" { Role::SearchInput }
+            else if role == "combobox" { Role::EditableComboBox }
+            else if role == "spinbutton" { Role::SpinButton }
             else if cx.multiline { Role::MultilineTextInput } else { Role::TextInput });
     }
     match spec(role).map_or(AkRole::Fallback, |s| s.ak) {
@@ -356,6 +358,7 @@ const fn ak_meta(role: Role) -> AkRoleMeta {
         Role::Heading => D.focus("heading").content_name(),
         Role::TextInput | Role::MultilineTextInput | Role::SearchInput | Role::PasswordInput | Role::Terminal => D.focus("textbox"),
         Role::Slider => D.focus("slider"),
+        Role::SpinButton => D.focus("spinbutton"),
         Role::ComboBox | Role::EditableComboBox => D.focus("combobox"),
         Role::Dialog => D.focus("dialog"),
         Role::AlertDialog => D.focus("alertdialog"),
@@ -438,8 +441,15 @@ mod tests {
         let field = RoleCtx { input: true, ..cx() };
         assert_eq!(map("textbox", &field), Some(Role::TextInput));
         assert_eq!(map("searchbox", &field), Some(Role::SearchInput));
+        assert_eq!(map("combobox", &field), Some(Role::EditableComboBox));
+        assert_eq!(map("spinbutton", &field), Some(Role::SpinButton));
+        assert_eq!(map("combobox", &cx()), Some(Role::ComboBox));
         assert_eq!(map("textbox", &RoleCtx { multiline: true, ..field }), Some(Role::MultilineTextInput));
         assert_eq!(map("textbox", &RoleCtx { secure: true, ..field }), Some(Role::PasswordInput));
+        assert_eq!(map("combobox", &RoleCtx { secure: true, ..field }), Some(Role::PasswordInput));
+        assert_eq!(map("spinbutton", &RoleCtx { secure: true, ..field }), Some(Role::PasswordInput));
+        assert_eq!(focus_role(Role::EditableComboBox), "combobox");
+        assert_eq!(focus_role(Role::SpinButton), "spinbutton");
     }
 
     #[test]
@@ -513,6 +523,16 @@ mod tests {
         assert_eq!(container_tag("listitem"), Some("li"));
         assert_eq!(container_tag("dialog"), Some("div"));
         assert_eq!(container_aria("dialog"), Some("dialog"));
+        assert_eq!(container_tag("tablist"), Some("div"));
+        assert_eq!(container_aria("tablist"), Some("tablist"));
+        assert_eq!(container_tag("radiogroup"), Some("div"));
+        assert_eq!(container_aria("radiogroup"), Some("radiogroup"));
+        assert_eq!(container_tag("status"), Some("div"));
+        assert_eq!(container_aria("status"), Some("status"));
+        assert_eq!(container_tag("alert"), Some("div"));
+        assert_eq!(container_aria("alert"), Some("alert"));
+        assert_eq!(container_tag("log"), Some("div"));
+        assert_eq!(container_aria("log"), Some("log"));
         assert_eq!(container_aria("table"), Some("table"));
         assert_eq!(container_aria("main"), None);
         assert_eq!(web_control_role("option"), Some("option"));

@@ -149,13 +149,24 @@ fn the_middle_button_drags_only_elements_that_take_it() {
     assert!(drags.contains(&(Phase::Move, PointerButton::Middle, 20.0, 30.0)));
     assert_eq!(drags.last(), Some(&(Phase::Up, PointerButton::Middle, 20.0, 30.0)));
     assert!(drags.iter().all(|d| d.1 == PointerButton::Middle));
-    assert_eq!(rt.state.presses, [PointerButton::Middle], "released over it, as a primary drag would be");
+    assert!(rt.state.presses.is_empty(), "a drag past the click slop suppresses on_press, as a primary drag does");
 
-    // A middle click outside it presses nothing.
+    // A middle click within slop presses it.
+    rt.button_down(90.0, 100.0, PointerButton::Middle);
+    rt.button_up(90.0, 100.0, PointerButton::Middle);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.presses, [PointerButton::Middle]);
+
+    // A middle click outside it presses nothing (on Windows/Linux it latches page autoscroll,
+    // which a key dismisses before the next press reaches the canvas).
     rt.button_down(20.0, 20.0, PointerButton::Middle);
     rt.button_up(20.0, 20.0, PointerButton::Middle);
     rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.presses.len(), 1);
+    if cfg!(any(target_os = "windows", target_os = "linux")) {
+        rt.key(KeyEvent { key: Key::Escape, mods: Mods::default() });
+        rt.frame(1.0 / 60.0);
+    }
 
     // The primary button presses it as before, as the primary.
     rt.pointer_down(150.0, 150.0);

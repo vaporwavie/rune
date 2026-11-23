@@ -51,7 +51,9 @@ mod windows;
 use self::windows as backend;
 #[cfg(target_os = "windows")]
 #[doc(hidden)]
-pub use self::windows::LayerStatus;
+pub use self::windows::{LayerStatus, LayerSurface};
+#[cfg(target_os = "windows")]
+pub(crate) use self::windows::release_removed_device;
 mod waker;
 
 use phases::{Effect, Event, Run, Stage, step};
@@ -158,6 +160,12 @@ pub(crate) fn headless_clock() -> Option<f64> {
 }
 
 /// Where media comes from. Strings containing `://` are URLs; anything else is a file path.
+///
+/// Local file sources ([`MediaSource::File`] and `file:` URLs) open strictly as self-contained
+/// local media files: macOS forbids external references (`AVAssetReferenceRestrictions::ForbidAll`),
+/// and Windows requires a plain local disk path with a direct media container extension and
+/// resolves it from a local byte stream without wildcard handler fallback. Network `http(s)://`
+/// URLs keep URL resolution unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaSource {
     File(PathBuf),
@@ -751,7 +759,7 @@ fn push_placeholder(surface: &NativeSurface) {
         color: ColorInfo { matrix: crate::native_surface::Matrix::Bt709, transfer: crate::native_surface::Transfer::Srgb },
         planes: [rgba, Vec::new()],
     };
-    let _ = surface.push_bytes(frame, u64::MAX);
+    surface.push_bytes(frame, u64::MAX).ok();
 }
 
 #[cfg(test)]

@@ -247,6 +247,8 @@ fn masks_match_coregraphics_within_three_levels() {
 #[test]
 fn text_system_keys_glyphs_by_ink() {
     let mut ts = crate::TextSystem::default();
+    // Select the CoreGraphics rasterizer; off macOS the default is WindfoilChromium.
+    ts.set_font_smoothing(crate::FontSmoothing::On);
     ts.set_apple_pipeline(ApplePipeline::SMOOTHED);
     let style = rune_core::tok::TextStyle::new(16.0, 400.0);
     let mut dark = Vec::new();
@@ -267,6 +269,8 @@ fn text_system_keys_glyphs_by_ink() {
 #[test]
 fn pipelines_never_share_masks() {
     let mut ts = crate::TextSystem::default();
+    // Select the CoreGraphics rasterizer; off macOS the default is WindfoilChromium.
+    ts.set_font_smoothing(crate::FontSmoothing::On);
     let style = rune_core::tok::TextStyle::new(16.0, 400.0);
     let mut seen = Vec::new();
     for pipeline in [ApplePipeline::SMOOTHED, ApplePipeline::UNSMOOTHED, ApplePipeline { flatten: false, ..ApplePipeline::UNSMOOTHED }] {
@@ -416,7 +420,7 @@ fn sf_corpus() {
     };
     let data = std::fs::read("/System/Library/Fonts/SFNS.ttf").unwrap();
     let font = FontRef::from_index(&data, 0).unwrap();
-    let stem: Option<f64> = std::env::var("SF_STEM").ok().and_then(|v| v.parse().ok());
+    let stem: Option<f64> = rune_core::env::var("SF_STEM").and_then(|v| v.parse().ok());
     let mut cx = ScaleContext::new();
     let coords = |p: &Value| -> Vec<i16> {
         font.variations().normalized_coords([("opsz", p["opsz"].as_f64().unwrap() as f32), ("wght", p["wght"].as_f64().unwrap() as f32)]).collect()
@@ -495,7 +499,6 @@ fn sf_corpus() {
 #[test]
 #[ignore = "timing; run in release"]
 fn rasterize_cost() {
-    use std::time::Instant;
     let font = FontRef::from_index(INTER, 0).unwrap();
     let mut cx = ScaleContext::new();
     let text = "The quick brown fox jumps over the lazy dog. SPHINX OF BLACK QUARTZ, JUDGE MY VOW! 0123456789 @&%?";
@@ -511,7 +514,7 @@ fn rasterize_cost() {
         let mut smoothing = Smoothing::default();
         smoothing.set_pipeline(ApplePipeline::SMOOTHED);
         let mut per_bucket = [0usize; 5];
-        let start = Instant::now();
+        let start = rune_core::time::now();
         for _ in 0..rounds {
             for &g in &glyphs {
                 for subpx in 0..4 {
@@ -523,7 +526,7 @@ fn rasterize_cost() {
         }
         let new = start.elapsed().as_secs_f64() * 1e6 / n;
         smoothing.set_pipeline(ApplePipeline::UNSMOOTHED);
-        let start = Instant::now();
+        let start = rune_core::time::now();
         for _ in 0..rounds {
             for &g in &glyphs {
                 for subpx in 0..4 {

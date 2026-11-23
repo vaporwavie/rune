@@ -146,8 +146,11 @@ impl RuntimeCore {
             .filter(|b| n.vis.border_bottom.is_some() || *b != border);
         let (border_kind, border_uv) = border_bottom.map_or((KIND_RECT, [0.0; 4]), |b| (KIND_GRADIENT, b));
         let border_a = border[3].max(border_uv[3]);
+        // A box with zero width or height has no area to fill or border; emitting it lets
+        // `sd_rounded` shade a one-pixel line at up to half strength on fractional device pixels.
+        let has_area = w > 0.0 && h > 0.0;
         // A dashed ring is its own instance over the fill, which then draws without a ring.
-        let dashed = n.vis.border_dash.filter(|_| bw > 0.0 && border_a > 0.0005).map(|[dash, gap]| Instance {
+        let dashed = n.vis.border_dash.filter(|_| has_area && bw > 0.0 && border_a > 0.0005).map(|[dash, gap]| Instance {
             rect: [r[0], r[1], w, h],
             radii,
             fill: border,
@@ -175,13 +178,13 @@ impl RuntimeCore {
             clip,
             fade: crate::render::pack_fade(fade, clip, clip),
         };
-        let apart = bw > 0.0 && border_a > 0.0005 && n.vis.shadows.iter().chain(stuck_shadows.1).any(|sh| sh.inset);
+        let apart = has_area && bw > 0.0 && border_a > 0.0005 && n.vis.shadows.iter().chain(stuck_shadows.1).any(|sh| sh.inset);
         // Dimmed, an opaque fill and its gradient draw as one opaque gradient, so they fade
         // together as a layer at that opacity would (CSS `opacity`), not one through the other.
         let flat = layered && o < 1.0 && base[3] >= 1.0 && n.vis.gradient.is_some();
         if layered {
             // Fill, gradient and overlays first, then the border on top, as in CSS.
-            if fill[3] > 0.0005 && !flat {
+            if has_area && fill[3] > 0.0005 && !flat {
                 self.instances.push(Instance {
                     rect: [r[0], r[1], w, h],
                     radii,
@@ -197,7 +200,7 @@ impl RuntimeCore {
             let stop = |c| if flat { over(premul(c, 1.0, srgb), base).map(|v| v * o) } else { premul(c, o, srgb) };
             let top = stop(self.color(n.id, P_GRADIENT[0], g[0]));
             let bottom = stop(self.color(n.id, P_GRADIENT[1], g[1]));
-            if top[3] > 0.0005 || bottom[3] > 0.0005 {
+            if has_area && (top[3] > 0.0005 || bottom[3] > 0.0005) {
                 self.instances.push(Instance {
                     rect: [r[0], r[1], w, h],
                     radii,
@@ -209,7 +212,7 @@ impl RuntimeCore {
                     fade: crate::render::pack_fade(fade, clip, clip),
                 });
             }
-            if let Some(rg) = &n.vis.radial {
+            if has_area && let Some(rg) = &n.vis.radial {
                 let segs = rg.stops.len().saturating_sub(1);
                 let rmax = radii[0].max(radii[1]).max(radii[2]).max(radii[3]).min(w * 0.5).min(h * 0.5);
                 let pad = 1.0 + blur * s * 2.0;
@@ -285,14 +288,12 @@ impl RuntimeCore {
                 if let Some(pulled) = surface.pull_video(video_clock, self.frame.live.waker()) {
                     // A clip whose next picture isn't due for a while wakes the window
                     // then, instead of drawing every refresh in between.
-                    let wait = pulled.due.map(|due| due.saturating_duration_since(crate::time::Instant::now()).as_secs_f64());
+                    let wait = pulled.due.map(|due| due.saturating_duration_since(crate::time::now()).as_secs_f64());
                     match wait {
                         Some(wait) if pulled.active && wait > crate::video::WAKE_MIN => {
                             let wake = self.clock + wait;
                             self.paint.keep.cycles.other_deadline();
-                            if self.motion.loop_wake.is_none_or(|w| wake < w.0) {
-                                self.motion.loop_wake = Some((wake, now + wait * self.time_scale as f64));
-                            }
+                            self.motion.arm_loop_wake(wake, now + wait * self.time_scale as f64);
                         }
                         _ => self.paint.videos_active |= pulled.active,
                     }
@@ -305,13 +306,17 @@ impl RuntimeCore {
             }
             let ov = overlay.map(|c| c * o);
             if apart && ov[3] > 0.0005 {
-                self.instances.push(border_paint::fill_under(Instance { fill: ov, ..ring }, false));
-            } else if !apart && (ov[3] > 0.0005 || border_a > 0.0005) {
+                let under = border_paint::fill_under(Instance { fill: ov, ..ring }, false);
+                if under.rect[2] > 0.0 && under.rect[3] > 0.0 { self.instances.push(under); }
+            } else if has_area && !apart && (ov[3] > 0.0005 || border_a > 0.0005) {
                 self.instances.push(Instance { fill: ov, ..ring });
             }
         } else if apart {
-            if fill[3] > 0.0005 { self.instances.push(border_paint::fill_under(Instance { fill, ..ring }, true)); }
-        } else if fill[3] > 0.0005 || border_a > 0.0005 {
+            if fill[3] > 0.0005 {
+                let under = border_paint::fill_under(Instance { fill, ..ring }, true);
+                if under.rect[2] > 0.0 && under.rect[3] > 0.0 { self.instances.push(under); }
+            }
+        } else if has_area && (fill[3] > 0.0005 || border_a > 0.0005) {
             if fill == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 && sides.is_none() {
                 bands::push_ring(&mut self.instances, ring);
             } else {
@@ -333,17 +338,19 @@ impl RuntimeCore {
         }
         // Inset shadows draw inside the border (CSS's padding box), under it.
         let (inner, inner_radii) = border_paint::inset_box([r[0], r[1], w, h], radii, padding);
-        for (k, sh) in n.vis.shadows.iter().chain(stuck_shadows.1).enumerate() {
-            if !sh.inset || (focus_flat && k < n.vis.shadows.len()) {
-                continue;
+        if inner[2] > 0.0 && inner[3] > 0.0 {
+            for (k, sh) in n.vis.shadows.iter().chain(stuck_shadows.1).enumerate() {
+                if !sh.inset || (focus_flat && k < n.vis.shadows.len()) {
+                    continue;
+                }
+                let c = if k >= n.vis.shadows.len() { sh.color.alpha(sh.color.a * stuck_shadows.0) }
+                    else if k < P_SHADOWS.len() { self.color(n.id, P_SHADOWS[k], sh.color) } else { sh.color };
+                if c.a <= 0.0 {
+                    continue;
+                }
+                let sh = &if k < n.vis.shadows.len() { self.shadow_at(n.id, k, sh) } else { *sh };
+                self.instances.push(border_paint::inset_shadow(sh, premul(c, o, srgb), (inner, inner_radii), (k_px, s), clip, fade));
             }
-            let c = if k >= n.vis.shadows.len() { sh.color.alpha(sh.color.a * stuck_shadows.0) }
-                else if k < P_SHADOWS.len() { self.color(n.id, P_SHADOWS[k], sh.color) } else { sh.color };
-            if c.a <= 0.0 {
-                continue;
-            }
-            let sh = &if k < n.vis.shadows.len() { self.shadow_at(n.id, k, sh) } else { *sh };
-            self.instances.push(border_paint::inset_shadow(sh, premul(c, o, srgb), (inner, inner_radii), (k_px, s), clip, fade));
         }
         if apart {
             if sides.is_none() && border_kind == KIND_RECT { bands::push_ring(&mut self.instances, ring); } else { self.instances.push(ring); }
@@ -354,7 +361,10 @@ impl RuntimeCore {
             faded_slot = paint_slots::push_effect(&mut self.instances, (effect, mark), ([r[0], r[1], w, h], radii, clip, fade), k_px, o);
         }
         let focus_ring = if default_ring == Some(i) || self.forced_default_ring(i) { Some(self.default_focus_ring()) }
-            else if n.focus.within { n.focus.ring.filter(|_| self.focus_within(i)) }
+            else if let Some(key) = n.focus.ring_for.as_deref() {
+                n.focus.ring.filter(|_| self.kbd.focus.keyboard() && self.kbd.focus.path().is_some_and(|p| p.rsplit('/').next().is_some_and(|seg| element_path::segment_matches_key(seg, key))))
+            }
+            else if n.focus.within { n.focus.ring.filter(|_| self.focus_within(i) && (!n.focus.within_keyboard || self.kbd.focus.entered_by_keys())) }
             else { self.focus_ring_visible(i).then_some(n.focus.ring).flatten() };
         if let Some(ol) = focus_ring.or(n.vis.outline) {
             let c = if focus_ring.is_some() { ol.color } else { self.color(n.id, P_OUTLINE, ol.color) };
@@ -406,6 +416,7 @@ impl RuntimeCore {
                 gliding,
                 caret,
                 shown: if !turned && !pinh.in_cache { [clip[1].max(vp[1] - m), clip[3].min(vp[3] + m)] } else { [clip[1], clip[3]] },
+                shown_x: if !turned && !pinh.in_cache { [clip[0].max(vp[0] - m), clip[2].min(vp[2] + m)] } else { [clip[0], clip[2]] },
             },
             sel_ranges,
             mark_ranges,
@@ -414,3 +425,7 @@ impl RuntimeCore {
         faded_slot
     }
 }
+
+#[cfg(test)]
+#[path = "primitives_tests.rs"]
+mod tests;

@@ -49,7 +49,9 @@ pub enum TabDensity {
 pub enum TabOverflow {
     /// Horizontal tabs share the strip equally, from `max_width` down to `min_width`, then the
     /// strip scrolls sideways with a `fade_width` linear fade at each edge while anything is
-    /// past it (Desktop's `titlebar-tabs-fade-*`). Pinned tabs keep `pinned_width`.
+    /// past it (Desktop's `titlebar-tabs-fade-*`). Pinned tabs keep `pinned_width`. When
+    /// `min_width` exceeds `max_width` (or `max_width` is NaN), `min_width` wins; a NaN
+    /// `min_width` leaves the lower bound open while still capping at `max_width`.
     ShrinkThenScroll { min_width: f32, max_width: f32, pinned_width: f32, fade_width: f32 },
     /// Full-width rows that scroll, the top and bottom feathering by as much as is left to scroll
     /// past them, up to `fade_width` (Desktop's `--vertical-tabs-fade-*`).
@@ -74,14 +76,17 @@ impl TabOverflow {
 
     /// The width of each unpinned tab when `unpinned` of them and `pinned` pinned ones share
     /// `available` points with `gap` between each: equal shares between the policy's bounds.
-    /// Past the minimum the tabs overflow and the strip scrolls. `max_width` for `Scroll`.
+    /// Past the minimum the tabs overflow and the strip scrolls. When `min_width` exceeds
+    /// `max_width` (or `max_width` is NaN), `min_width` wins; a NaN `min_width` leaves the lower
+    /// bound open. `f32::INFINITY` for `Scroll`.
     pub fn tab_width(&self, available: f32, unpinned: usize, pinned: usize, gap: f32) -> f32 {
         let Self::ShrinkThenScroll { min_width, max_width, pinned_width, .. } = *self else { return f32::INFINITY };
+        let hi = max_width.max(min_width);
         if unpinned == 0 {
-            return max_width;
+            return hi;
         }
         let gaps = (unpinned + pinned).saturating_sub(1) as f32 * gap;
-        ((available - pinned as f32 * pinned_width - gaps) / unpinned as f32).clamp(min_width, max_width)
+        ((available - pinned as f32 * pinned_width - gaps) / unpinned as f32).max(min_width).min(hi)
     }
 
     pub(super) fn fade(&self) -> f32 {
@@ -351,7 +356,8 @@ impl<S: 'static> TabBind for TabHandlers<S> {
 /// active or hovered. In a `.window_drag()` titlebar the gaps between tabs, the bands above and
 /// below them and the space after the trailing action move the window, as only the tabs and
 /// buttons take presses. Vertical tabs fill the row with 3 points between them, each reaching
-/// across half the gap so no press misses.
+/// across half the gap so no press misses. Each tab is keyed `t-{id}`; a vertical tab's row as
+/// drawn, without that reach, is keyed `t-{id}-pill`, for overlays anchored beside it.
 ///
 /// A press selects a tab as the button goes down, so a drag carries the selected tab and the
 /// release draws nothing ([`Self::select_on_drag_start`]); a press on the selected tab and a

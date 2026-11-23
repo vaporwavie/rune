@@ -5,13 +5,14 @@
 //! `Rgba16Float` holds it, then the composite (backdrop_composite.wgsl) inside the record's rounded
 //! rect and clip. Only the record's region is blurred, as on the GPU.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use super::raster::{Exec, f16};
 use super::shade::{Clip, sd_rounded};
 use crate::render::Instance;
 use crate::render::backdrop_blur::level_scissor;
 pub(super) use crate::render::backdrop_blur::{Plan as Record, plan_region as plan};
+use crate::render::instance::shader_consts;
 
 /// The composite's pixels: the rect inside its clip, by whole pixels (the GPU's scissor).
 pub(super) fn bounds(i: &Instance, viewport: (u32, u32)) -> [i32; 4] {
@@ -74,20 +75,35 @@ fn bilinear(uv: [f32; 2], w: u32, h: u32, texel: impl Fn(u32, u32) -> [f32; 4]) 
     mix(mix(texel(x0, y0), texel(x1, y0), fx), mix(texel(x0, y1), texel(x1, y1), fx), fy)
 }
 
-/// Runs `row(y, texels)` for rows `y0..y1` of `out`, a row at a time on `exec`'s threads.
+/// Runs `row(y, texels)` for rows `y0..y1` of `out`, in disjoint horizontal bands on `exec`'s
+/// threads.
 fn rows(exec: &dyn Exec, out: &mut Level, y0: u32, y1: u32, row: &(dyn Fn(u32, &mut [[f32; 4]]) + Sync)) {
-    struct Rows(*mut [f32; 4]);
-    // SAFETY: each row goes to one thread (the counter hands each out once), and rows don't
-    // overlap; `out` outlives the run, which joins before returning.
-    unsafe impl Sync for Rows {}
-    let (base, w) = (&Rows(out.px.as_mut_ptr()), out.w as usize);
-    let next = AtomicU32::new(y0);
+    if y1 <= y0 || out.w == 0 { return; }
+    let w = out.w as usize;
+    let slice = &mut out.px[y0 as usize * w..y1 as usize * w];
+    let total = (y1 - y0) as usize;
+    let threads = exec.threads().max(1);
+    if threads == 1 || total == 1 {
+        for (i, texels) in slice.chunks_exact_mut(w).enumerate() {
+            row(y0 + i as u32, texels);
+        }
+        return;
+    }
+    let band = (total / (threads * 4)).max(1);
+    let work = Mutex::new((y0, slice.chunks_mut(band * w)));
     exec.run(&|| loop {
-        let y = next.fetch_add(1, Ordering::Relaxed);
-        if y >= y1 { break; }
-        // SAFETY: row `y` is inside `out` (y < y1 <= h) and only this thread has it.
-        let texels = unsafe { std::slice::from_raw_parts_mut(base.0.add(y as usize * w), w) };
-        row(y, texels);
+        let next = {
+            let mut guard = work.lock().unwrap_or_else(|e| e.into_inner());
+            guard.1.next().map(|chunk| {
+                let y = guard.0;
+                guard.0 += (chunk.len() / w) as u32;
+                (y, chunk)
+            })
+        };
+        let Some((y_start, chunk)) = next else { break };
+        for (i, texels) in chunk.chunks_exact_mut(w).enumerate() {
+            row(y_start + i as u32, texels);
+        }
     });
 }
 
@@ -190,10 +206,10 @@ pub(super) fn blur(rec: &Record, viewport: (u32, u32), half: super::HalfRounding
                 let add = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] { std::array::from_fn(|c| a[c] + b[c]) };
                 let scale = |a: [f32; 4], k: f32| a.map(|v| v * k);
                 // `fs_up`'s sums, in its order.
-                let mut c = scale(s(1, 1), 4.0);
-                c = add(c, scale(add(add(add(s(2, 1), s(0, 1)), s(1, 2)), s(1, 0)), 2.0));
+                let mut c = scale(s(1, 1), shader_consts::BACKDROP_UP_CENTER_WEIGHT);
+                c = add(c, scale(add(add(add(s(2, 1), s(0, 1)), s(1, 2)), s(1, 0)), shader_consts::BACKDROP_UP_AXIAL_WEIGHT));
                 c = add(c, add(add(add(s(2, 2), s(0, 0)), s(2, 0)), s(0, 2)));
-                let c = c.map(|v| v / 16.0);
+                let c = c.map(|v| v / shader_consts::BACKDROP_UP_DIVISOR);
                 let f = tap(&ax.1, &ay.1, &fine_texel);
                 row[tx as usize] = std::array::from_fn(|ch| f16(f[ch] * (1.0 - weight) + c[ch] * weight, half));
             }
@@ -210,8 +226,11 @@ fn down13(s: impl Fn([f32; 2]) -> [f32; 4]) -> [f32; 4] {
     let (i, j) = (s([-1.0, 1.0]), s([1.0, 1.0]));
     let (k, l, m) = (s([-2.0, 2.0]), s([0.0, 2.0]), s([2.0, 2.0]));
     std::array::from_fn(|ch| {
-        (d[ch] + e[ch] + i[ch] + j[ch]) * 0.125 + (a[ch] + b[ch] + g[ch] + f[ch]) * 0.03125 + (b[ch] + c[ch] + h[ch] + g[ch]) * 0.03125
-            + (f[ch] + g[ch] + l[ch] + k[ch]) * 0.03125 + (g[ch] + h[ch] + m[ch] + l[ch]) * 0.03125
+        (d[ch] + e[ch] + i[ch] + j[ch]) * shader_consts::BACKDROP_DOWN_INNER_WEIGHT
+            + (a[ch] + b[ch] + g[ch] + f[ch]) * shader_consts::BACKDROP_DOWN_OUTER_WEIGHT
+            + (b[ch] + c[ch] + h[ch] + g[ch]) * shader_consts::BACKDROP_DOWN_OUTER_WEIGHT
+            + (f[ch] + g[ch] + l[ch] + k[ch]) * shader_consts::BACKDROP_DOWN_OUTER_WEIGHT
+            + (g[ch] + h[ch] + m[ch] + l[ch]) * shader_consts::BACKDROP_DOWN_OUTER_WEIGHT
     })
 }
 

@@ -1,13 +1,15 @@
 //! Embedded `CAMetalLayer` host for UIKit, SwiftUI and AppKit views that own their own window
 //! and event loop (e.g. a `UIViewRepresentable` driven by `CADisplayLink` on iOS).
 
+#![allow(unsafe_code)]
+
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
 
 use crate::compose::{Compositor, Frame};
 use crate::frame::clock::FrameClock;
 use crate::frame::host_step::{self, Acquire};
-use crate::platform::embed_frame::{self, EmbedSurface, FrameSummary};
+use crate::platform::embed_frame::{self, EmbedSurface, EmbedSurfaceEvent, EmbedSurfaceHealth, FrameSummary};
 use crate::render::{Gpu, Renderer};
 use crate::runtime::{AppDriver, Env, Runtime, RuntimeCore, Waker};
 use crate::time::Instant;
@@ -27,11 +29,11 @@ fn shared_gpu() -> Result<Arc<Gpu>, String> {
 pub fn prewarm() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new().name("rune-embed-prewarm".into()).spawn(|| {
+        std::thread::Builder::new().name("rune-embed-prewarm".into()).spawn(|| {
             if let Ok(gpu) = shared_gpu() {
                 let _ = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
             }
-        });
+        }).ok();
     });
 }
 
@@ -74,6 +76,7 @@ struct LayerHostCore {
     renderer: Renderer,
     clock: FrameClock,
     suspended: bool,
+    surface_health: EmbedSurfaceHealth,
 }
 
 impl LayerHostCore {
@@ -82,6 +85,7 @@ impl LayerHostCore {
             return Err("null CAMetalLayer pointer".into());
         }
         let gpu = shared_gpu()?;
+        // SAFETY: caller guarantees non-null `layer` is a valid `CAMetalLayer` outliving this surface on an allowed thread.
         let surface = unsafe {
             gpu.instance
                 .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
@@ -99,7 +103,7 @@ impl LayerHostCore {
         let mut renderer = Renderer::new(&gpu.device, target_format);
         renderer.set_srgb_blend(true);
         let size = (px_w as f32 / scale, px_h as f32 / scale);
-        let now = Instant::now();
+        let now = crate::time::now();
         let core = Self {
             gpu,
             surface,
@@ -107,6 +111,7 @@ impl LayerHostCore {
             renderer,
             clock: FrameClock::new(now),
             suspended: viewport.0 <= 0.0 || viewport.1 <= 0.0,
+            surface_health: EmbedSurfaceHealth::default(),
         };
         Ok((core, size, scale, now))
     }
@@ -115,7 +120,7 @@ impl LayerHostCore {
         rt.set_srgb_blend(true);
         rt.set_os_drag(false);
         rt.wall_start = Some(now);
-        rt.frame.record_events = false;
+        rt.frame.set_record_events(false);
         let target_format = if rt.srgb_blend() { self.config.format.remove_srgb_suffix() } else { self.config.format };
         crate::window::rebuild_renderer_core(&self.gpu.device, &mut self.renderer, target_format, rt);
     }
@@ -126,6 +131,7 @@ impl LayerHostCore {
             return;
         }
         self.suspended = false;
+        self.surface_health.step(EmbedSurfaceEvent::Resized);
         let scale = scale.max(1.0);
         let max_dim = self.gpu.device.limits().max_texture_dimension_2d.max(1);
         let px_w = ((viewport.0 * scale).round() as u32).clamp(1, max_dim);
@@ -185,7 +191,7 @@ impl LayerHostCore {
         self.renderer.submit(&self.gpu.queue, prepared.encoder);
         self.gpu.queue.present(prepared.frame);
         crate::render::gpu_events::presented();
-        Instant::now()
+        crate::time::now()
     }
 }
 
@@ -215,6 +221,7 @@ impl<S: 'static> LayerHost<S> {
         dark: bool,
         wake: Waker,
     ) -> Result<Self, String> {
+        // SAFETY: caller upholds `from_core_animation_layer`'s safety contract (`layer` is a valid `CAMetalLayer` outliving `LayerHost`, on the UI thread).
         let (mut core, size, scale, now) = unsafe { LayerHostCore::new(layer, viewport, scale) }?;
         let mut rt = runtime_for(spec, state, size, Env::new(dark, scale), wake);
         core.configure_runtime(rt.core_mut(), now);
@@ -255,6 +262,7 @@ impl<S: 'static> EmbedSurface for LayerHost<S> {
     type Prepared = PreparedEmbedFrame;
 
     fn suspended(&self) -> bool { self.core.suspended }
+    fn surface_health_mut(&mut self) -> &mut EmbedSurfaceHealth { &mut self.core.surface_health }
     fn renderer_srgb_blend(&self) -> bool { self.core.renderer.srgb_blend() }
     fn rt_srgb_blend(&self) -> bool { self.rt.core().srgb_blend() }
     fn reblend(&mut self) -> bool { self.core.reblend(self.rt.core_mut()) }
@@ -305,7 +313,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    use objc2_video::{
+    use objc2::{
         msg_send,
         rc::Retained,
         runtime::{AnyClass, AnyObject},
@@ -332,10 +340,12 @@ mod tests {
 
     #[test]
     fn layer_host_runs_compositor_with_tracked_marks() {
+        // SAFETY: `CAMetalLayer` is a QuartzCore class whose `+new` returns a retained instance.
         let layer: Retained<AnyObject> = unsafe { msg_send![AnyClass::get(c"CAMetalLayer").expect("QuartzCore"), new] };
         let seen = Arc::new(AtomicU32::new(0));
         let view = |_: &(), _: &mut Cx<()>| -> El { col().size(120.0, 80.0).child(effect(42).size(60.0, 20.0)) };
         let spec = AppSpec::new("embed-test", (120.0, 80.0), || (), view);
+        // SAFETY: `layer` is a valid retained `CAMetalLayer` owned by this test and outlives `host` (dropped before `layer`).
         let host = unsafe {
             LayerHost::from_core_animation_layer(
                 Retained::as_ptr(&layer) as *mut std::ffi::c_void,

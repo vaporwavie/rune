@@ -1,11 +1,14 @@
 //! Shared XDG desktop portal helpers for Linux D-Bus clients (`portal_appearance`,
 //! `shortcuts::wayland`, `file_dialog::portal`): monotonic request tokens, Request object path
-//! construction, portal availability classification, subscribe-before-call Request/Response
-//! round-trips, and a shared background worker runtime for one-shot portal calls.
+//! construction, host app-id registration, portal availability classification,
+//! subscribe-before-call Request/Response round-trips, and a shared background worker runtime for
+//! one-shot portal calls.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const PATH: &str = "/org/freedesktop/portal/desktop";
+pub(crate) const REGISTRY_INTERFACE: &str = "org.freedesktop.host.portal.Registry";
+pub(crate) const REGISTRY_METHOD: &str = "Register";
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -41,18 +44,29 @@ pub(crate) fn should_watch_settings(read_ok: bool, unavailable: bool) -> bool {
     read_ok || !unavailable
 }
 
+/// The application id to send to `org.freedesktop.host.portal.Registry.Register`, or `None`
+/// when unset or blank.
+pub(crate) fn registry_app_id(app_id: Option<&str>) -> Option<&str> {
+    app_id.map(str::trim).filter(|id| !id.is_empty())
+}
+
 #[cfg(all(target_os = "linux", feature = "dbus"))]
 mod dbus {
     use std::collections::HashMap;
     use std::future::Future;
-    use std::pin::Pin;
+    use std::pin::{Pin, pin};
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    use futures_util::StreamExt;
-    use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, fdo};
+    use async_executor::LocalExecutor;
+    use async_io::Timer;
+    use futures_lite::{FutureExt, StreamExt};
+    use zbus::{
+        Connection, Proxy, fdo,
+        zvariant::{OwnedObjectPath, OwnedValue, Type, Value},
+    };
 
-    use super::request_path;
+    use super::{PATH, REGISTRY_INTERFACE, REGISTRY_METHOD, registry_app_id, request_path};
 
     pub(crate) const DEST: &str = "org.freedesktop.portal.Desktop";
 
@@ -69,6 +83,40 @@ mod dbus {
         TimedOut,
         Disconnected,
         Cancelled,
+    }
+
+    /// Awaits `future`, returning `None` if `limit` elapses first.
+    pub(crate) async fn timeout<T>(limit: Duration, future: impl Future<Output = T>) -> Option<T> {
+        async { Some(future.await) }
+            .or(async {
+                Timer::after(limit).await;
+                None
+            })
+            .await
+    }
+
+    async fn or_cancel<T, C: Future<Output = ()>>(
+        cancel: Pin<&mut C>,
+        future: impl Future<Output = Result<T, RequestError>>,
+    ) -> Result<T, RequestError> {
+        async {
+            cancel.await;
+            Err(RequestError::Cancelled)
+        }
+        .or(future)
+        .await
+    }
+
+    /// Registers the process's application id (`rune::set_app_id`) with
+    /// `org.freedesktop.host.portal.Registry.Register` on a freshly opened portal connection.
+    /// Must run before any other portal call on `conn`; errors (older portals without `Registry`,
+    /// or sandboxed / systemd-scoped apps that already carry an app id) are ignored.
+    pub(crate) async fn register_app_id(conn: &Connection) {
+        let Some(app_id) = registry_app_id(crate::tooling::app_id()) else { return };
+        let options: HashMap<&str, Value<'_>> = HashMap::new();
+        let _ = conn
+            .call_method(Some(DEST), PATH, Some(REGISTRY_INTERFACE), REGISTRY_METHOD, &(app_id, options))
+            .await;
     }
 
     /// Whether `e` indicates that the XDG desktop portal service or interface is absent or
@@ -106,41 +154,51 @@ mod dbus {
         body: &B,
         timeouts: RequestTimeouts,
         cancel: C,
-    ) -> Result<(u32, HashMap<String, OwnedVariant>), RequestError>
+    ) -> Result<(u32, HashMap<String, OwnedValue>), RequestError>
     where
-        B: serde::Serialize + zbus::Type,
+        B: serde::Serialize + Type,
         C: Future<Output = ()>,
     {
-        tokio::pin!(cancel);
+        let mut cancel = pin!(cancel);
         let unique = conn.unique_name().ok_or(RequestError::Unavailable)?;
         let path = request_path(unique.as_str(), token).ok_or(RequestError::Unavailable)?;
-        let (request, mut responses) = tokio::time::timeout(timeouts.rpc, async {
+        let (request, mut responses) = timeout(timeouts.rpc, async {
             let mut request = Proxy::new(conn, DEST, path.clone(), "org.freedesktop.portal.Request")
                 .await
                 .map_err(RequestError::Dbus)?;
             // Subscribe before calling: a portal can emit `Response` before the method returns.
-            let mut responses = tokio::select! {
-                res = request.receive_signal("Response") => res.map_err(RequestError::Dbus)?,
-                _ = &mut cancel => return Err(RequestError::Cancelled),
-            };
-            let handle: OwnedObjectPath = tokio::select! {
-                res = portal.call(method, body) => res.map_err(RequestError::Dbus)?,
-                _ = &mut cancel => {
-                    let _ = tokio::time::timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
+            let mut responses = or_cancel(cancel.as_mut(), async {
+                request.receive_signal("Response").await.map_err(RequestError::Dbus)
+            })
+            .await?;
+            let handle: OwnedObjectPath = match or_cancel(cancel.as_mut(), async {
+                portal.call::<_, _, OwnedObjectPath>(method, body).await.map_err(RequestError::Dbus)
+            })
+            .await
+            {
+                Ok(handle) => handle,
+                Err(RequestError::Cancelled) => {
+                    let _ = timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
                     return Err(RequestError::Cancelled);
                 }
+                Err(e) => return Err(e),
             };
             if handle.as_str() != path {
                 // Portals older than `handle_token` support pick their own request object path.
                 request = Proxy::new(conn, DEST, handle.as_str().to_owned(), "org.freedesktop.portal.Request")
                     .await
                     .map_err(RequestError::Dbus)?;
-                responses = tokio::select! {
-                    res = request.receive_signal("Response") => res.map_err(RequestError::Dbus)?,
-                    _ = &mut cancel => {
-                        let _ = tokio::time::timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
+                responses = match or_cancel(cancel.as_mut(), async {
+                    request.receive_signal("Response").await.map_err(RequestError::Dbus)
+                })
+                .await
+                {
+                    Ok(responses) => responses,
+                    Err(RequestError::Cancelled) => {
+                        let _ = timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
                         return Err(RequestError::Cancelled);
                     }
+                    Err(e) => return Err(e),
                 };
             }
             Ok::<_, RequestError>((request, responses))
@@ -148,73 +206,58 @@ mod dbus {
         .await
         .unwrap_or(Err(RequestError::TimedOut))?;
 
-        let wait = async {
-            tokio::select! {
-                response = responses.next() => match response {
-                    Some(message) => message
-                        .body()
-                        .deserialize::<(u32, HashMap<String, OwnedVariant>)>()
-                        .map_err(RequestError::Dbus),
-                    None => Err(RequestError::Disconnected),
-                },
-                _ = &mut cancel => Err(RequestError::Cancelled),
+        let wait = or_cancel(cancel.as_mut(), async {
+            match responses.next().await {
+                Some(message) => message
+                    .body()
+                    .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+                    .map_err(RequestError::Dbus),
+                None => Err(RequestError::Disconnected),
             }
-        };
+        });
         let result = match timeouts.response {
-            Some(limit) => tokio::time::timeout(limit, wait).await.unwrap_or(Err(RequestError::TimedOut)),
+            Some(limit) => timeout(limit, wait).await.unwrap_or(Err(RequestError::TimedOut)),
             None => wait.await,
         };
         if result.is_err() {
-            let _ = tokio::time::timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
+            let _ = timeout(timeouts.rpc, request.call::<_, _, ()>("Close", &())).await;
         }
         result
     }
 
-    /// Runs a one-shot portal future on a single lazily-started background tokio `LocalSet`
-    /// thread instead of spawning an unjoined thread and runtime per call.
+    /// Runs a one-shot portal future on a single lazily-started background `LocalExecutor`
+    /// thread instead of spawning an unjoined thread per call.
     pub(crate) fn spawn<F, Fut>(make: F) -> Result<(), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         type Job = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>;
-        static WORKER: OnceLock<Result<tokio::sync::mpsc::UnboundedSender<Job>, String>> = OnceLock::new();
+        static WORKER: OnceLock<Result<async_channel::Sender<Job>, String>> = OnceLock::new();
         let tx = WORKER
             .get_or_init(|| {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
-                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+                let (tx, rx) = async_channel::unbounded::<Job>();
                 std::thread::Builder::new()
                     .name("rune-portal-worker".into())
                     .spawn(move || {
-                        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                            Ok(r) => {
-                                let _ = ready_tx.send(Ok(()));
-                                r
-                            }
-                            Err(e) => {
-                                let _ = ready_tx.send(Err(e.to_string()));
-                                return;
-                            }
-                        };
-                        let local = tokio::task::LocalSet::new();
-                        runtime.block_on(local.run_until(async move {
-                            while let Some(job) = rx.recv().await {
-                                tokio::task::spawn_local(job());
+                        let local = LocalExecutor::new();
+                        async_io::block_on(local.run(async {
+                            while let Ok(job) = rx.recv().await {
+                                local.spawn(job()).detach();
                             }
                         }));
                     })
                     .map_err(|e| e.to_string())?;
-                ready_rx.recv().map_err(|_| "portal worker exited".to_owned())??;
                 Ok(tx)
             })
             .as_ref()
             .map_err(Clone::clone)?;
-        tx.send(Box::new(move || Box::pin(make()))).map_err(|_| "portal worker stopped".to_owned())
+        tx.try_send(Box::new(move || Box::pin(make()))).map_err(|_| "portal worker stopped".to_owned())
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "dbus"))]
-pub(crate) use dbus::{DEST, RequestError, RequestTimeouts, is_unavailable, request, spawn};
+pub(crate) use dbus::{DEST, RequestError, RequestTimeouts, is_unavailable, register_app_id, request, spawn, timeout};
 
 #[cfg(test)]
 #[path = "portal_tests.rs"]

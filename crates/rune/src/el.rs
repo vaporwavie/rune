@@ -56,7 +56,7 @@ pub use anchor::{Anchor, Side, anchor_rect};
 pub(crate) use crate::clipboard::tx::{ClipboardRead, ReadFn};
 pub use crate::cursor::{Cursor, CursorImage};
 pub use direction::Direction;
-pub(crate) use direction::{DirEffect, DirEvent, Flow, Pin, mirror_anchor, mirror_visual, step as step_direction};
+pub(crate) use direction::{DirEffect, DirEvent, Flow, Pin, mirror_anchor, mirror_side, mirror_visual, step as step_direction};
 pub(crate) use drop::{DropHoverFn, DropSpec};
 pub(crate) use focus::FocusSpec;
 pub(crate) use focus::ModalSpec;
@@ -66,7 +66,7 @@ pub use handlers::{Drag, Phase, PointerEvent, PointerPress};
 pub(crate) use handlers::{DragEndFn, DragFn, DragOutFn, InputKeyFn, PointerFn, PressFn, StepFn, StepLimitFn, WindowDrag};
 pub(crate) use help::{HELP_KEY, HELP_ROW, help_words};
 pub use input::{InputSpec, auto_grow, edit_access, text_input};
-pub use pills::InlineIcon;
+pub use pills::{InlineIcon, InlineImage};
 pub(crate) use rare::{ElCold, ElFlags, RoleTag};
 pub use rune_motion::Cycle;
 pub(crate) use scroll::FadeStyle;
@@ -149,6 +149,7 @@ pub(crate) struct PasteFn {
 pub(crate) type PillIconFn = Rc<dyn Fn(&str) -> Option<&'static crate::Icon>>;
 /// A pill's look by its id; see [`El::pill_style`].
 pub(crate) type PillStyleFn = Rc<dyn Fn(&str) -> PillStyle>;
+pub(crate) type PillSecondaryFn = Rc<dyn Fn(crate::states::States<'_>, &str, PointerPress, &mut Tx) -> bool>;
 
 /// How one [`Mark::Pill`](crate::Mark::Pill) chip looks: any part left unset falls back to
 /// [`El::pill_colors`] and [`El::pill_icon`], then the field's defaults. Build one with
@@ -282,6 +283,13 @@ pub fn el() -> El {
 #[inline]
 pub fn spacer() -> El {
     base(FlexDirection::Row).grow(1.0)
+}
+
+/// A 1 pt horizontal divider scaled vertically by half at paint time (`height: 1px; transform:
+/// scaleY(0.5)`), matching Chromium's sub-pixel hairline coverage at 1x, 1.5x and 2x while taking
+/// 1 pt of layout height.
+pub fn hairline(c: Color) -> El {
+    el().h(1.0).fill(c).hairline()
 }
 
 /// A horizontal rule as a CSS `border-top: <width>px` on an empty box draws and lays out: its

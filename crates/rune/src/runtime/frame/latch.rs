@@ -21,7 +21,7 @@ impl RuntimeCore {
         ordered: bool,
     ) -> (bool, Option<std::num::NonZeroU64>) {
         stall.end_named("an `update` closure");
-        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.paint.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.font_smoothing())
+        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.paint.srgb_blend()) || one.font_smoothing.is_some_and(|m| m != self.text.font_smoothing())
             || self.changes_families(&one)
             || (one.blur && self.kbd.focus.path().is_some());
         let minimize = if ordered {
@@ -54,6 +54,27 @@ impl RuntimeCore {
     pub(in crate::runtime) fn latch_requests(&mut self, app: &mut dyn AppDriver, tx: &mut Tx) {
         self.run_pick_reads(app, tx);
         self.latch_after_picks(app, tx);
+    }
+
+    /// Latches programmatic focus requests (`Tx::blur`, `Tx::focus*`) so the next commit's
+    /// `sync_requested_focus` applies them against the new view's accessors.
+    pub(in crate::runtime) fn latch_focus(&mut self, tx: &mut Tx) {
+        if std::mem::take(&mut tx.blur) {
+            if self.kbd.focus.path().is_some() {
+                self.kbd.focus_request = Some(focus_machine::FocusRequest::Blur);
+                self.commit.dirty = true;
+            } else if matches!(self.kbd.focus_request, Some(focus_machine::FocusRequest::Focus(..))) {
+                self.kbd.focus_request = None;
+            }
+            // An explicit blur is not the temporary pointer-down blur of a scrim, and nothing
+            // hands focus on from it: only a control the user blurred and then left does.
+            self.kbd.focus.step(focus_machine::FocusEvent::Dropped);
+            self.kbd.focus.step(focus_machine::FocusEvent::Settled);
+        }
+        if let Some((key, ring, ask)) = tx.focus_to.take() {
+            self.kbd.focus_request = Some(focus_machine::FocusRequest::Focus(key, ring, ask));
+            self.commit.dirty = true;
+        }
     }
 
     /// [`Self::latch_requests`] once the pick callbacks have run.
@@ -99,21 +120,8 @@ impl RuntimeCore {
         if let Some(mode) = tx.font_smoothing.take() { self.set_font_smoothing(mode); }
         if let Some((sans, mono)) = tx.font_families.take() { self.set_font_families(&sans, &mono); }
         if let Some(srgb) = tx.srgb_blend.take() { self.set_srgb_blend(srgb); }
-        if let Some(rewind) = tx.rewind.take() { self.motion.rewind = rewind; }
-        if std::mem::take(&mut tx.blur) {
-            if self.kbd.focus.path().is_some() {
-                self.set_focus(app, None, self.kbd.focus.keyboard());
-                self.commit.dirty = true;
-            }
-            // An explicit blur is not the temporary pointer-down blur of a scrim, and nothing
-            // hands focus on from it: only a control the user blurred and then left does.
-            self.kbd.focus.step(focus_machine::FocusEvent::Dropped);
-            self.kbd.focus.step(focus_machine::FocusEvent::Settled);
-        }
-        if let Some(request) = tx.focus_to.take() {
-            self.kbd.focus_request = Some(request);
-            self.commit.dirty = true;
-        }
+        if let Some(rewind) = tx.rewind.take() { self.motion.set_rewind(rewind); }
+        self.latch_focus(tx);
         if let Some(title) = tx.title.take() { self.host.window_title.set(title); }
         if let Some((text, how)) = tx.announce.take() { self.host.announcement.say(text, how); }
         if let Some(mut request) = tx.window_frame.take() {
@@ -123,17 +131,17 @@ impl RuntimeCore {
         crate::clipboard::flush_memory(self);
     }
 
-    pub fn tracing(&self) -> bool { self.frame.trace_channels.is_some() || self.scene.tracing() }
+    pub fn tracing(&self) -> bool { self.frame.tracing_channels() || self.scene.tracing() }
 
     pub(in crate::runtime) fn transaction(&self, app: &dyn ViewDriver) -> Tx {
         Tx { trace: self.tracing().then(crate::el::TraceCalls::default), mods: self.kbd.held_mods, selection: self.selection_snapshot(app),
-            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.kbd.focus.keyboard(), focused: self.focused_key(), assistive: self.host.a11y.is_some() || cfg!(target_arch = "wasm32"), ..Tx::default() }
+            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.kbd.focus.keyboard(), focused: self.focused_key(), assistive: self.host.a11y.is_some() || cfg!(target_arch = "wasm32"), window_hidden: !self.live_visible(), ..Tx::default() }
     }
 
     /// A scalar from the actual draw path (e.g. `shell.width`). Values hold until resampled.
     /// Call before the tooling writer records the frame; scene traces sample in `frame`.
     pub fn trace_channel(&mut self, name: &'static str, kind: &'static str, value: f32) {
-        if let Some(channels) = &mut self.frame.trace_channels { channels.insert(name, (kind, value)); }
+        self.frame.record_trace_channel(name, kind, value);
         if let Some(trace) = self.scene.trace_mut() { trace.channel(name, kind, value); }
     }
 
@@ -144,7 +152,7 @@ impl RuntimeCore {
     }
 
     pub(crate) fn trace_event_dyn(&mut self, event: &dyn std::fmt::Display) {
-        if self.frame.trace_channels.is_some() { event_log::push(&mut self.events, event.to_string()); }
+        if self.frame.tracing_channels() { event_log::push(&mut self.events, event.to_string()); }
         if let Some(trace) = self.scene.trace_mut() { trace.event(event); }
     }
 }

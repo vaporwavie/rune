@@ -1,5 +1,4 @@
 use super::*;
-use crate::time::Instant;
 
 #[test]
 fn trace_annotations_from_hidden_poll_survive_idle_catch_up_once() {
@@ -8,7 +7,7 @@ fn trace_annotations_from_hidden_poll_survive_idle_catch_up_once() {
         launch: "hidden".into(), width: 100.0, height: 100.0, hz: 60.0, scale: 1.0,
     });
     rt.scene.set_trace(Some(trace));
-    rt.frame.trace_channels = Some(Default::default());
+    rt.frame.enable_trace_channels(true);
     rt.poll = Some(|pending, _, tx| {
         if !std::mem::take(pending) { return false; }
         tx.trace_event("hidden:ready");
@@ -23,7 +22,7 @@ fn trace_annotations_from_hidden_poll_survive_idle_catch_up_once() {
     rt.frame_split(1.0, 0.0);
     rt.frame(0.02);
     assert_eq!(rt.events, ["hidden:ready"]);
-    assert_eq!(rt.frame.trace_channels.as_ref().unwrap()["shell.width"], ("position", 40.0));
+    assert_eq!(rt.frame.trace_channels().unwrap()["shell.width"], ("position", 40.0));
     rt.scene.take_trace().unwrap().flush().unwrap();
     let lines: Vec<Value> = buffer.contents().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
     assert_eq!(lines.iter().filter(|line| line["ev"] == json!(["hidden:ready"])).count(), 1);
@@ -42,7 +41,7 @@ fn trace_annotations_reach_both_writers_once() {
         launch: "pill".into(), width: 100.0, height: 100.0, hz: 60.0, scale: 1.0,
     });
     rt.scene.set_trace(Some(trace));
-    rt.frame.trace_channels = Some(Default::default());
+    rt.frame.enable_trace_channels(true);
     let path = std::env::temp_dir().join(format!("rune-annotations-{}.jsonl", std::process::id()));
     {
         let mut trace = Trace::open(&path, rt.viewport, 60.0, 1.0);
@@ -96,14 +95,14 @@ fn native_traces_add_target_and_present_times_without_changing_other_fields() {
     let run = |name: &str, timed: bool| {
         let mut rt = Runtime::new(false, view, (100.0, 100.0), Env { scale: 1.0, system_dark: true });
         let path = std::env::temp_dir().join(format!("rune-present-{name}-{}.jsonl", std::process::id()));
-        let start = Instant::now();
+        let start = crate::time::now();
         let source = std::sync::Arc::new(Presents(Default::default()));
         {
             let mut trace = Trace::open_clock(&path, rt.viewport, 120.0, 1.0, "wall");
             if timed { trace.record_presents(source.clone(), start); }
             for k in 0..3u64 {
                 rt.frame(1.0 / 120.0);
-                let timing = FrameTiming { target_ms: timed.then_some(k as f64 * 8.333), drawable: timed.then_some(k + 1), continuous: k > 0 };
+                let timing = FrameTiming { target_ms: timed.then_some(k as f64 * 8.333), drawable: timed.then_some(k + 1), continuous: k > 0, hz: None };
                 trace.frame_timed(&mut rt, k as f64 * 8.0, 0.0, timing);
                 let at = start + std::time::Duration::from_micros(20_000 + k * 8_333);
                 source.0.lock().unwrap().push((k + 1, Some(at)));
@@ -166,9 +165,6 @@ fn marks_are_inert_events_that_times_can_name() {
     assert_eq!(unmarked.frames, 96, "without an end mark, one second after the last event (the tap's release at 0.58 s)");
 }
 
-/// Headless runs publish the process's `headless_run`, so tests that render one take turns.
-static HEADLESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn mark_names_win_over_offsets_and_offsets_must_be_complete() {
     let script = parse_script(json!([
@@ -199,7 +195,7 @@ fn mark_names_win_over_offsets_and_offsets_must_be_complete() {
 
 #[test]
 fn duration_and_out_select_headless_png_output_unless_native() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let args = |v: &[&str]| Args::parse_from(v.iter().map(|s| (*s).into()).collect());
     for flags in [vec!["--out", "frames"], vec!["--duration", "auto"], vec!["--duration", "auto", "--out", "frames"]] {
         assert!(args(&flags).headless());
@@ -228,7 +224,7 @@ fn duration_and_out_select_headless_png_output_unless_native() {
 
 #[test]
 fn headless_runs_report_each_frame_to_on_frame_encoded() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let snap = std::env::temp_dir().join(format!("rune-encoded-{}.png", std::process::id()));
     let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let log = seen.clone();
@@ -247,7 +243,7 @@ fn headless_runs_report_each_frame_to_on_frame_encoded() {
 
 #[test]
 fn single_window_snapshots_honor_transparency_and_physical_size() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-window-options-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let render = |name: &str, options: crate::WindowOptions, size: Option<(f32, f32)>, legacy: bool| {
@@ -276,7 +272,7 @@ fn single_window_snapshots_honor_transparency_and_physical_size() {
 
 #[test]
 fn window_resizes_move_the_headless_viewport_on_the_virtual_clock() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-window-resize-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("script.json");
@@ -308,7 +304,7 @@ fn window_resizes_move_the_headless_viewport_on_the_virtual_clock() {
 
 #[test]
 fn a_scripted_resize_steps_the_viewport_with_the_hand() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-script-resize-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("script.json");
@@ -331,7 +327,7 @@ fn a_scripted_resize_steps_the_viewport_with_the_hand() {
 
 #[test]
 fn fit_content_height_follows_the_content() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-fit-content-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("script.json");
@@ -356,7 +352,7 @@ fn fit_content_height_follows_the_content() {
 
 #[test]
 fn snapshots_leave_the_playground_out_unless_asked() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-playground-snap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     fn view(n: &u32, _: &mut Cx<u32>) -> crate::El {
@@ -378,7 +374,7 @@ fn snapshots_leave_the_playground_out_unless_asked() {
 
 #[test]
 fn apps_read_the_headless_run_from_init() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-run-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("script.json");
@@ -408,7 +404,7 @@ fn apps_read_the_headless_run_from_init() {
 
 #[test]
 fn video_streams_every_frame_into_ffmpeg() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     if std::process::Command::new("ffprobe").arg("-version").output().is_err() {
         eprintln!("skipped: ffmpeg and ffprobe aren't installed");
         return;
@@ -457,7 +453,7 @@ fn video_streams_every_frame_into_ffmpeg() {
 
 #[test]
 fn desktop_composites_each_window_at_its_frame_with_a_shadow() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-desktop-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let backdrop = dir.join("backdrop.png");
@@ -558,7 +554,7 @@ fn focus_of(run: &HeadlessRun, t: f64, key: &str) -> (bool, bool) {
 
 #[test]
 fn desktop_frame_shows_what_a_handler_did_to_another_window_that_frame() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // The launcher's Return updates and focuses the notes window and closes the launcher;
     // the frame of that key shows the new note in the focused window.
     let (png, run) = desktop_case("stale", r#"[{"t": 0.1, "type": "key", "name": "Enter"}]"#, 0.1, &[], || {
@@ -578,7 +574,7 @@ fn desktop_frame_shows_what_a_handler_did_to_another_window_that_frame() {
 
 #[test]
 fn desktop_window_closing_itself_on_blur_closes_in_that_frame() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // Return in `a` focuses `b`, which blurs `a`, whose on_focus closes it.
     let script = r#"[{"t": 0.1, "type": "tap", "x": 30, "y": 25}, {"t": 0.2, "type": "key", "name": "Enter"}]"#;
     let (png, run) = desktop_case("blur", script, 0.2, &[], || {
@@ -604,7 +600,7 @@ fn desktop_window_closing_itself_on_blur_closes_in_that_frame() {
 
 #[test]
 fn desktop_click_on_the_backdrop_deactivates_the_app_until_it_refocuses() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // As on macOS, a click on the desktop activates another app: no window has focus and
     // keys go nowhere until the app is active again.
     let script = r#"[{"t": 0.1, "type": "tap", "x": 110, "y": 75}, {"t": 0.2, "type": "key", "name": "Enter"},
@@ -629,7 +625,7 @@ fn desktop_click_on_the_backdrop_deactivates_the_app_until_it_refocuses() {
 
 #[test]
 fn desktop_click_through_window_never_takes_the_keyboard() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // `a` opens and focuses a click-through HUD; `a` keeps the keyboard.
     let script = r#"[{"t": 0.1, "type": "key", "name": "Enter"}, {"t": 0.2, "type": "key", "name": "Enter"}]"#;
     let (_, run) = desktop_case("hud", script, 0.3, &[], || {
@@ -691,7 +687,7 @@ fn reopen_case(script: &str, accessory: bool, windows: impl FnOnce() -> Vec<crat
 
 #[test]
 fn desktop_reopen_shows_the_window_closed_last_with_the_keyboard() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // Enter closes `b` (on top, with the keyboard), then `a`; reopening brings back `a`.
     let script = r#"[{"t": 0.1, "type": "key", "name": "Enter"}, {"t": 0.2, "type": "key", "name": "Enter"},
         {"t": 0.3, "reopen": true}]"#;
@@ -705,7 +701,7 @@ fn desktop_reopen_shows_the_window_closed_last_with_the_keyboard() {
 
 #[test]
 fn desktop_reopen_with_a_window_showing_changes_nothing() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let script = r#"[{"t": 0.1, "type": "key", "name": "Enter"}, {"t": 0.2, "reopen": true}]"#;
     let run = reopen_case(script, false, || vec![closer("a", RED, false, left().macos(Default::default())),
         closer("b", BLUE, false, right().macos(Default::default()))]);
@@ -715,7 +711,7 @@ fn desktop_reopen_with_a_window_showing_changes_nothing() {
 
 #[test]
 fn desktop_reopen_default_sees_what_the_hooks_did() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // `a` closes, then `b`, so `b` would come back; but `b`'s hook opens `a` and leaves
     // the rest to the default, which then finds a window showing.
     let script = r#"[{"t": 0.1, "type": "tap", "x": 30, "y": 25}, {"t": 0.2, "type": "key", "name": "Enter"},
@@ -732,7 +728,7 @@ fn desktop_reopen_default_sees_what_the_hooks_did() {
 
 #[test]
 fn desktop_reopen_hook_that_handles_it_skips_the_default() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let script = r#"[{"t": 0.1, "type": "key", "name": "Enter"}, {"t": 0.2, "reopen": true}]"#;
     let run = reopen_case(script, false, || vec![closer("a", RED, true, left().macos(Default::default()))]);
     assert_eq!(focus_of(run, 0.2, "a"), (false, false));
@@ -741,7 +737,7 @@ fn desktop_reopen_hook_that_handles_it_skips_the_default() {
 
 #[test]
 fn desktop_reopen_never_brings_back_a_launcher_or_an_accessory_app_window() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     // The launcher closes last, so a launcher-blind rule would pick it; `a` comes back.
     let launcher = || {
         let mut options = crate::WindowOptions::launcher_panel();
@@ -777,7 +773,7 @@ fn size_and_scale_must_be_positive() {
 
 #[test]
 fn keycaps_draw_over_frames_but_never_enter_the_tree() {
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     let dir = std::env::temp_dir().join(format!("rune-keys-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("script.json");
@@ -814,7 +810,7 @@ fn script_chords_only_fire_global_handlers_even_when_the_window_is_key() {
     assert!(matches!(&script[0].kind, Kind::Shortcut(c) if *c == "cmd+space".parse().unwrap()));
     assert!(matches!(&script[1].kind, Kind::Shortcut(c) if *c == "cmd+k".parse().unwrap()));
 
-    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = headless_run::test_turn();
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let dir = std::env::temp_dir().join(format!("rune-chords-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

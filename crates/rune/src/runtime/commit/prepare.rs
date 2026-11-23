@@ -57,7 +57,7 @@ impl RuntimeCore {
     pub(super) fn prepare_text_with(&mut self, app: &dyn ViewDriver, size: (f32, f32)) -> usize {
         let before = self.text.layout_keys();
         let (mut nodes, mut spare_nodes, mut layout) = (Vec::new(), Vec::new(), LayoutEngine::new());
-        let (mut node_index, mut path_ids, mut memo) = (HashMap::default(), HashMap::default(), crate::memo::MemoCache::default());
+        let (mut node_index, mut path_ids, mut memo) = (NodeIndex::default(), HashMap::default(), crate::memo::MemoCache::default());
         let (mut next_id, mut scrolls, mut virtuals) = (0u64, HashMap::default(), HashMap::default());
         let (mut virtual_culled, mut virtual_inputs, mut stats, mut key_warnings) = (HashSet::default(), HashMap::default(), FrameStats::default(), None);
         let m = Measurement {
@@ -88,7 +88,6 @@ impl RuntimeCore {
             nodes: &mut nodes,
             committing: false,
             spare_nodes: &mut spare_nodes,
-            text: &mut self.text,
             layout: &mut layout,
             node_index: &mut node_index,
             path_ids: &mut path_ids,
@@ -107,7 +106,7 @@ impl RuntimeCore {
             windowed: HashMap::default(),
             kept_lists: Vec::new(),
         };
-        drop(m.finish(&Tx::default()));
+        drop(m.finish(&mut self.text, &Tx::default()));
         self.text.keep_prepared(&before, PREPARE_BYTES)
     }
 }

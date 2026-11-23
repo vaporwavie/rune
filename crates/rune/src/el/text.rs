@@ -111,17 +111,36 @@ impl El {
         self
     }
     /// A strikethrough line across bytes `start..end` in `color` (`None`: the span's or text's
-    /// colour). Wrapped lines each get their own segment.
+    /// colour). Wrapped lines each get their own segment. On a [`text_input`], byte offsets are
+    /// relative to `edit.text` and shift across any active IME preedit, as [`El::spans`] do.
     pub fn strike(mut self, start: usize, end: usize, color: Option<Color>) -> Self {
-        if let Some(t) = &mut self.text && start < end {
+        if start >= end {
+            return self;
+        }
+        if let Some(inp) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
+            inp.decoration_strikes.push((start as u32, end as u32, color));
+            self.sync_input_rich();
+        } else if let Some(t) = &mut self.text {
             t.cold.strikes.push((start as u32, end as u32, color));
         }
         self
     }
     /// Strikethrough lines `(start, end, color)` for multiple byte ranges (see [`El::strike`]).
     pub fn strikes(mut self, strikes: impl IntoIterator<Item = (usize, usize, Option<Color>)>) -> Self {
-        for (start, end, color) in strikes {
-            self = self.strike(start, end, color);
+        if let Some(inp) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
+            let before = inp.decoration_strikes.len();
+            inp.decoration_strikes.extend(
+                strikes.into_iter().filter(|&(s, e, _)| s < e).map(|(s, e, c)| (s as u32, e as u32, c)),
+            );
+            if inp.decoration_strikes.len() != before {
+                self.sync_input_rich();
+            }
+        } else if let Some(t) = &mut self.text {
+            for (start, end, color) in strikes {
+                if start < end {
+                    t.cold.strikes.push((start as u32, end as u32, color));
+                }
+            }
         }
         self
     }
@@ -202,6 +221,17 @@ impl El {
         }
         self
     }
+
+    /// Secondary press (right-click or macOS control-click) on a [`Mark::Pill`](crate::Mark::Pill)
+    /// inside this [`text_input`](crate::text_input). Called with the pill's id and the press point
+    /// in window points; return `true` to handle it (opening a pill-specific menu) or `false` to
+    /// fall through to the field's standard context menu.
+    pub fn on_pill_secondary<S: 'static>(mut self, f: impl Fn(&mut S, &str, PointerPress, &mut Tx) -> bool + 'static) -> Self {
+        if let Some(inp) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
+            inp.on_pill_secondary = Some(Rc::new(move |s, id, press, tx| f(downcast::<S>(s), id, press, tx)));
+        }
+        self
+    }
     pub(super) fn sync_input_pills(&mut self) {
         let (Some(inp), Some(t)) = (&self.cold.input, &mut self.text) else { return };
         if inp.edit.is_plain() {
@@ -222,7 +252,7 @@ impl El {
     pub(crate) fn sync_input_rich(&mut self) {
         let (Some(inp), Some(t)) = (&self.cold.input, &mut self.text) else { return };
         t.cold.rich_style = Some(inp.rich_style);
-        if inp.edit.is_plain() && inp.decorations.is_empty() {
+        if inp.edit.is_plain() && inp.decorations.is_empty() && inp.decoration_strikes.is_empty() {
             // A plain field lays out and draws exactly as before rich editing existed.
             t.spans.clear();
             t.cold.strikes.clear();
@@ -231,7 +261,7 @@ impl El {
             t.cold.pills.clear();
             return;
         }
-        let (mut base_spans, strikes, rich_links, blocks) =
+        let (mut base_spans, mut strikes, rich_links, blocks) =
             inp.edit.rich_display_specs(t.style, inp.rich_style);
         for d in &inp.decorations {
             for (ds, de) in inp.edit.map_range_to_display(d.start as usize, d.end as usize) {
@@ -239,6 +269,11 @@ impl El {
                 sp.start = ds;
                 sp.end = de;
                 base_spans.push(sp);
+            }
+        }
+        for &(start, end, color) in &inp.decoration_strikes {
+            for (ds, de) in inp.edit.map_range_to_display(start as usize, end as usize) {
+                strikes.push((ds, de, color));
             }
         }
         let pill_fg = t.cold.pill_colors.and_then(|(_, fg)| fg);
@@ -460,11 +495,15 @@ impl El {
         }
         self
     }
+    /// The field's insertion caret and selection highlight colours. Without it, the caret follows
+    /// the field's text colour ([`El::color`], else [`Cx::foreground`](crate::Cx::foreground), else
+    /// white), matching CSS `caret-color: auto`, and the selection uses that colour at 20%.
     pub fn caret(mut self, caret: Color, selection: Color) -> Self {
         if let Some(i) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             i.caret = caret;
             i.selection = selection;
             i.caret_inked = true;
+            i.selection_inked = true;
         }
         self
     }
@@ -596,7 +635,10 @@ impl El {
     }
     /// The selection highlight of [`El::selectable`] text or a text field, drawn alike for both.
     pub fn selection_color(mut self, color: Color) -> Self {
-        if let Some(i) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) { i.selection = color; }
+        if let Some(i) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
+            i.selection = color;
+            i.selection_inked = true;
+        }
         if let Some(t) = &mut self.text { t.cold.selection = color; }
         self
     }
@@ -651,7 +693,15 @@ impl El {
             *ic = c;
             cold.icon_inked = true;
         }
-        if self.cold.input.is_some() {
+        let has_input = if let Some(i) = self.cold.get_mut_if_some().and_then(|cold| cold.input.as_deref_mut()) {
+            if !i.placeholder_inked { i.placeholder_color = c.alpha(0.4); }
+            if !i.caret_inked { i.caret = c; }
+            if !i.selection_inked { i.selection = c.alpha(0.2); }
+            true
+        } else {
+            false
+        };
+        if has_input {
             self.sync_input_rich();
         }
         self

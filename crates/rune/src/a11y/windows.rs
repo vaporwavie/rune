@@ -2,6 +2,8 @@
 //! AccessKit's own subclassing adapter must exist before the window first shows; Rune's windows
 //! open shown, so this subclasses with `SetWindowSubclass` instead, which works at any time.
 
+#![allow(unsafe_code)]
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -80,6 +82,8 @@ impl Adapter {
         // whichever succeeds in removing the subclass.
         let ok = unsafe { SetWindowSubclass(hwnd as _, Some(subclass), SUBCLASS_ID, data as usize) };
         if ok == 0 {
+            // SAFETY: `SetWindowSubclass` failed so the subclass never took ownership of `data`;
+            // reclaim the `Rc` ref created by `Rc::into_raw` above.
             unsafe { drop(Rc::from_raw(data)); }
             return None;
         }
@@ -89,7 +93,7 @@ impl Adapter {
     /// Announces what UIA events from AccessKit don't: children added, removed or reordered
     /// (`EVENT_OBJECT_REORDER`) and boxes moved by a scroll (`EVENT_OBJECT_LOCATIONCHANGE`), on
     /// the window's client object, as Win32 controls do.
-    pub(super) fn notify(&self, changes: crate::runtime::a11y_tree::Changes) {
+    pub(super) fn notify(&self, changes: super::tree::Changes) {
         use windows_sys::Win32::UI::Accessibility::NotifyWinEvent;
         use windows_sys::Win32::UI::WindowsAndMessaging::{CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, OBJID_CLIENT};
         // SAFETY: plain notifications about a live window this thread owns.

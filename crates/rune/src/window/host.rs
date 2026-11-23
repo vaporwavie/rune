@@ -29,6 +29,7 @@ pub(in crate::window) mod lifecycle;
 mod render;
 pub(in crate::window) mod shell_requests;
 pub(in crate::window) mod stepping;
+pub(in crate::window) mod window_script;
 
 #[cfg(test)]
 #[path = "host/frame_move_tests.rs"]
@@ -99,6 +100,8 @@ pub(in crate::window) struct Host {
     pub(in crate::window) trace: Option<crate::tooling::Trace>,
     pub(in crate::window) trace_start: Option<Instant>,
     pub(in crate::window) trace_frames: usize,
+    /// `--window-script`: the script this window replays (`window_script`).
+    pub(in crate::window) window_script: Option<window_script::WindowScript>,
     pub(in crate::window) meter: SurfaceMeter,
     pub(in crate::window) win: Option<Win>,
     pub(in crate::window) gpu: Option<(Arc<Gpu>, Renderer)>,
@@ -115,7 +118,16 @@ pub(in crate::window) struct Host {
     pub(in crate::window) files: FileDrop,
     pub(in crate::window) clipboard: crate::clipboard::Client,
     pub(in crate::window) secure_input: crate::input::secure_input::SecureInput,
-    pub(in crate::window) ime_allowed: bool,
+    pub(in crate::window) ime: crate::input::host_events::ImeSync,
+    /// While a new window's first frame is drawn: its text input starts once that frame is with
+    /// the window server, not inside it. On macOS, allowing the IME for a window of the app in
+    /// front (one started from the Dock) loads AppKit's text input services: about 15,000 µs.
+    pub(in crate::window) ime_waits: bool,
+    /// macOS, while a new window's first frame is drawn: its display link is made once that
+    /// frame is with the window server. The frame is drawn at once, unpaced, and making the
+    /// link asks the window server three times (about 2,000 µs).
+    #[cfg(target_os = "macos")]
+    pub(in crate::window) pacing_waits: bool,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(in crate::window) wayland: bool,
     /// The frame moving or jumping to where a handler asked (`stepping::FrameMove`).
@@ -160,7 +172,7 @@ impl HostWaker {
         let woken = app_woken.clone();
         let waker: Waker = Arc::new(move || {
             woken.store(true, Ordering::Release);
-            let _ = proxy.send_event(WakeEvent::App(slot));
+            proxy.send_event(WakeEvent::App(slot)).ok();
         });
         let prepared = Self {
             app_woken,
@@ -229,6 +241,7 @@ impl Host {
         let (open_inactive, open_as, chrome, titlebar) = (app.open_inactive, app.open_as, app.chrome, app.titlebar);
         let (on_close, on_rest, on_reopen, on_quit, turn_scope) = (app.on_close, app.on_rest, app.on_reopen, app.on_quit, app.turn_scope);
         let comp = app.compositor.take();
+        let (layout_seed, keep_layout) = (app.layout_seed.take(), app.keep_layout.take());
         let (playground, attach_playground) = (app.playground.take(), app.attach_playground);
         let (spec, state, shared, runtime) = app.into_parts(args.scene.as_deref());
         let size = args.size.unwrap_or(spec.size);
@@ -237,6 +250,7 @@ impl Host {
         let mut rt = runtime_for(&spec, state, size, env, setup_waker(&shared.core));
         if let Some(attach) = attach_playground { attach(&mut rt, playground, &spec, args.playground.clone(), args.variant.clone(), true); }
         rt.configure(runtime);
+        if let Some(seed) = layout_seed.clone() { rt.core_mut().offer_layout_seed(seed); }
         shared.core.connect(prepared.waker.clone());
         let shortcuts = crate::shortcuts::Guard::attach(&shared, prepared.waker.clone(), false, wayland);
         let menus = crate::native_menu::MenuGuard::attach(&shared, false);
@@ -244,6 +258,7 @@ impl Host {
         let geometry = WindowGeometry { title: spec.title, size: spec.size, min_size: spec.min_size };
         let typed = Box::new(TypedWindowApp {
             rt, shared, comp, on_frame_drawn, on_close, on_rest, on_quit, on_reopen, turn_scope,
+            keep_layout, kept_layout: layout_seed,
         });
         Self::from_app(typed, HostInit {
             prepared,
@@ -333,6 +348,13 @@ impl Host {
         let present_log = args.trace.as_ref().map(|_| Arc::default());
         let has_comp = app.has_compositor();
         let meter = SurfaceMeter::new(native_handle.key(), native_handle.native.stats.clone());
+        // One window replays: the one `--window` names, else the first window the app opens.
+        let replays = args.window_script.is_some() && match args.window.as_deref() {
+            Some(key) => native_handle.key() == key,
+            None => window_script::claim_first(),
+        };
+        let window_script = replays.then(|| crate::tooling::read_window_script(&args).map(|events| window_script::WindowScript::new(events, crate::time::now()))).flatten();
+        if replays { println!("rune-script-window {}", native_handle.key()); }
         {
             let rt = app.rt_mut();
             rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
@@ -343,14 +365,14 @@ impl Host {
             rt.set_system_accent(crate::system_accent());
             crate::platform::scroll_bars::watch();
             rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(args.scroll_bars));
-            rt.frame.trace_channels = args.trace.as_ref().map(|_| Default::default());
-            rt.set_live_waker(Arc::new(move || { let _ = live_proxy.send_event(WakeEvent::Live(slot)); }));
+            rt.frame.enable_trace_channels(args.trace.is_some());
+            rt.set_live_waker(Arc::new(move || { live_proxy.send_event(WakeEvent::Live(slot)).ok(); }));
             rt.set_os_drag(crate::drag_out::SUPPORTED);
             rt.transparent = options.transparent;
             rt.track_marks = has_comp;
-            rt.wall_start = Some(Instant::now());
-            rt.host.open_urls_natively = args.script.is_none() && args.trace.is_none() && args.frames.is_none();
-            rt.frame.record_events = false;
+            rt.wall_start = Some(crate::time::now());
+            rt.host.open_urls_natively = args.script.is_none() && args.window_script.is_none() && args.trace.is_none() && args.frames.is_none();
+            rt.frame.set_record_events(false);
             rt.host.surface_stats = Some(meter.shared());
         }
         app.set_live_visible(false);
@@ -396,7 +418,7 @@ impl Host {
             gpu_pool,
             shown: false,
             started: false,
-            clock: FrameClock::new(Instant::now()),
+            clock: FrameClock::new(crate::time::now()),
             idle: true,
             rest: Rest::default(),
             mods: ModifiersState::empty(),
@@ -404,17 +426,21 @@ impl Host {
             files: FileDrop::default(),
             clipboard,
             secure_input: Default::default(),
-            ime_allowed: false,
+            ime_waits: false,
+            #[cfg(target_os = "macos")]
+            pacing_waits: false,
+            ime: Default::default(),
             wayland,
             frame_move: None,
             trace: None,
             trace_start: None,
             trace_frames: 0,
+            window_script,
             meter,
             #[cfg(target_os = "macos")]
             present_log,
             #[cfg(target_os = "macos")]
-            frame_wake: Arc::new(move || { let _ = frame_proxy.send_event(WakeEvent::DisplayTick(slot)); }),
+            frame_wake: Arc::new(move || { frame_proxy.send_event(WakeEvent::DisplayTick(slot)).ok(); }),
         }
     }
 

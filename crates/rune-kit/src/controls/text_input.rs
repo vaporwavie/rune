@@ -32,6 +32,10 @@ fn shell(k: &Kit, e: El, state: State, invalid: bool, focused: bool) -> El {
     if state == State::Disabled {
         return k.disabled_dim(k.elevate(e, k.elevation.input()), true);
     }
+    if let Some(highlight) = k.forced {
+        let e = if invalid { e.border(2.0, c.text_base).border_dash(4.0, 3.0) } else { e.border(1.0, c.text_base) };
+        return if focused || state == State::Focus { e.outline(2.0, 2.0, highlight) } else { e };
+    }
     if invalid {
         e.outline(1.0, -1.0, c.danger.fg)
     } else if focused || state == State::Focus {
@@ -368,6 +372,8 @@ impl TextInput {
                 .self_center()
                 .center()
                 .radius(radius)
+                // Inside, clear of the field's edge it sits on (`text-input.css`, opencode#64909).
+                .focus_ring(2.0, -2.0, c.border_focus)
                 .child(icon(glyph, 16.0).color(c.icon_muted))
                 .disabled(disabled);
             if self.clear {
@@ -379,6 +385,12 @@ impl TextInput {
             e = e.child(b);
         }
         if self.plain {
+            // A contrast theme shows the ring a plain field (a palette's search) otherwise leaves
+            // off: its look is a fill the theme doesn't keep apart (`search-list.css`).
+            let e = match k.forced {
+                Some(highlight) if self.edit.focused && !disabled => e.outline(2.0, 2.0, highlight),
+                _ => e,
+            };
             return k.disabled_dim(e, disabled);
         }
         shell(k, e, self.state, self.invalid && !disabled, self.edit.focused && !disabled)
@@ -701,7 +713,7 @@ impl TextField {
         if let Some(e) = &self.error {
             // Announced as it appears, and read again as the field's description.
             root = root.child(text(e.clone()).key("error").font(k.ty.text_xsmall_medium).color(c.danger.fg)
-                .live_region(rune::LiveRegion::Assertive));
+                .wrap().w_full().live_region(rune::LiveRegion::Assertive));
         }
         k.disabled_dim(root, self.state == State::Disabled)
     }

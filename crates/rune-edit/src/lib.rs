@@ -120,8 +120,17 @@ pub struct TextEdit {
 
 impl std::fmt::Debug for TextEdit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TextEdit").field("text", &if self.secure { "[redacted]" } else { &self.text })
-            .field("anchor", &self.anchor).field("focus", &self.focus).field("focused", &self.focused)
+        let mut s = f.debug_struct("TextEdit");
+        if self.secure {
+            s.field("text", &"[redacted]")
+                .field("anchor", &"[redacted]")
+                .field("focus", &"[redacted]");
+        } else {
+            s.field("text", &self.text)
+                .field("anchor", &self.anchor)
+                .field("focus", &self.focus);
+        }
+        s.field("focused", &self.focused)
             .field("marks", &self.marks).field("blocks", &self.blocks)
             .field("secure", &self.secure).field("revealed", &self.revealed).finish_non_exhaustive()
     }
@@ -175,6 +184,7 @@ impl Drop for TextEdit {
 /// out (volatile writes and a fence, as `zeroize`), then empties it. Eight bytes a write, not
 /// one: a 1.7 MB draft's copy goes in a tenth of a millisecond, where a byte at a time was most
 /// of one on every frame a long draft's field was built.
+#[allow(unsafe_code)]
 pub(crate) fn wipe(s: &mut String) {
     // SAFETY: only zeros are written, inside the allocation (`capacity` bytes from its start),
     // each at an address aligned for what's written there; the length is reset to 0 after.

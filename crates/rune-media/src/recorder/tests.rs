@@ -6,7 +6,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("rune-recorder-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -16,7 +16,7 @@ impl Scratch {
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        std::fs::remove_dir_all(&self.0).ok();
     }
 }
 
@@ -370,7 +370,7 @@ fn a_second_stop_while_the_device_finishes_changes_nothing() {
 #[test]
 fn finishing_on_the_recorder_thread_doesnt_wait_on_itself() {
     let (session, commands) = macos::idle_session();
-    let begun = std::time::Instant::now();
+    let begun = rune_core::time::now();
     std::thread::spawn(move || {
         macos::mark_recorder_thread();
         macos::finish(session);
@@ -568,6 +568,7 @@ fn wav_files_parse_formats_and_reject_others() {
 /// it, so nothing is captured and no permission prompt appears.
 #[cfg(target_os = "macos")]
 #[test]
+#[allow(unsafe_code)]
 fn the_macos_recorder_builds_without_capturing() {
     use objc2::msg_send;
     use objc2::runtime::Bool;
@@ -575,6 +576,7 @@ fn the_macos_recorder_builds_without_capturing() {
     for (name, format) in [("a.m4a", RecordFormat::Aac), ("b.wav", RecordFormat::Wav)] {
         let opts = Options { format, sample_rate: 44_100, channels: 1, fake: None };
         let recorder = macos::make_recorder(&dir.join(name), &opts).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // SAFETY: `recorder` is a live `AVAudioRecorder` returned by `make_recorder`; `isRecording` returns `BOOL`.
         let recording: Bool = unsafe { msg_send![&*recorder, isRecording] };
         assert!(!recording.as_bool());
     }

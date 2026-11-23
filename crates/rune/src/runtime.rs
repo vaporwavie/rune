@@ -84,7 +84,11 @@ mod input;
 mod interaction;
 mod key_index;
 pub(crate) mod layout_read;
+mod layout_seed;
+pub use layout_seed::LayoutSeed;
 mod motion;
+mod node_index;
+use node_index::NodeIndex;
 mod paint;
 mod paint_probe;
 mod playground;
@@ -94,38 +98,15 @@ mod system_settings;
 mod text_fill;
 mod turn;
 mod types;
+mod virtual_list;
 mod visible;
 mod web;
 mod window_requests;
 mod zoom;
 
-// `virtual` is a reserved keyword in Rust, so submodules under `runtime/virtual/` keep `#[path]`.
-#[path = "runtime/virtual/window.rs"]
-mod virtual_window;
-#[path = "runtime/virtual/fill.rs"]
-mod virtual_fill;
-#[path = "runtime/virtual/row_reorder.rs"]
-mod row_reorder;
-#[cfg(test)]
-#[path = "runtime/virtual/fill_resume_tests.rs"]
-mod fill_resume_tests;
-
-// `a11y/*` lives outside `runtime/` while sharing private `RuntimeCore` internals.
-#[path = "a11y/tree.rs"]
-pub(crate) mod a11y_tree;
-#[path = "a11y/node.rs"]
-mod a11y_node;
-#[path = "a11y/text.rs"]
-mod a11y_text;
-#[path = "a11y/actions.rs"]
-mod a11y_actions;
-use a11y_actions::A11yAct;
-#[cfg(test)]
-#[path = "a11y/tests.rs"]
-mod a11y_tests;
-
 pub(crate) use commit::memo_reuse;
-pub(crate) use commit::text_layout::text_width;
+pub(crate) use commit::path as element_path;
+pub(crate) use commit::text_layout::{caret_index, text_width};
 pub(crate) use commit::why::CommitWhy;
 #[cfg(all(test, debug_assertions))]
 use commit::layout_diagnostics;
@@ -174,7 +155,7 @@ use paint::helpers::*;
 use paint::shape::push_shape;
 use paint::soft_edges::{in_fade, inherit_fade};
 
-pub(crate) use scroll::offset::ScrollRequest;
+pub(crate) use scroll::offset::{ScrollAnchor, ScrollRequest};
 pub(crate) use scroll::reveal::ScrollReveal;
 #[doc(hidden)]
 pub use scroll::watch::scroll_watch_state;
@@ -189,17 +170,22 @@ use scroll::{
 use scroll::drawn::PixelHold;
 use scroll::mode::ScrollMode;
 
+#[cfg(test)]
+pub(crate) use selection::links::count_span_box_queries;
+pub(crate) use selection::links::origin as text_origin;
 pub(crate) use selection::selectable;
 pub use selection::selectable::{SelectedText, SelectionChange, TextSelection};
 pub use selection::text_marks::TextMark;
 use selection::{caret, click as input_click, links, select_all, text_marks};
+
+use virtual_list::{fill as virtual_fill, row_reorder};
 
 pub(crate) use web::{a11y as web_a11y, export as web_export, page as web_page};
 #[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) use web::runtime as web_runtime;
 
 pub(crate) use anchor::anchor_position;
-use anchor::{anchor_index, step_up};
+use anchor::{anchor_ancestors, anchor_index, anchor_index_live, step_up};
 pub use cx::{Cx, Env, Waker, commit_generation};
 pub(crate) use cx::caret_of;
 use cx::COMMITS;
@@ -211,6 +197,7 @@ use turn::{Turn, compose_turn, open_turned_layer, screen_clip_of};
 pub(crate) use types::{AnimSource, Node};
 pub use types::{FrameStats, TitlebarAction};
 use types::{AxisScroll, GlideTo, Inh, NodeCold, RowLayout, ScaleMotion, ScrollState, Stack, WidthHold, XMotion};
+pub(crate) use window_requests::HostState;
 
 #[cfg(test)]
 mod timer_wake_tests;
@@ -242,6 +229,8 @@ mod select_all_tests;
 mod selection_api_tests;
 #[cfg(test)]
 mod anchored_grow_tests;
+#[cfg(test)]
+mod layout_seed_tests;
 #[cfg(test)]
 mod pixel_snap_tests;
 #[cfg(test)]
@@ -378,7 +367,7 @@ runtime_core_fields! {
     /// Render-side growth stacks, reveals, flights, loops and rewind capture.
     pub(crate) motion: tracks::MotionState,
     /// Scroll viewports, wheel axis locking, scroll requests and sticky headers.
-    scroll: requests::ScrollTables,
+    pub(crate) scroll: requests::ScrollTables,
     pub scene: Scene,
     /// Action queue, pending `Tx`, wake deadlines, live latch, tracing and hot reload.
     pub(crate) frame: timer_wake::FrameState,
@@ -387,7 +376,7 @@ runtime_core_fields! {
     /// Pointer position, capture, hover/tooltip tracking, touch, autoscroll and file/OS drags.
     pointer: capture::PointerState,
     /// Keyboard focus, modal focus/scope, type-select, held keys and modifier tracking.
-    kbd: focus_machine::KeyboardState,
+    pub(crate) kbd: focus_machine::KeyboardState,
 
     pub surfaces: Vec<crate::native_surface::SurfaceDraw>,
     /// RGBA images elements show (`El::pixels`), uploaded by the renderer.
@@ -434,6 +423,7 @@ impl<S: 'static> Runtime<S> {
     }
 
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn core(&self) -> &RuntimeCore {
         assert_prefix_layout::<S>();
         // SAFETY: `Runtime<S>` and `RuntimeCore` are `#[repr(C)]` with an identical field prefix
@@ -450,6 +440,7 @@ impl<S: 'static> Runtime<S> {
     /// (`std::mem::swap`, `std::mem::replace`, `*core = ...`), which would pair this
     /// `Runtime<S>`'s tail fields with another runtime's core.
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn core_mut(&mut self) -> &mut RuntimeCore {
         assert_prefix_layout::<S>();
         // SAFETY: `Runtime<S>` and `RuntimeCore` are `#[repr(C)]` with an identical field prefix
@@ -461,6 +452,7 @@ impl<S: 'static> Runtime<S> {
     }
 
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn split(&self) -> (&RuntimeCore, AppRef<'_, S>) {
         assert_prefix_layout::<S>();
         let ptr = std::ptr::from_ref(self);
@@ -484,6 +476,7 @@ impl<S: 'static> Runtime<S> {
     /// As with [`Self::core_mut`], mutate fields on the returned `&mut RuntimeCore` rather than
     /// replacing the whole value.
     #[inline(always)]
+    #[allow(unsafe_code)]
     pub(crate) fn split_mut(&mut self) -> (&mut RuntimeCore, AppRefMut<'_, S>) {
         assert_prefix_layout::<S>();
         let ptr = std::ptr::from_mut(self);
@@ -509,7 +502,7 @@ impl<S: 'static> Runtime<S> {
     /// Attaches a live playground to this runtime and keeps `has_playground` in sync.
     pub(crate) fn attach_playground(&mut self, live: crate::playground::Live<S>) {
         self.hooks.playground = Some(Box::new(live));
-        self.tree.has_playground = true;
+        self.tree.attach_playground();
     }
 }
 
@@ -591,7 +584,7 @@ mod prefix_layout_tests {
             let (core, app) = rt.split();
             assert_eq!(core.viewport, (640.0, 480.0));
             assert!(core.motion.motion_scratch.try_borrow().is_err());
-            let _ = std::ptr::from_ref(app.state);
+            let _ptr = std::ptr::from_ref(app.state);
         }
         assert_eq!(rt.core().motion.motion_scratch.borrow().as_slice(), &[(7, 3, true)]);
     }

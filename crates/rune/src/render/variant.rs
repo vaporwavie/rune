@@ -8,8 +8,14 @@
 //! builds Windfoil the first time text asks for outlines. A Windfoil that can't be built leaves
 //! the renderer Classic for good (`Unavailable`), and text falls back to its other rasterisers.
 
+use super::instance::shader_consts;
 use super::*;
 use crate::machine::Effects;
+
+const _: () = {
+    assert!(shader_consts::PINNED_KIND < 0.0);
+    assert!(!shader_consts::OUTLINE_SUBPIXEL);
+};
 
 /// Windfoil's WGSL: shader.wgsl with outline.wgsl's glyph branch, joined when Rune builds
 /// (`build.rs`, render/uber_wgsl.rs).
@@ -18,8 +24,10 @@ pub(crate) fn windfoil_wgsl() -> &'static str {
 }
 
 /// Windfoil's fragment entry, which the subpixel variant renames for its own entry to call.
-const FS_ENTRY: &str = "@fragment\nfn fs(i: Out) -> @location(0) vec4<f32> {";
-const DUAL_ENTRY: &str = r#"
+const FS_ENTRY: &str = shader_consts::FS_ENTRY_DECL;
+/// Mean subpixel coverage floor below which dual-source text emits zero (`DUAL_ENTRY`).
+pub(super) const LCD_MEAN_EPSILON: f32 = 1.0e-5;
+pub(super) const DUAL_ENTRY: &str = r#"
 struct DualOut {
     @location(0) @blend_src(0) color: vec4<f32>,
     @location(0) @blend_src(1) blend: vec4<f32>,
@@ -48,7 +56,7 @@ fn fs(i: Out) -> DualOut {
 pub(crate) const PINNED: [u32; 3] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32()];
 
 /// shader.wgsl's marker for the kind a fragment draws: -1, every kind.
-const PINNED_OFF: &str = "const PINNED_KIND: f32 = -1.0;";
+const PINNED_OFF: &str = shader_consts::PINNED_KIND_OFF_DECL;
 
 /// Windfoil's WGSL with its fragment entry pinned to `kind` (shader.wgsl `fragment_kind`): the
 /// compiler drops every other kind's code. The vertex stage is unchanged.
@@ -58,11 +66,11 @@ pub(crate) fn pinned_wgsl(kind: u32) -> Option<String> {
 }
 
 /// outline.wgsl's switch for subpixel outline glyphs, off but in the subpixel variant.
-const SUBPIXEL_OFF: &str = "const OUTLINE_SUBPIXEL: bool = false;";
+const SUBPIXEL_OFF: &str = shader_consts::OUTLINE_SUBPIXEL_OFF_DECL;
 
 /// The subpixel variant's WGSL: Windfoil's, with subpixel outline coverage and its fragment
 /// entry blending by a second output. Only this variant pays for the three coverages.
-fn dual_wgsl() -> Option<String> {
+pub(super) fn dual_wgsl() -> Option<String> {
     let windfoil = windfoil_wgsl();
     let marked = windfoil.matches(FS_ENTRY).count() == 1 && windfoil.matches(SUBPIXEL_OFF).count() == 1;
     marked.then(|| {
@@ -189,6 +197,57 @@ pub(super) struct Built {
     pub source: Source,
 }
 
+/// What [`Renderer::build_windfoil`] makes beside the uber pipeline, from its pipeline layout,
+/// bind group layout and shader. On Windows it runs on a thread of its own.
+#[cfg(target_os = "windows")]
+pub(super) type With<'a> = dyn Fn(&wgpu::PipelineLayout, &wgpu::BindGroupLayout, &dxbc::Shaders) + Sync + 'a;
+#[cfg(not(target_os = "windows"))]
+pub(super) type With<'a> = dyn Fn(&wgpu::PipelineLayout, &wgpu::BindGroupLayout, &dxbc::Shaders) + 'a;
+
+/// `make`'s result, with `other` run too: on Windows on a thread of its own while `make` runs,
+/// elsewhere after it. A DX12 driver compiles each pipeline when it's created, and the first
+/// time a machine sees one that takes hundreds of milliseconds (Iris Xe: 341 ms for the uber
+/// pipeline and 266 ms for the atlas fill's, one after the other, on the thread a window's GPU is
+/// made on, so its first GPU frame waited for both). The thread runs at the caller's priority.
+/// `RUNE_GPU_PIPELINES=serial` makes them one after the other, as before.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn beside<T>(other: impl FnOnce() + Send, make: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority};
+    static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // A slot the thread empties: when it can't start, `other` is still here to run.
+    let other = std::sync::Mutex::new(Some(other));
+    let take = || other.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if *SERIAL.get_or_init(|| crate::env::var("RUNE_GPU_PIPELINES").is_some_and(|v| v == "serial")) {
+        let made = make();
+        if let Some(other) = take() { other(); }
+        return made;
+    }
+    // SAFETY: this thread's pseudo-handle.
+    let priority = unsafe { GetThreadPriority(GetCurrentThread()) };
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new().name("rune-gpu-pipeline".into()).spawn_scoped(scope, || {
+            // SAFETY: this thread's pseudo-handle; a priority another thread of this process has.
+            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+            if let Some(other) = take() { other(); }
+        });
+        let made = make();
+        match thread.map(std::thread::ScopedJoinHandle::join) {
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Ok(Ok(())) => {}
+            Err(_) => if let Some(other) = take() { other(); },
+        }
+        made
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn beside<T>(other: impl FnOnce(), make: impl FnOnce() -> T) -> T {
+    let made = make();
+    other();
+    made
+}
+
 impl Renderer {
     /// Which uber shader draws, for diagnostics: `classic`, `windfoil (precompiled)`,
     /// `windfoil (compiled)` or `unavailable` (Windfoil couldn't be built).
@@ -207,6 +266,7 @@ impl Renderer {
     /// filled on the CPU. `prepare` tells it again every frame.
     pub fn attach_text(&self, atlas: &mut Atlas) {
         atlas.outlines.set_support(self.uber.support());
+        atlas.outlines.limit_rows(self.max_texture_dim);
     }
 
     /// Steps the shader machine `state` on `event`, carrying out each effect (building Windfoil
@@ -218,11 +278,18 @@ impl Renderer {
         while let Some(effect) = queue.pop() {
             match effect {
                 Effect::Build => {
-                    let next = match Self::build_windfoil(device, cx.format, cx.vertex_entry) {
+                    let outlines = Self::outline_texture(device, outlines::MIN_ROWS);
+                    let fill_pass = |layout: &wgpu::PipelineLayout, bind_layout: &wgpu::BindGroupLayout, shader: &dxbc::Shaders| {
+                        fill::FillPass::new(device, layout, shader, fill::FillBindings { layout: bind_layout, globals: cx.globals, outlines: &outlines, stand_in: cx.stand_in })
+                    };
+                    // The fill pass's pipeline is made while the uber pipeline is (`beside`).
+                    let made = std::sync::Mutex::new(None);
+                    let with = |layout: &wgpu::PipelineLayout, bind_layout: &wgpu::BindGroupLayout, shader: &dxbc::Shaders| {
+                        *made.lock().unwrap_or_else(|e| e.into_inner()) = Some(fill_pass(layout, bind_layout, shader));
+                    };
+                    let next = match Self::build_windfoil(device, cx.format, cx.vertex_entry, &with) {
                         Ok(b) => {
-                            let outlines = Self::outline_texture(device, outlines::MIN_ROWS);
-                            let fill = fill::FillPass::new(device, &b.layout, &b.shader, fill::FillBindings {
-                                layout: &b.bind_layout, globals: cx.globals, outlines: &outlines, stand_in: cx.stand_in });
+                            let fill = made.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| fill_pass(&b.layout, &b.bind_layout, &b.shader));
                             let event = Event::Built { source: b.source, outlines, fill };
                             built = Some(b);
                             event
@@ -256,14 +323,16 @@ impl Renderer {
     }
 
     /// Windfoil's layouts, shader and pipeline for `format`, from the shipped bytecode where it
-    /// matches, else from WGSL; an error where neither builds.
-    pub(super) fn build_windfoil(device: &wgpu::Device, format: wgpu::TextureFormat, vertex_entry: &'static str) -> Result<Built, String> {
+    /// matches, else from WGSL; an error where neither builds. `with` makes what else draws with
+    /// that shader and layout (the atlas fill pass's pipeline) while the pipeline is made
+    /// ([`beside`]); it runs again for each shader tried.
+    pub(super) fn build_windfoil(device: &wgpu::Device, format: wgpu::TextureFormat, vertex_entry: &'static str, with: &With<'_>) -> Result<Built, String> {
         if vertex_entry != "vs" {
             return Err("GPU springs draw the classic shader".into());
         }
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &windfoil_bind_entries() });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bind_layout)], immediate_size: 0 });
-        let make_pipeline = |shader: &dxbc::Shaders| Self::pipeline(device, &layout, shader, format, vertex_entry, Blend::SourceOver);
+        let make_pipeline = |shader: &dxbc::Shaders| beside(|| with(&layout, &bind_layout, shader), || Self::pipeline(device, &layout, shader, format, vertex_entry, Blend::SourceOver));
         #[cfg(target_os = "windows")]
         if let Some((shader, pipeline)) = dxbc::uber(device, make_pipeline) {
             return Ok(Built { bind_layout, layout, shader, pipeline, source: Source::Precompiled });
@@ -384,6 +453,7 @@ impl Renderer {
     /// frame should wait for. The general shader draws every kind until they arrive (`take_pinned`), the same picture.
     /// Anywhere else, or when the bytecode doesn't match, none: every kind draws with the one shader, as before.
     /// Never from WGSL, which takes FXC tens of seconds each.
+    #[allow(unsafe_code)]
     pub(super) fn start_pinned(&mut self, device: &wgpu::Device) {
         self.pinned = None;
         self.pinned_building = None;
@@ -431,6 +501,14 @@ impl Renderer {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+    }
+    /// Waits for the pinned pipelines a thread is making (`start_pinned`): a process that only
+    /// warms the driver's cache has no later frame to take them in.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn wait_pinned(&mut self) {
+        let Some((format, done)) = self.pinned_building.take() else { return };
+        let pinned = done.recv().unwrap_or_default();
+        if format == self.format { self.pinned = Some(pinned); }
     }
     /// Takes `built` as the renderer's shader: every pipeline again from it. Bind groups follow
     /// once the outline texture exists (`rebind_all`).
@@ -501,14 +579,14 @@ fn compile(device: &wgpu::Device, wgsl: &str, make_pipeline: impl FnOnce(&dxbc::
 #[cfg(target_os = "windows")]
 fn make_pinned(device: &wgpu::Device, layout: &wgpu::PipelineLayout, format: wgpu::TextureFormat) -> Vec<Option<wgpu::RenderPipeline>> {
     #[cfg(feature = "frame-profile")]
-    let started = crate::time::Instant::now();
+    let started = crate::time::now();
     let pinned: Vec<_> = PINNED.iter().map(|&kind| dxbc::uber_pinned(device, kind, |shader| Renderer::pipeline(device, layout, shader, format, "vs", Blend::SourceOver)).map(|(_, p)| p)).collect();
     // Frame-profile builds: what making them costs, and what the run-time freshness check before `PINNED_FRESH`
     // cost (three `pinned_wgsl` and their hashes).
     #[cfg(feature = "frame-profile")]
     {
         let made = started.elapsed();
-        let checked = crate::time::Instant::now();
+        let checked = crate::time::now();
         let old: usize = PINNED.iter().filter_map(|&kind| super::pinned_wgsl_blake3(kind)).map(|h| h.len()).sum();
         eprintln!("rune-warm pinned pipelines: {:.0} us to make {} of 3 on their thread (the run-time check they replace: {:.0} us, {old} hex)", made.as_secs_f64() * 1e6, pinned.iter().filter(|p| p.is_some()).count(), checked.elapsed().as_secs_f64() * 1e6);
     }

@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// Whether a live Wayland layer-shell surface must be destroyed and recreated for `requests`.
+/// `zwlr_layer_surface_v1` fixes its `wl_output` at creation, so only changing the target
+/// display requires a new surface; placement changes (size, anchors, margins) update in place.
+#[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+pub(super) fn should_recreate_layer(current_display: &DisplayTarget, requests: &Requests, is_layer: bool) -> bool {
+    is_layer && requests.display.as_ref().is_some_and(|display| display != current_display)
+}
+
 /// An overlay has no window to ask: whatever a step requested of one is dropped.
 pub(super) fn drop_window_requests(rt: &mut RuntimeCore) {
     rt.shell_request = None;
@@ -153,6 +161,14 @@ impl OverlayCore {
         if self.options.input.resolved(self.interactive) != OverlayInput::None { self.left_button(app, pressed, point); }
     }
 
+    /// Delivers clipboard replies or secret-copy changes from the worker. A shown overlay steps
+    /// them on its next drawn frame; a hidden or occluded one advances now.
+    pub(super) fn clipboard_due(&mut self, app: &mut dyn OverlayApp) {
+        if !self.clipboard.receive_core(app.rt_mut()) { return; }
+        self.dirty = true;
+        if self.frameless() { self.advance(app); }
+    }
+
     /// Delivers drag ends a host reported. An `on_drag_start` may have hidden the overlay;
     /// its `on_drag_end` still runs.
     pub(super) fn drag_ends_due(&mut self, app: &mut dyn OverlayApp) {
@@ -209,7 +225,7 @@ impl OverlayCore {
         if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() { layer.commit(); }
     }
 
-    pub(super) fn advance(&mut self, app: &mut dyn OverlayApp) { self.advance_at(app, Instant::now()); }
+    pub(super) fn advance(&mut self, app: &mut dyn OverlayApp) { self.advance_at(app, crate::time::now()); }
 
     /// An overlay that draws nothing delivers queued input without drawing, such as the
     /// releases of the modifier keys held when it hid, rather than when it next shows.
@@ -261,19 +277,41 @@ impl OverlayCore {
         }
     }
 
-    /// Hidden, or shown but not on screen: no frame will come to run what's due.
+    /// Wayland layer-shell: true while a presented frame's `wl_surface.frame` callback is
+    /// outstanding and the GPU device is still live, so the overlay must not acquire or present
+    /// again until the compositor answers.
+    pub(super) fn awaiting_layer_frame(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        let surface_ready = match self.surface.live().map(|l| &l.backing) {
+            Some(Backing::Layer(layer)) => layer.frame_ready(),
+            _ => true,
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+        let surface_ready = true;
+        #[cfg(test)]
+        let surface_ready = surface_ready && !self.layer_frame_pending;
+        let lost = self.gpu.as_ref().is_some_and(|gpu| gpu.is_lost());
+        frame::is_awaiting_frame(surface_ready, lost)
+    }
+
+    /// Hidden, shown but not on screen, or awaiting a Wayland layer frame callback: no frame will
+    /// come on its own to run what's due.
     pub(super) fn frameless(&self) -> bool {
-        !self.presence.drawing() || self.presence.occluded()
+        frame::is_frameless(self.presence.drawing(), self.presence.occluded(), self.awaiting_layer_frame())
     }
 
     pub(super) fn advance_at(&mut self, app: &mut dyn OverlayApp, now: Instant) {
-        // Covered or asleep, a shown overlay only polls. What it would commit waits for the
-        // first uncovered frame, which resumes running motion and starts new motion fresh
-        // (`step`). Hidden, an overlay only polls too, and its view waits for the frame that
-        // shows it; a retained one commits at most every `HIDDEN_REFRESH` to keep its cached
-        // frame near. Input and drag ends still run their handlers now.
+        // Covered, asleep or awaiting a Wayland layer frame callback, a shown overlay only polls.
+        // What it would commit waits for the next drawn frame, which resumes running motion and
+        // starts new motion fresh (`step`). Hidden, an overlay only polls too, and its view waits
+        // for the frame that shows it; a retained one commits at most every `HIDDEN_REFRESH` to
+        // keep its cached frame near. Input and drag ends still run their handlers now.
         let handlers = app.rt().has_pending_input() || app.rt().drag_ends_pending();
-        let polls_only = !handlers && if self.presence.drawing() { self.presence.shown() && self.presence.occluded() } else { !self.retained() || !self.hidden_pace.ready(now) };
+        let polls_only = !handlers && if self.presence.drawing() {
+            frame::polls_only_when_drawing(self.presence.shown(), self.presence.occluded(), self.awaiting_layer_frame())
+        } else {
+            !self.retained() || !self.hidden_pace.ready(now)
+        };
         if !polls_only { return self.commit_at(app, now); }
         app.poll_hidden();
         if app.rt().has_pending_input() { return self.commit_at(app, now); }
@@ -314,7 +352,7 @@ impl OverlayCore {
         self.presence_due(app, now);
         // Paced to a frame interval: a hidden or covered overlay's poll that keeps asking for
         // the next frame runs once a frame, however often other events turn the loop.
-        let deadline = crate::window::timer_deadline_core(app.rt());
+        let deadline = frame::timer_deadline(app.rt(), self.awaiting_layer_frame());
         if deadline.is_some_and(|deadline| deadline <= now) {
             // Backing off, the frame waits for the retry and would leave the timer due.
             if !self.frameless() && !self.backing_off(now) {
@@ -326,7 +364,7 @@ impl OverlayCore {
             } else {
                 // No frame will come to run it in time: a hidden, occluded or backing-off
                 // overlay steps without drawing, so its timers fire (and may hide it) on time.
-                self.advance(app);
+                self.advance_at(app, now);
                 self.turn_frame.step(frame::TurnEvent::WakeStepped);
             }
         }
@@ -342,7 +380,10 @@ impl OverlayCore {
     /// without drawing, as a hidden overlay does, unless it already `stepped`. The next try
     /// waits, with the display link stopped so no tick tries sooner.
     pub(super) fn missed(&mut self, app: &mut dyn OverlayApp, missed: crate::window::Missed, paced: bool, stepped: bool) {
-        let now = Instant::now();
+        self.missed_at(app, missed, paced, stepped, crate::time::now());
+    }
+
+    pub(super) fn missed_at(&mut self, app: &mut dyn OverlayApp, missed: crate::window::Missed, paced: bool, stepped: bool, now: Instant) {
         self.quiet.step(frame::QuietEvent::Forget);
         self.turn_frame.step(frame::TurnEvent::FrameMissed);
         if stepped {
@@ -382,7 +423,7 @@ impl OverlayCore {
 
     /// Applies requests from other threads: updates, edge, show and hide.
     pub(super) fn sync(&mut self, app: &mut dyn OverlayApp, event_loop: &ActiveEventLoop) {
-        if self.clipboard.receive_core(app.rt_mut()) { self.dirty = true; self.advance(app); }
+        self.clipboard_due(app);
         if app.popup_answer(&mut self.popup) {
             self.dirty = true;
             if self.frameless() { self.advance(app); }
@@ -405,12 +446,22 @@ impl OverlayCore {
         }
         let options_changed = requests.placement.is_some() || requests.display.is_some();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        let recreate_layer = options_changed && matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Layer(_)));
+        let recreate_layer = should_recreate_layer(
+            &self.options.display,
+            &requests,
+            matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Layer(_))),
+        );
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         let layer_was_visible = self.presence.shown();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if recreate_layer { self.hide(app); }
-        if let Some(placement) = requests.placement { self.options.placement = placement; }
+        if let Some(placement) = requests.placement {
+            self.options.placement = placement;
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
+                layer.set_placement(placement);
+            }
+        }
         if let Some(display) = requests.display { self.options.display = display; }
         self.apply_wake(app, requests.woken);
         let mut at = self.at;
@@ -436,11 +487,11 @@ impl OverlayCore {
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
                     Some(Backing::Layer(layer)) => {
-                        layer.place(at);
+                        layer.place(self.at);
                         layer.commit();
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-                    Some(Backing::Xwayland(surface)) => surface.place(at, &self.options),
+                    Some(Backing::Xwayland(surface)) => surface.place(self.at, &self.options),
                     None => {}
                 }
             }
@@ -487,3 +538,7 @@ impl OverlayCore {
             && let Some(native) = &self.native { native.request_keys(); }
     }
 }
+
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod tests;

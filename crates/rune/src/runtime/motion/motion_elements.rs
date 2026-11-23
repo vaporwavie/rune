@@ -67,7 +67,7 @@ fn text_hash(text: &str) -> u64 {
 }
 
 fn intent(n: &Node) -> bool {
-    n.live.iter().any(|b| b.spring.is_none() && !b.property.is_color() && !matches!(b.property, crate::live::Property::Blur | crate::live::Property::Trim))
+    n.live.iter().any(|b| b.enter.is_none() && !b.property.is_color() && !matches!(b.property, crate::live::Property::Blur | crate::live::Property::Trim))
 }
 
 impl RuntimeCore {
@@ -88,7 +88,21 @@ impl RuntimeCore {
         for (i, node) in self.tree.nodes.iter().enumerate() {
             // `elements` steps up to an `El::above` target before the parent.
             let up = step_up(&self.tree.nodes, i);
-            let mut flags = up.map_or(0, |u| down[u].1);
+            let mut flags = match up {
+                Some(u) if u < i => down[u].1,
+                Some(u) => {
+                    let mut f = 0u16;
+                    for a in anchor_ancestors(&self.tree.nodes, u) {
+                        if a < i { f |= down[a].1; break; }
+                        let an = &self.tree.nodes[a];
+                        if intent(an) || self.motion.landing_holds.holds(an.id) { f |= MotionElement::LIVE; }
+                        if self.scroll.scrolls.get(&an.id).is_some_and(ScrollState::moving) { f |= MotionElement::SCROLLING; }
+                        if self.motion.grows.get(&an.id).is_some_and(|g| g.moving()) { f |= MotionElement::GROWING; }
+                    }
+                    f
+                }
+                None => 0,
+            };
             let mut pass = flags;
             if intent(node) || self.motion.landing_holds.holds(node.id) { pass |= MotionElement::LIVE; }
             if self.scroll.scrolls.get(&node.id).is_some_and(ScrollState::moving) { pass |= MotionElement::SCROLLING; }

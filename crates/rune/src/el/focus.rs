@@ -28,6 +28,10 @@ pub(crate) struct FocusSpec {
     /// `focus_within_flat`: no outer or inset shadows and no hover fill while focus is on this
     /// element or inside it.
     pub flat_within: bool,
+    /// `focus_visible_within_ring`: the within ring shows only while the keyboard put focus there.
+    pub within_keyboard: bool,
+    /// [`crate::El::focus_ring_for`]: `ring` shows while the keyboard has the element with this key focused.
+    pub ring_for: Option<Rc<str>>,
     /// `default_button`: Return presses it.
     pub default: bool,
     pub highlight: Option<Color>,
@@ -62,6 +66,8 @@ impl crate::cold::Empty for FocusSpec {
         within: false,
         ring_off: false,
         flat_within: false,
+        within_keyboard: false,
+        ring_for: None,
         default: false,
         highlight: None,
         fill: None,
@@ -178,11 +184,12 @@ impl El {
         self.cold_mut().focus.default = true;
         self
     }
-    /// A slider's keyboard, as NSSlider's: while this element is focused, Left and Down call
-    /// `f` with -1, Right and Up with +1, Page Down with -10 and Page Up with +10, repeating
-    /// while held. `f` moves the value by that many of its steps and clamps it. The element
-    /// becomes focusable, and its role `slider` unless it has another. Home and End go to the
-    /// ends with [`El::on_step_limit`].
+    /// A slider's or spin button's keyboard, as NSSlider's: while this element is focused, Left
+    /// and Down call `f` with -1, Right and Up with +1, Page Down with -10 and Page Up with +10,
+    /// repeating while held. On a text field, Left and Right stay with the caret while Up, Down,
+    /// Page Up and Page Down step. `f` moves the value by that many of its steps and clamps it.
+    /// The element becomes focusable, and its role `slider` unless it has another. Home and End
+    /// go to the ends with [`El::on_step_limit`].
     pub fn on_step<S: 'static>(mut self, f: impl Fn(&mut S, i32, &mut Tx) + 'static) -> Self {
         self.cold_mut().focus.step = Some(Rc::new(move |s, delta, tx| f(downcast::<S>(s), delta, tx)));
         self.cold_mut().focus.enabled = true;
@@ -221,7 +228,9 @@ impl El {
     pub fn focus_ring(mut self, width: f32, offset: f32, color: Color) -> Self {
         self.cold_mut().focus.ring = Some(Outline { width, offset, color });
         self.cold_mut().focus.within = false;
+        self.cold_mut().focus.within_keyboard = false;
         self.cold_mut().focus.ring_off = false;
+        self.cold_mut().focus.ring_for = None;
         self
     }
     /// A ring drawn while focus is on this element or anywhere inside it, whether the pointer or
@@ -231,7 +240,28 @@ impl El {
     pub fn focus_within_ring(mut self, width: f32, offset: f32, color: Color) -> Self {
         self.cold_mut().focus.ring = Some(Outline { width, offset, color });
         self.cold_mut().focus.within = true;
+        self.cold_mut().focus.within_keyboard = false;
         self.cold_mut().focus.ring_off = false;
+        self.cold_mut().focus.ring_for = None;
+        self
+    }
+    /// [`El::focus_within_ring`] that shows only while the keyboard put focus on this element or
+    /// inside it (a Tab, an arrow, `Tx::focus` with a ring), as a web field's own keyboard-focus
+    /// ring does: not for a click, a focus handed over without a ring, or the window coming back
+    /// to the front with focus where it was. A text field's frame (a prompt's) takes it.
+    pub fn focus_visible_within_ring(mut self, width: f32, offset: f32, color: Color) -> Self {
+        self = self.focus_within_ring(width, offset, color);
+        self.cold_mut().focus.within_keyboard = true;
+        self
+    }
+    /// A keyboard-only ring drawn on this element while the element keyed `key` (the last part of
+    /// its path) has focus, as a CSS sibling's `:has(:focus-visible) ~ ::after` ring: a scroll
+    /// region's ring drawn by an overlay painted after the header and the dock that cover the
+    /// region's own edges. Give the focused element [`El::no_focus_ring`]. This element isn't a
+    /// Tab stop by itself.
+    pub fn focus_ring_for(mut self, key: impl Into<String>, width: f32, offset: f32, color: Color) -> Self {
+        self = self.focus_ring(width, offset, color);
+        self.cold_mut().focus.ring_for = Some(Rc::from(key.into()));
         self
     }
     /// While focus is on this element or anywhere inside it, from the pointer or the keyboard,

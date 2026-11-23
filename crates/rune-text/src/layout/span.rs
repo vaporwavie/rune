@@ -5,7 +5,7 @@ use crate::*;
 /// Brush carried through Parley: 0 is unspanned, n is the nth layout-affecting span; glyph
 /// colour is resolved from [`TextSystem::set_glyph_inks`] at emission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Ink(pub u16);
+pub struct Ink(pub u32);
 
 /// A styled byte range of a text element (markdown inline code, bold, links).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -130,6 +130,29 @@ pub struct BareIcon {
     pub gap: f32,
     pub radius: f32,
     pub image: Option<rune_image::pixels::Pixels>,
+    /// Set, the image takes the place of its pill's label instead of sitting before it.
+    pub replace: Option<Replace>,
+}
+
+/// An image set on the baseline in place of a pill's label (see `InlineImage`): `width`
+/// points wide, `ascent` points above the baseline and `descent` below it. The label still
+/// holds its bytes, for selection and copy, but takes no room and draws nothing. The image
+/// draws `bleed` points past each edge of that box.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Replace {
+    pub width: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub bleed: f32,
+}
+
+/// The font size a replaced label shapes at in device px: small enough to take no room.
+pub(crate) const HIDDEN_SIZE: f32 = 1e-3;
+
+/// Whether a glyph run shaped at `font_size` device px is a replaced label, which draws nothing.
+pub(crate) fn is_hidden_size(font_size: f32) -> bool {
+    font_size <= HIDDEN_SIZE * 2.0
 }
 
 /// A pill chip's horizontal geometry in points for text of `size` points: the room before its
@@ -381,6 +404,10 @@ pub struct TextHighlight {
     #[doc(hidden)]
     pub pad: f32,
     #[doc(hidden)]
+    pub radius: f32,
+    #[doc(hidden)]
+    pub vpad: f32,
+    #[doc(hidden)]
     pub key: Option<String>,
 }
 
@@ -394,6 +421,8 @@ impl TextHighlight {
             fg: None,
             ring: None,
             pad: 1.5,
+            radius: 4.0,
+            vpad: 1.0,
             key: None,
         }
     }
@@ -410,6 +439,16 @@ impl TextHighlight {
     /// Horizontal padding around each line's background, in points (`1.5` by default).
     pub fn pad(mut self, pad: f32) -> Self {
         self.pad = pad;
+        self
+    }
+    /// Corner radius of each line's background, in points (`4.0` by default; `0.0` for CSS `::highlight`).
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.radius = radius.max(0.0);
+        self
+    }
+    /// Vertical padding above ascent and below descent on each line, in points (`1.0` by default).
+    pub fn vpad(mut self, vpad: f32) -> Self {
+        self.vpad = vpad.max(0.0);
         self
     }
     /// Optional key for [`Tx::scroll_into_view`](crate::Tx::scroll_into_view),

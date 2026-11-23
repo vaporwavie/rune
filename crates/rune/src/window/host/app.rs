@@ -127,6 +127,10 @@ impl dyn WindowApp + '_ {
         self.driver(|rt, app| rt.pointer_move(app, x, y));
     }
 
+    pub(in crate::window) fn observe_pointer(&mut self, x: f32, y: f32) -> bool {
+        self.driver(|rt, app| rt.observe_pointer(app, x, y))
+    }
+
     pub(in crate::window) fn pointer_down(&mut self, x: f32, y: f32) {
         self.driver(|rt, app| rt.pointer_down(app, x, y));
     }
@@ -182,6 +186,21 @@ pub(super) struct TypedWindowApp<S: 'static> {
     pub(super) on_quit: Option<fn(&mut S, &mut Tx)>,
     pub(super) on_reopen: Option<fn(&mut S, bool, &mut Tx) -> bool>,
     pub(super) turn_scope: Option<TurnScope<S>>,
+    /// `App::layout_seed`'s keeper, and the seed it was last given (or the launch's own).
+    pub(super) keep_layout: Option<Box<dyn FnMut(crate::LayoutSeed)>>,
+    pub(super) kept_layout: Option<crate::LayoutSeed>,
+}
+
+impl<S: 'static> TypedWindowApp<S> {
+    /// Hands the first view's layout reads to `App::layout_seed`'s keeper when they aren't the
+    /// ones it last had. Before the app's own close, quit and rest hooks, which save.
+    fn keep_layout(&mut self) {
+        let Some(keep) = self.keep_layout.as_mut() else { return };
+        let Some(seed) = self.rt.core().first_layout_seed() else { return };
+        if self.kept_layout.as_ref() == Some(seed) { return; }
+        keep(seed.clone());
+        self.kept_layout = Some(seed.clone());
+    }
 }
 
 impl<S: 'static> WindowApp for TypedWindowApp<S> {
@@ -207,18 +226,21 @@ impl<S: 'static> WindowApp for TypedWindowApp<S> {
     }
 
     fn run_on_close(&mut self) {
+        self.keep_layout();
         if let Some(f) = self.on_close {
             self.rt.update(f);
         }
     }
 
     fn run_on_quit(&mut self) -> bool {
+        self.keep_layout();
         let Some(f) = self.on_quit else { return false };
         self.rt.update(f);
         true
     }
 
     fn run_on_rest(&mut self) {
+        self.keep_layout();
         if let Some(f) = self.on_rest {
             self.rt.update_if(f);
         }

@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use crate::runtime::Runtime;
-use crate::time::Instant;
 use crate::window::covered_step;
 use crate::{Cx, El, Env, Spring, el, text};
 
@@ -27,7 +26,7 @@ fn shown_text(rt: &Runtime<Chat>) -> Option<String> {
 fn a_covered_window_builds_nothing_until_it_uncovers() {
     let mut rt = Runtime::new(Chat::default(), view, (200.0, 50.0), Env { system_dark: true, scale: 1.0 });
     rt.poll = Some(|chat, _, _| { chat.polls += 1; let unread = chat.read < chat.messages; chat.read = chat.messages; unread });
-    let start = Instant::now();
+    let start = crate::time::now();
     rt.wall_start = Some(start);
     rt.frame(0.0);
     assert_eq!(shown_text(&rt).as_deref(), Some("0 0"));
@@ -96,4 +95,38 @@ fn a_covered_window_lands_its_motion_when_it_uncovers() {
     rt.frame(1.0 / 120.0);
     assert_eq!(x(&rt), 40.0, "uncovering paints where the motion ends");
     assert!(!rt.animating, "with nothing left to play");
+}
+
+/// A poll reads the window going off screen and back with `Tx::window_visible`. The host
+/// derives it from the window's sight and whether it's minimised; each change wakes the poll
+/// once, though a covered window draws no frames, and a step that changes nothing (minimised
+/// while already occluded) wakes nothing.
+#[test]
+fn a_poll_hears_each_visibility_change_once() {
+    use super::sight::{Cover, Sight};
+
+    #[derive(Default)]
+    struct Seen { visible: Vec<bool> }
+    let mut rt = Runtime::new(Seen::default(), |_: &Seen, _: &mut Cx<Seen>| el(), (100.0, 50.0), Env { system_dark: true, scale: 1.0 });
+    rt.poll = Some(|seen, _, tx| { seen.visible.push(tx.window_visible()); false });
+    rt.frame(0.0);
+    assert_eq!(std::mem::take(&mut rt.state.visible), [true]);
+    let mut sight = Sight::Seen;
+    let mut minimized = false;
+    // What the host does on `WindowEvent::Occluded`, a minimise and a restore.
+    let mut step = |rt: &mut Runtime<Seen>, sight: Sight, minimized: bool| {
+        rt.set_live_visible(!sight.covered() && !minimized);
+        let woken = rt.wake_deadline().is_some_and(|due| due <= rt.clock);
+        if woken { covered_step(rt); }
+        (woken, std::mem::take(&mut rt.state.visible))
+    };
+    sight = sight.step(Cover::System, true);
+    assert_eq!(step(&mut rt, sight, minimized), (true, vec![false]), "occluded: the poll runs and reads it");
+    minimized = true;
+    assert_eq!(step(&mut rt, sight, minimized), (false, vec![]), "minimised too: nothing changed");
+    sight = sight.step(Cover::System, false);
+    assert_eq!(step(&mut rt, sight, minimized), (false, vec![]), "uncovered but still minimised");
+    minimized = false;
+    assert_eq!(step(&mut rt, sight, minimized), (true, vec![true]), "restored: the poll runs and reads it");
+    assert_eq!(rt.wake_deadline(), None, "each wake is spent");
 }

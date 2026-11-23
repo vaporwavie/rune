@@ -31,7 +31,7 @@ pub(crate) struct Lazy {
 pub struct AsciiLine {
     pub advance: [f32; 95],
     /// The widest character's advance: a line this many times its length that fits needs no sum.
-    pub(super) widest: f32,
+    pub(crate) widest: f32,
     pub height: f32,
     /// True when every printable ASCII character has the same advance (a fixed-pitch face).
     pub fixed_pitch: bool,
@@ -148,7 +148,7 @@ impl TextSystem {
 
     /// Printable ASCII in `style` at `scale`, measured once: None when its characters don't all
     /// come from one font, whose one line is then not every ASCII line's.
-    pub(super) fn ascii_line(&mut self, style: TextStyle, scale: f32, wrap_anywhere: bool) -> Option<Rc<AsciiLine>> {
+    pub(crate) fn ascii_line(&mut self, style: TextStyle, scale: f32, wrap_anywhere: bool) -> Option<Rc<AsciiLine>> {
         let key = {
             let mut h = hash::KeyHasher::default();
             (hash::text_hash("", &[], style, scale, None), wrap_anywhere).hash(&mut h);
@@ -187,7 +187,7 @@ impl TextSystem {
     pub fn fill_paragraphs(&mut self, laid: &ParagraphLayout, budget: std::time::Duration, rows: (f32, f32), reach: f32) -> Option<(Rc<ParagraphLayout>, bool)> {
         let lazy = laid.lazy.clone()?;
         // The crate's clock: the standard library's has none in a browser, and panics there.
-        let start = rune_core::time::Instant::now();
+        let start = rune_core::time::now();
         let distance = |p: &Paragraph| if p.y + p.height >= rows.0 && p.y <= rows.1 { 0.0 } else { (rows.0 - p.y - p.height).max(p.y - rows.1) };
         let mut paragraphs = laid.paragraphs.clone();
         let (mut moved, mut shaped_any) = (false, false);
@@ -292,7 +292,7 @@ fn split_run(lazy: &Lazy, max_width: Option<f32>, paragraphs: &[Paragraph], k: u
                     sp.hash_layout(&mut hs);
                 }
                 let height = (f64::from(lines) * f64::from(h)) as f32;
-                out.push(Paragraph { start, end: e, y: y.round() as f32, y_frac: 0.0, height, widths: [widest, widest], flow, key: hs.finish(), isolates: Box::default(), layout: r.layout.clone(), shaped: false, lines, run: true });
+                out.push(Paragraph { start, end: e, y: y.round() as f32, y_frac: 0.0, height, widths: [widest, widest], pad: [0.0, 0.0], flow, key: hs.finish(), isolates: Box::default(), layout: r.layout.clone(), shaped: false, lines, run: true });
                 y += f64::from(height);
             }
             continue;
@@ -304,7 +304,7 @@ fn split_run(lazy: &Lazy, max_width: Option<f32>, paragraphs: &[Paragraph], k: u
             sp.hash_layout(&mut hs);
         }
         let (height, w) = lazy.ascii.one_line(words, max_width, 0.0, true).unwrap_or((h, 0.0));
-        out.push(Paragraph { start: s, end: e, y: y.round() as f32, y_frac: 0.0, height, widths: [w, w], flow, key: hs.finish(), isolates: Box::default(), layout: r.layout.clone(), shaped: false, lines: 1, run: false });
+        out.push(Paragraph { start: s, end: e, y: y.round() as f32, y_frac: 0.0, height, widths: [w, w], pad: [0.0, 0.0], flow, key: hs.finish(), isolates: Box::default(), layout: r.layout.clone(), shaped: false, lines: 1, run: false });
         y += f64::from(height);
     }
     out

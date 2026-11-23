@@ -4,6 +4,8 @@
 //! CPU byte frames provide a portable source and a reference for headless verification.
 
 #[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
 #[path = "tests.rs"]
 mod gpu_tests;
 #[cfg(target_os = "linux")]
@@ -12,6 +14,8 @@ pub mod linux;
 mod place_tests;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+mod dxbc;
 mod pipeline;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -356,7 +360,8 @@ impl NativeSurface {
     #[cfg(not(target_arch = "wasm32"))]
     fn report(&self, timing: FrameTiming) {
         let observer = {
-            let mut s = self.0.lock().unwrap();
+            // Called from wgpu's work-done callbacks, where a panic could abort the process.
+            let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if timing.completed_at.is_some() {
                 s.completed += 1;
             } else {
@@ -387,6 +392,19 @@ pub fn note_device(device: &wgpu::Device, presented: bool) {
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = (device, presented);
+}
+
+/// Lets go of a removed D3D12 device that video decoding still holds (the last window's, and
+/// the decoders' D3D11 device on it), so a new device can be made on its adapter: D3D12 gives
+/// a process one device per adapter, and the removed one again while anything holds it. Rune
+/// calls it before it makes a device. Nothing off Windows.
+#[doc(hidden)]
+pub fn release_removed_device() {
+    #[cfg(target_os = "windows")]
+    {
+        windows::release_removed_device();
+        crate::video::release_removed_device();
+    }
 }
 
 /// A node's video draw in painter order. Geometry is already in device pixels.

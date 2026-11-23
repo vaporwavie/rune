@@ -153,7 +153,7 @@ impl FrameProfile {
                     shaped: rt.stats.shaped,
                     instances: rt.instances.len(),
                     animating,
-                    why: std::mem::take(&mut rt.commit.commit_why),
+                    why: rt.commit.take_commit_why(),
                     next: 0,
                     poll_due: None,
                     loop_due: None,
@@ -268,9 +268,12 @@ pub(super) fn prepare_window_render(
         // switch, `acquire` retrying an outdated surface) draws its first frame whole, through
         // `plan`, even when only a loop asked for it (the step has run; the frame draws it whole).
         let swap = l.surface.as_ref().map_or(0, crate::window::surface::configure::generation);
-        let fresh = !l.native.damage.current(size, rt.clear_color(), swap);
-        if fresh && looped.is_some() { profile.set_loop_why("a new swap chain"); }
-        let armed = looped.map(Vec::as_slice).filter(|_| whole.is_none() && !fresh).and_then(|p| {
+        let atlas = damage::GlyphAtlas::of(&rt.text.atlas);
+        let loop_ok = looped.is_none_or(|p| match l.native.damage.can_patch_loop(&rt.instances, p, size, rt.clear_color(), swap, atlas) {
+            Ok(()) => true,
+            Err(why) => { profile.set_loop_why(why); false }
+        });
+        let armed = looped.map(Vec::as_slice).filter(|_| whole.is_none() && loop_ok).and_then(|p| {
             match renderer.arm_loop(&gpu.device, &gpu.queue, rt.paint_count(), &rt.instances, p, rt.clear_color(), size, l.config.format) {
                 Ok(rects) => Some((p, rects)),
                 Err(why) => { profile.set_loop_why(why); None }
@@ -280,7 +283,7 @@ pub(super) fn prepare_window_render(
             l.native.damage.patched(&rt.instances, p);
             Some(present)
         } else {
-            match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none()) {
+            match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, atlas, whole.is_none()) {
                 damage::Plan::All(why) => { profile.set_whole_why(whole.unwrap_or(why)); None }
                 damage::Plan::Part { draw, present } => {
                     renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format);
@@ -344,6 +347,7 @@ pub(super) fn render_window_frame(
     comp_animating
 }
 
+#[allow(unsafe_code)]
 pub(super) fn submit_and_present_window(
     host: &mut Host,
     prepared: PreparedWindowFrame,
@@ -352,8 +356,16 @@ pub(super) fn submit_and_present_window(
     encoded: &mut Option<Instant>,
     info: &StepInfo,
 ) -> Instant {
+    // macOS: the first frame of a window already on screen is taken as finished when it is
+    // presented. The GPU takes 9,000 to 18,000 µs over it (an M4's, by the command buffer's own
+    // GPU times), and the UI thread has AppKit's launch work, the next frame and input to get
+    // to meanwhile. A frame a hidden window prepares still waits for the GPU: a reveal shows it.
+    #[cfg(target_os = "macos")]
+    let waits = host.launcher() || !host.life.shown() || std::env::var_os("RUNE_FIRST_FRAME_WAITS").is_some();
+    #[cfg(not(target_os = "macos"))]
+    let waits = true;
     let (Some(l), Some((gpu, renderer))) = (host.win.as_mut(), host.gpu.as_mut()) else {
-        return Instant::now();
+        return crate::time::now();
     };
     renderer.submit(&gpu.queue, prepared.encoder);
     profile.mark_submitted();
@@ -362,8 +374,8 @@ pub(super) fn submit_and_present_window(
     l.window.pre_present_notify();
     #[cfg(target_os = "macos")]
     {
-        let rt = host.app.rt();
-        l.native.materials.present(&rt.paint.materials, rt.env.scale, || gpu.queue.present(prepared.frame));
+        let (draws, scale) = crate::system_material::present_draws(host.app.rt());
+        l.native.materials.present(draws, scale, || gpu.queue.present(prepared.frame));
     }
     #[cfg(target_os = "windows")]
     if let (Some(rects), Some(surface)) = (&prepared.present_rect, l.surface.as_ref())
@@ -375,13 +387,11 @@ pub(super) fn submit_and_present_window(
     #[cfg(not(target_os = "macos"))]
     gpu.queue.present(prepared.frame);
     #[cfg(target_os = "windows")]
-    if let Some(surface) = l.surface.as_ref() {
-        l.native.slot.presented_surface(surface);
-    }
+    l.native.slot.presented();
     // A swap chain made again on a handed-over window's visual takes over now (`cpu_frame`).
     #[cfg(target_os = "windows")]
     if matches!(l.native.mode, handover::SurfaceMode::Rebinding { .. }) {
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
         if let handover::SurfaceMode::Rebinding { handover } = std::mem::take(&mut l.native.mode) {
             if let Err(error) = handover.commit() { eprintln!("rune: the window's new swap chain couldn't take over: {error}"); }
             l.native.mode = handover::SurfaceMode::Handed { handover };
@@ -399,8 +409,11 @@ pub(super) fn submit_and_present_window(
     // The frame landed with this present; later ones needn't wait for a transaction.
     #[cfg(target_os = "macos")]
     if !FrameMove::moving(&host.frame_move) { l.present_with_transaction(false); }
-    if !l.first_frame.ready()
-        && gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_ok() {
+    if !l.first_frame.ready() && !waits && l.first_frame.deadline().is_none() {
+        l.first_frame.gpu_done();
+        gpu.queue.on_submitted_work_done(|| crate::marks::mark("frame.first.gpu_done"));
+    } else if !l.first_frame.ready()
+        && rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).is_ok() {
         l.first_frame.gpu_done();
         crate::marks::mark("frame.first.gpu_done");
         #[cfg(target_os = "windows")]
@@ -409,7 +422,7 @@ pub(super) fn submit_and_present_window(
     // The window shows once the GPU has finished the frame it presents.
     #[cfg(target_os = "windows")]
     if l.native.cloak.held() {
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
         l.native.cloak.lift(&l.window);
         crate::marks::mark("window.shown");
     }
@@ -423,16 +436,14 @@ pub(super) fn submit_and_present_window(
     );
     #[cfg(not(feature = "frame-profile"))]
     let _ = (looped, info);
-    Instant::now()
+    crate::time::now()
 }
 
 pub(super) fn open_trace_if_needed(host: &mut Host, now: Instant) {
     let Some(path) = &host.args.trace else { return };
     if host.trace.is_some() { return; }
     let Some(l) = host.win.as_ref() else { return };
-    let hz = l.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).map_or(60.0, |hz| hz as f64 / 1000.0);
-    #[cfg(target_os = "macos")]
-    let hz = l.native.pacing.as_ref().map_or(hz, |pacing| pacing.refresh_hz());
+    let hz = super::draw::display_hz(l).unwrap_or(60.0);
     let rt = host.app.rt_mut();
     let mut trace = crate::tooling::Trace::open_clock(path, rt.viewport, hz, rt.env.scale, "wall");
     trace.all = host.args.trace_all;
@@ -453,10 +464,11 @@ pub(super) fn record_trace_frame(
     drawable: Option<u64>,
 ) -> bool {
     let Some(trace) = host.trace.as_mut() else { return false };
+    let hz = host.win.as_ref().and_then(super::draw::display_hz);
     let target_ms = target.zip(host.trace_start).map(|(target, start)| crate::frame::present_time::ms_since(start, target));
     // A frame count keeps the trace redrawing while idle, as below.
     let continuous = !host.idle || host.args.frames.is_some();
-    let timing = crate::tooling::FrameTiming { target_ms, drawable, continuous };
+    let timing = crate::tooling::FrameTiming { target_ms, drawable, continuous, hz };
     trace.frame_timed_core(
         host.app.rt_mut(),
         (submitted - host.trace_start.unwrap()).as_secs_f64() * 1000.0,

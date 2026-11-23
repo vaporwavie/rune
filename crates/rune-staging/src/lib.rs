@@ -13,6 +13,9 @@
 //! takes skip the staging.
 
 mod buffer;
+pub mod health;
+#[cfg(test)]
+mod tests;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -31,7 +34,7 @@ static DIRECT: OnceLock<Direct> = OnceLock::new();
 
 /// Registers the process's `Direct` writer. The first one stays.
 pub fn set_direct(direct: Direct) {
-    let _ = DIRECT.set(direct);
+    DIRECT.set(direct).ok();
 }
 
 /// The size of a new chunk; a larger write gets a chunk sized to its next power of two.
@@ -39,7 +42,7 @@ const CHUNK: u64 = 128 * 1024;
 /// Returned chunks kept for reuse, by count and in bytes; larger chunks are freed on return.
 const KEEP_CHUNKS: usize = 8;
 const KEEP_BYTES: u64 = 4 << 20;
-const KEEP_CHUNK_MAX: u64 = 1 << 20;
+const KEEP_CHUNK_MAX: u64 = KEEP_BYTES;
 /// Staged bytes past which a write first submits what is pending, so a caller that never
 /// flushes can't grow the chunks without bound.
 const MAX_PENDING: u64 = 16 << 20;
@@ -243,7 +246,11 @@ impl Inner {
             Some(i) => i,
             None => {
                 self.receive();
-                let chunk = match self.free.iter().position(|c| c.buffer.size() >= size) {
+                let chunk = match self.free.iter().enumerate()
+                    .filter(|(_, c)| c.buffer.size() >= size)
+                    .min_by_key(|(_, c)| c.buffer.size())
+                    .map(|(i, _)| i)
+                {
                     Some(i) => self.free.swap_remove(i),
                     None => {
                         self.stats.chunks += 1;
@@ -300,7 +307,7 @@ impl Inner {
             let buffer = chunk.buffer.clone();
             let mut back = Return { chunk: Some(chunk), recycle: self.recycle.clone(), lost: staging.1.clone() };
             encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Write, .., move |mapped| {
-                if mapped.is_ok() && let Some(chunk) = back.chunk.take() { let _ = back.recycle.send(chunk); }
+                if mapped.is_ok() && let Some(chunk) = back.chunk.take() { back.recycle.send(chunk).ok(); }
             });
         }
         staging.2.store(false, Ordering::Release);

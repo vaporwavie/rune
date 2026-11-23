@@ -22,7 +22,7 @@ use crate::render::{Gpu, Renderer};
 use crate::time::Instant;
 use crate::window::WakeEvent;
 use crate::window::host::{CompositorFrame, Host};
-use crate::window::surface::{Win, acquire, configure, reblend_core, rebuild_renderer_core, surface_config};
+use crate::window::surface::{Win, acquire, configure, drawable_size, max_surface_dim, reblend_core, rebuild_renderer_core, surface_config};
 
 /// Where a window's frames go. Windows that need the GPU from their first frame (a compositor,
 /// a translucent window, an overlay) are `Gpu` from the start, as on every other platform.
@@ -101,6 +101,7 @@ pub(in crate::window) struct Prepared {
 
 // SAFETY: wgpu's objects are `Send`; a new `Renderer` has no native surface renderer (the one
 // part that isn't), and `Handover` is used by one thread at a time.
+#[allow(unsafe_code)]
 unsafe impl Send for Prepared {}
 
 impl SurfaceMode {
@@ -143,7 +144,7 @@ impl Host {
     /// Whether the GPU is due to start now (`cpu_idle`).
     pub(in crate::window) fn gpu_owed(&self) -> bool {
         if std::env::var_os("RUNE_CPU_FIRST").is_some_and(|v| v == "only") { return false; }
-        let now = Instant::now();
+        let now = crate::time::now();
         self.win.as_ref().is_some_and(|w| matches!(w.native.mode, SurfaceMode::Cpu { job: GpuJob::Waiting { retry_at, .. }, .. } if retry_at.is_none_or(|at| at <= now)) && w.first_frame.ready())
     }
 
@@ -170,7 +171,7 @@ impl Host {
             handle.send(WakeEvent::GpuReady);
         });
         match spawned {
-            Ok(thread) => { crate::marks::mark("gpu.window.start"); *job = GpuJob::Building { slot, latest, thread, since: Instant::now(), raised: !below, tries: tries + 1, animating: false, ready: None }; }
+            Ok(thread) => { crate::marks::mark("gpu.window.start"); *job = GpuJob::Building { slot, latest, thread, since: crate::time::now(), raised: !below, tries: tries + 1, animating: false, ready: None }; }
             Err(error) => self.fail_gpu(format!("its thread couldn't start: {error}"), tries + 1),
         }
     }
@@ -186,7 +187,7 @@ impl Host {
         // Ready while the CPU frames move something (a view fading in): the hand-over waits for a
         // frame at rest, so the frame both renderers draw is one that costs what a frame at rest
         // does, not the first of the GPU's frames to draw every layer of an entrance.
-        let now = Instant::now();
+        let now = crate::time::now();
         if slot.as_ref().is_some_and(Result::is_ok) && *animating && now < *ready.get_or_insert(now) + QUIET_WAIT {
             crate::marks::mark("gpu.window.deferred");
             return;
@@ -214,7 +215,7 @@ impl Host {
         let SurfaceMode::Cpu { mut cpu, .. } = std::mem::replace(&mut w.native.mode, SurfaceMode::Gpu) else { unreachable!() };
         cpu.half = HalfRounding::of_vendor(gpu.adapter.get_info().vendor);
         w.native.video_layers.hold_premultiplied(vrr_guard(gpu.adapter.get_info().vendor));
-        w.native.mode = SurfaceMode::HandingOver { cpu, handover, done: None, readback: None, since: Instant::now(), nudged: None, tries, paused: false };
+        w.native.mode = SurfaceMode::HandingOver { cpu, handover, done: None, readback: None, since: crate::time::now(), nudged: None, tries, paused: false };
         w.native.slot.reset();
         w.native.damage.reset();
         // D3D12's idle-priority threads compile the first frame's shaders: on a busy machine they
@@ -236,8 +237,9 @@ impl Host {
         if !matches!(l.native.mode, SurfaceMode::HandingOver { paused: false, .. }) { return; }
         if renderer.srgb_blend() != self.app.rt().srgb_blend() {
             let Some(surface) = l.surface.as_ref() else { return };
-            l.native.slot.reset();
-            if !reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut()) {
+            let ok = reblend_core(surface, gpu, &mut l.config, renderer, &mut l.alpha, self.app.rt_mut());
+            l.native.slot.reconfigured(ok);
+            if !ok {
                 l.surface_ok = false;
                 return;
             }
@@ -273,6 +275,7 @@ impl Host {
             });
         } else {
             let rt = self.app.rt_mut();
+            renderer.set_fade_stops(rt.fade_stops());
             renderer.prepare_ui(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, size);
             renderer.draw(&mut enc, &view, rt.clear_color());
         }
@@ -288,17 +291,15 @@ impl Host {
         });
         renderer.submit(&gpu.queue, enc);
         gpu.queue.present(frame);
-        if let Some(surface) = l.surface.as_ref() {
-            l.native.slot.presented_surface(surface);
-        }
+        l.native.slot.presented();
         let flag = Arc::new(AtomicBool::new(false));
         let set = flag.clone();
         gpu.queue.on_submitted_work_done(move || set.store(true, Ordering::Release));
-        *done = Some((flag, Instant::now()));
+        *done = Some((flag, crate::time::now()));
         // A thread waits for the GPU and wakes the loop, which commits (`hand_over_if_done`).
         let (waiting, handle) = (gpu.clone(), self.native_handle.clone());
         let spawned = std::thread::Builder::new().name("rune-gpu-wait".into()).spawn(move || {
-            let _ = waiting.device.poll(wgpu::PollType::wait_indefinitely());
+            rune_gpu::health::poll(&waiting.device, wgpu::PollType::wait_indefinitely()).ok();
             handle.send(WakeEvent::GpuReady);
         });
         if let Err(error) = spawned { eprintln!("rune: could not wait for the GPU's frame: {error}"); }
@@ -315,7 +316,7 @@ impl Host {
         match &mut w.native.mode {
             SurfaceMode::HandingOver { done: Some((done, _)), tries, .. } => {
                 let tries = *tries;
-                let _ = gpu.device.poll(wgpu::PollType::Poll);
+                rune_gpu::health::poll(&gpu.device, wgpu::PollType::Poll).ok();
                 let lost = gpu.is_lost();
                 if !lost && !done.load(Ordering::Acquire) { return; }
                 let committed = if lost { Err("its device was lost".to_owned()) } else if let SurfaceMode::HandingOver { handover, .. } = &w.native.mode { handover.commit() } else { unreachable!() };
@@ -359,7 +360,7 @@ impl Host {
         crate::marks::mark("gpu.window.failed");
         if !crate::marks::noted("gpu.window.why") { crate::marks::note("gpu.window.why", Box::leak(why.into_boxed_str())); }
         let Some(w) = self.win.as_mut() else { return };
-        let job = if tries < TRIES { GpuJob::Waiting { tries, retry_at: Some(Instant::now() + RETRY_AFTER) } } else { GpuJob::Failed };
+        let job = if tries < TRIES { GpuJob::Waiting { tries, retry_at: Some(crate::time::now() + RETRY_AFTER) } } else { GpuJob::Failed };
         let (SurfaceMode::Cpu { cpu, .. } | SurfaceMode::HandingOver { cpu, .. }) = std::mem::replace(&mut w.native.mode, SurfaceMode::Gpu) else { unreachable!("only a CPU window hands over") };
         w.native.mode = SurfaceMode::Cpu { cpu, job };
         // From a hand-over: its swap chain and GPU go. DWM kept the window's own content, which
@@ -426,6 +427,7 @@ impl Win {
 }
 
 /// Runs the GPU thread at normal priority (`RAISE_AFTER`).
+#[allow(unsafe_code)]
 fn raise_priority(thread: &std::thread::JoinHandle<()>) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_NORMAL};
@@ -437,6 +439,7 @@ static FIRST_GPU: AtomicBool = AtomicBool::new(false);
 
 /// On the GPU thread: the device (the one `warm_gpu` made, if it did), the renderer, the
 /// uncommitted visual and a swap chain on it, configured for `size`.
+#[allow(unsafe_code)]
 fn prepare(hwnd: isize, size: (u32, u32), srgb: bool, features: wgpu::Features, latest: &Mutex<Vec<crate::render::Instance>>) -> Result<Prepared, String> {
     let handover = Handover::new(hwnd)?;
     let visual = handover.visual();
@@ -444,7 +447,8 @@ fn prepare(hwnd: isize, size: (u32, u32), srgb: bool, features: wgpu::Features, 
     // to it, and the window keeps the `Handover` as long as it keeps the surface.
     let (gpu, surface, renderer) = Gpu::for_surface(features, false,
         |instance| unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(visual)) }.map_err(|e| e.to_string()))?;
-    let (config, _) = surface_config(&surface, &gpu.adapter, (size.0.max(1), size.1.max(1)), srgb).ok_or("the GPU can't present to this window")?;
+    let size = drawable_size(None, size, max_surface_dim(Some(&gpu)));
+    let (config, _) = surface_config(&surface, &gpu.adapter, size, srgb).ok_or("the GPU can't present to this window")?;
     configure(&surface, &gpu, &config)?;
     let target_format = if srgb { config.format.remove_srgb_suffix() } else { config.format };
     let mut renderer = renderer.unwrap_or_else(|| Renderer::new(&gpu.device, target_format));
@@ -481,9 +485,9 @@ fn warm_frame(gpu: &Gpu, renderer: &mut Renderer, format: wgpu::TextureFormat, s
     renderer.prepare_ui(&gpu.device, &gpu.queue, &mut atlas, instances, size);
     renderer.draw(&mut enc, &view, [0.0; 4]);
     renderer.submit(&gpu.queue, enc);
-    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
     target.destroy();
-    let _ = gpu.device.poll(wgpu::PollType::Poll);
+    rune_gpu::health::poll(&gpu.device, wgpu::PollType::Poll).ok();
 }
 
 /// A CPU frame's instances as the warm frame draws them: what reads the app's own state (an
@@ -511,7 +515,7 @@ fn count_drift(gpu: Arc<Gpu>, readback: Readback, mut dib: Dib) {
     let spawned = std::thread::Builder::new().name("rune-drift".into()).spawn(move || {
         let slice = readback.buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        if gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_err() { return; }
+        if rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).is_err() { return; }
         let (width, height) = readback.size;
         let stride = dib.stride();
         let Ok(gpu_px) = slice.get_mapped_range() else { return };
@@ -520,6 +524,25 @@ fn count_drift(gpu: Arc<Gpu>, readback: Readback, mut dib: Dib) {
     if let Err(error) = spawned { eprintln!("rune: could not count the hand-over's drift: {error}"); }
 }
 
+/// `crate::warm_gpu_cache` on Windows: a window that is never shown, the GPU thread's own
+/// `prepare` on it with no frame to draw, and the pinned pipelines waited for.
+#[allow(unsafe_code)]
+pub(crate) fn warm_gpu_cache() -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    // SAFETY: a window of the system's own class with no parent, menu or data; never shown.
+    let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1280, 800, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+    if hwnd.is_null() { return Err("no window could be made to warm the GPU on".into()); }
+    // What a window's hand-over makes: the device, the frame and fill pipelines for its swap
+    // chain's format, then (started by the warm frame's prepare) the pinned ones.
+    let made = prepare(hwnd as isize, (1280, 800), true, wgpu::Features::empty(), &Mutex::new(Vec::new()));
+    let result = made.map(|mut prepared| prepared.renderer.wait_pinned());
+    // SAFETY: the window made above, on this thread; the surface on it is gone with `prepared`.
+    unsafe { DestroyWindow(hwnd) };
+    result
+}
+
+#[allow(unsafe_code)]
 fn lower_priority() {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
     // SAFETY: this thread's pseudo-handle.

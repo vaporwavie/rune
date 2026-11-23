@@ -322,7 +322,7 @@ impl SurfaceRenderer {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn submit(&self, queue: &wgpu::Queue, encoder: wgpu::CommandEncoder) -> wgpu::SubmissionIndex {
-        let submitted_at = Instant::now();
+        let submitted_at = rune_core::time::now();
         let frames: Vec<_> = self
             .draws
             .iter()
@@ -368,26 +368,37 @@ impl SurfaceRenderer {
             let seconds_per_tick = queue.get_timestamp_period() as f64 * 1e-9;
             let queries = queries.clone();
             let device = self.device.clone();
-            let queue = queue.clone();
-            let completion = self.completion.clone();
+            // Weak: the queue keeps this closure until it runs, and a queue held by it would keep
+            // the queue (and the closure) alive for good if its device is lost first.
+            let queue = Arc::downgrade(self.timing_queue.get_or_init(|| Arc::new(queue.clone())));
+            let completion = self.completion.waker();
+            let resolves = self.resolves.clone();
             // Metal counter resolves can race the render pass's final fragment sample when
             // encoded into the same command buffer. Resolve after its completion fence; this
             // is timestamp metadata only, never a readback or wait on the video pixel path.
             encoder.on_submitted_work_done(move || {
-                let completed_at = Instant::now();
+                let completed_at = rune_core::time::now();
+                // The renderer is gone (its device lost and replaced, or the app closing): nothing
+                // resolves the times.
+                if queue.strong_count() == 0 {
+                    for (s, _, mut t) in frames {
+                        t.completed_at = Some(completed_at);
+                        s.report(t);
+                    }
+                    return;
+                }
                 let mut timestamps = device.create_command_encoder(&Default::default());
                 timestamps.resolve_query_set(&queries.pool.queries, queries.start..queries.start + 2, &resolve, 0);
                 timestamps.copy_buffer_to_buffer(&resolve, 0, &readback, 0, 16);
                 let result = readback.clone();
                 timestamps.map_buffer_on_submit(&readback, wgpu::MapMode::Read, .., move |status| {
-                    let times = if status.is_ok() {
-                        let bytes = result.slice(..).get_mapped_range().expect("mapped timestamps");
-                        let a = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                        let b = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    // Nothing in a wgpu callback may panic: a map aborted while a thread unwinds
+                    // runs it then, and a second panic aborts the process.
+                    let times = status.as_ref().ok().and_then(|_| result.slice(..).get_mapped_range().ok()).and_then(|bytes| {
+                        let a = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+                        let b = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
                         (b >= a && b != 0).then_some((a as f64 * seconds_per_tick, b as f64 * seconds_per_tick))
-                    } else {
-                        None
-                    };
+                    });
                     if status.is_ok() {
                         result.unmap();
                     }
@@ -402,20 +413,26 @@ impl SurfaceRenderer {
                         s.report(t);
                     }
                 });
-                queue.submit([timestamps.finish()]);
-                let _ = completion.try_send(());
+                // This runs on whichever thread polls the device, usually the completion thread:
+                // submitted from here while the window's thread configures a surface, the
+                // resolve makes wgpu refuse the configuration. It is parked, and submitted now
+                // unless a surface is being configured; the completion thread, woken below,
+                // submits it after one that is.
+                resolves.park((queue, timestamps.finish()));
+                resolves.submit();
+                completion.wake();
             });
         } else {
             encoder.on_submitted_work_done(move || {
                 for (s, _, mut t) in frames {
-                    t.completed_at = Some(Instant::now());
+                    t.completed_at = Some(rune_core::time::now());
                     s.report(t);
                 }
             });
         }
         let index = queue.submit([encoder.finish()]);
         self.release_decoded(queue);
-        let _ = self.completion.try_send(());
+        self.completion.wake();
         index
     }
 
@@ -486,7 +503,7 @@ mod abi_tests {
 
         let source = include_str!("../video.wgsl");
         let module = wgsl::parse_str(source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
-        Validator::new(ValidationFlags::all(), Capabilities::default() | Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+        Validator::new(ValidationFlags::all(), Capabilities::default())
             .validate(&module)
             .expect("validate video.wgsl");
         let mut layouter = Layouter::default();

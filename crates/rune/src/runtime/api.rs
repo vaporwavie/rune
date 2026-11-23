@@ -170,15 +170,15 @@ impl<S: 'static> Runtime<S> {
 
     /// The view's UI zoom from the last commit (`Cx::zoom`), 1 when unzoomed.
     #[inline(always)]
-    pub fn zoom(&self) -> f32 { self.core().zoom() }
+    pub fn zoom(&self) -> f32 { self.core().host.zoom() }
 
     /// The window's size in its own points, before the view's zoom.
     #[inline(always)]
-    pub fn window_viewport(&self) -> (f32, f32) { self.core().window_viewport() }
+    pub fn window_viewport(&self) -> (f32, f32) { self.core().host.window_viewport() }
 
     /// The window's scale, before the view's zoom.
     #[inline(always)]
-    pub fn window_scale(&self) -> f32 { self.core().window_scale() }
+    pub fn window_scale(&self) -> f32 { self.core().host.window_scale() }
 
     /// Physical pixels per view point: what a host divides physical pointer coordinates by.
     #[inline(always)]
@@ -186,7 +186,7 @@ impl<S: 'static> Runtime<S> {
 
     /// A rect `[x, y, w, h]` from view points to window points.
     #[inline(always)]
-    pub fn to_window(&self, r: [f32; 4]) -> [f32; 4] { self.core().to_window(r) }
+    pub fn to_window(&self, r: [f32; 4]) -> [f32; 4] { self.core().host.to_window(r) }
 
     /// The root's natural height at the current width, in window points.
     #[inline(always)]
@@ -221,7 +221,7 @@ impl<S: 'static> Runtime<S> {
     #[inline(always)]
     pub fn set_system_reduced_motion(&mut self, reduced: bool) { self.core_mut().set_system_reduced_motion(reduced); }
     #[inline(always)]
-    pub fn system_reduced_motion(&self) -> bool { self.core().system_reduced_motion() }
+    pub fn system_reduced_motion(&self) -> bool { self.core().host.system_reduced_motion() }
     #[inline(always)]
     pub(crate) fn system_scroll_bars_state(&self) -> crate::platform::scroll_bars::SystemScrollBars { self.core().system_scroll_bars_state() }
     #[inline(always)]
@@ -229,17 +229,17 @@ impl<S: 'static> Runtime<S> {
     #[inline(always)]
     pub fn set_system_scroll_bars(&mut self, bars: crate::ScrollBars) { self.core_mut().set_system_scroll_bars(bars); }
     #[inline(always)]
-    pub fn system_scroll_bars(&self) -> crate::ScrollBars { self.core().system_scroll_bars() }
+    pub fn system_scroll_bars(&self) -> crate::ScrollBars { self.core().host.system_scroll_bars() }
     #[inline(always)]
     pub fn set_system_scroller_overlay(&mut self, overlay: bool) { self.core_mut().set_system_scroller_overlay(overlay); }
     #[inline(always)]
-    pub fn system_scroller_overlay(&self) -> bool { self.core().system_scroller_overlay() }
+    pub fn system_scroller_overlay(&self) -> bool { self.core().host.system_scroller_overlay() }
     #[inline(always)]
     pub fn set_system_scroller_jumps(&mut self, jumps: bool) { self.core_mut().set_system_scroller_jumps(jumps); }
     #[inline(always)]
-    pub fn system_scroller_jumps(&self) -> bool { self.core().system_scroller_jumps() }
+    pub fn system_scroller_jumps(&self) -> bool { self.core().host.system_scroller_jumps() }
     #[inline(always)]
-    pub fn overlay_scroll_bars(&self) -> bool { self.core().overlay_scroll_bars() }
+    pub fn overlay_scroll_bars(&self) -> bool { self.core().host.overlay_scroll_bars() }
 
     #[inline(always)]
     pub fn set_font_families(&mut self, sans: &str, mono: &str) { self.core_mut().set_font_families(sans, mono); }
@@ -253,6 +253,8 @@ impl<S: 'static> Runtime<S> {
     #[inline(always)]
     pub fn srgb_blend(&self) -> bool { self.core().srgb_blend() }
     #[inline(always)]
+    pub fn fade_stops(&self) -> [f32; 2] { self.core().fade_stops() }
+    #[inline(always)]
     pub fn set_font_smoothing(&mut self, mode: crate::FontSmoothing) { self.core_mut().set_font_smoothing(mode); }
     #[inline(always)]
     pub fn font_smoothing(&self) -> crate::FontSmoothing { self.core().font_smoothing() }
@@ -262,7 +264,7 @@ impl<S: 'static> Runtime<S> {
     // ── Elements & inspection ──────────────────────────────────────────────────────────────────
 
     #[inline(always)]
-    pub fn element_is_secure(&self, path: &str) -> bool { self.core().element_is_secure(path) }
+    pub fn element_is_secure(&self, path: &str) -> bool { self.core().tree.element_is_secure(path) }
     #[inline(always)]
     pub fn elements(&self) -> Vec<ElementInfo> { self.core().elements() }
     #[inline(always)]
@@ -317,7 +319,7 @@ impl<S: 'static> Runtime<S> {
     #[inline(always)]
     pub fn element_path(&self, id: NodeId) -> Option<(&str, Option<&str>)> { self.core().element_path(id) }
     #[inline(always)]
-    pub fn rewind(&self) -> Option<&crate::rewind::Rewind> { self.core().rewind() }
+    pub fn rewind(&self) -> Option<&crate::rewind::Rewind> { self.core().motion.rewind() }
 
     #[inline(always)]
     pub(crate) fn poll_hidden(&mut self) -> bool {
@@ -381,14 +383,14 @@ impl<S: 'static> Runtime<S> {
 
     /// Takes the links handlers asked to open that this runtime didn't open.
     #[inline(always)]
-    pub fn take_url_requests(&mut self) -> Vec<String> { self.core_mut().take_url_requests() }
+    pub fn take_url_requests(&mut self) -> Vec<String> { self.core_mut().host.take_url_requests() }
 
     #[cfg(feature = "hot")]
     #[inline(always)]
     pub(crate) fn hot_scrolls(&self) -> Vec<(String, f64)> { self.core().hot_scrolls() }
     #[cfg(feature = "hot")]
     #[inline(always)]
-    pub(crate) fn hot_motion(&self) -> Vec<(String, [f32; 4], [f32; 4])> { self.core().hot_motion() }
+    pub(crate) fn hot_motion(&self) -> Vec<(String, [f32; 4], [f32; 4])> { self.core().tree.hot_motion(&self.core().scene) }
 
     // ── Accessibility & web ────────────────────────────────────────────────────────────────────
 
@@ -407,7 +409,7 @@ impl<S: 'static> Runtime<S> {
     pub(crate) fn a11y_deactivate(&mut self) { self.core_mut().a11y_deactivate(); }
     #[cfg(test)]
     #[inline(always)]
-    pub(crate) fn a11y_changes(&self) -> a11y_tree::Changes { self.core().a11y_changes() }
+    pub(crate) fn a11y_changes(&self) -> crate::a11y::tree::Changes { self.core().a11y_changes() }
     #[cfg(test)]
     #[inline(always)]
     pub(crate) fn a11y_update(&mut self) -> Option<accesskit::TreeUpdate> { self.core_mut().a11y_update() }
@@ -472,13 +474,13 @@ impl<S: 'static> Runtime<S> {
         let (core, mut app) = self.split_mut();
         core.web_focus_field(&mut app)
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(test, target_arch = "wasm32"))]
     #[inline(always)]
     pub(crate) fn web_edit_context(&mut self, mirror: &mut web_runtime::Mirror) -> Option<bool> {
         let (core, mut app) = self.split_mut();
         core.web_edit_context(&mut app, mirror)
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(test, target_arch = "wasm32"))]
     #[inline(always)]
     pub(crate) fn web_context(&self, mirror: &mut web_runtime::Mirror) -> bool { self.core().web_context(mirror) }
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -487,14 +489,20 @@ impl<S: 'static> Runtime<S> {
         let (core, mut app) = self.split_mut();
         core.web_key(&mut app, event)
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(test, target_arch = "wasm32"))]
     #[inline(always)]
     pub(crate) fn web_secure(&mut self, key: &str, text: String) { self.core_mut().web_secure(key, text); }
     #[cfg(any(test, target_arch = "wasm32"))]
     #[inline(always)]
-    pub(crate) fn web_edit(&mut self, event: &serde_json::Value) {
+    pub(crate) fn web_secure_replace(&mut self, key: &str, text: String) {
         let (core, mut app) = self.split_mut();
-        core.web_edit(&mut app, event);
+        core.web_secure_replace(&mut app, key, text);
+    }
+    #[cfg(any(test, target_arch = "wasm32"))]
+    #[inline(always)]
+    pub(crate) fn web_edit(&mut self, event: &serde_json::Value, mirror: &mut web_runtime::Mirror) {
+        let (core, mut app) = self.split_mut();
+        core.web_edit(&mut app, event, mirror);
     }
 
     // ── Test-only helpers called directly on `Runtime<S>` inside unit tests ───────────────────
@@ -544,7 +552,10 @@ impl<S: 'static> Runtime<S> {
 
     #[cfg(test)]
     #[inline(always)]
-    pub(super) fn capture_text_flight(&mut self, source: String, target: String) { self.core_mut().capture_text_flight(source, target); }
+    pub(super) fn capture_text_flight(&mut self, source: String, target: String) {
+        let c = self.core_mut();
+        c.motion.capture_text_flight(&c.tree.nodes, &mut c.paint, &mut c.text, c.env.scale, c.viewport, c.t, source, target);
+    }
 
     #[cfg(test)]
     #[inline(always)]
@@ -600,7 +611,10 @@ impl<S: 'static> Runtime<S> {
 
     #[cfg(test)]
     #[inline(always)]
-    pub(crate) fn record_rewind(&mut self) { self.core_mut().record_rewind(); }
+    pub(crate) fn record_rewind(&mut self) {
+        let c = self.core();
+        c.motion.record_rewind(c.clock, c.viewport, &c.tree.nodes, &c.paint);
+    }
 
     #[cfg(test)]
     #[inline(always)]

@@ -12,6 +12,10 @@ use std::time::Duration;
 const KEEP: usize = 2;
 /// How long any other thread waits for a task before it ends.
 const LINGER: Duration = Duration::from_secs(10);
+/// Each thread's stack reservation: image decoding runs here, and an SVG at `rune-image`'s
+/// 512-level nesting bound needs ~2.3 MiB in `usvg` + `resvg` on an LTO build. Address space
+/// only; pages are committed as a thread touches them.
+const STACK: usize = 8 * 1024 * 1024;
 
 type Job = (String, Box<dyn FnOnce() + Send>);
 
@@ -37,7 +41,7 @@ pub(super) fn run(name: String, work: Box<dyn FnOnce() + Send>) -> std::io::Resu
     if s.idle >= s.jobs.len() {
         return Ok(());
     }
-    match std::thread::Builder::new().name("rune-task".into()).spawn(worker) {
+    match std::thread::Builder::new().name("rune-task".into()).stack_size(STACK).spawn(worker) {
         Ok(_) => {
             s.threads += 1;
             Ok(())
@@ -61,14 +65,14 @@ fn worker() {
             drop(s);
             describe(&name);
             // A task that panics ends itself, not the thread (the panic hook has reported it).
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).ok();
             describe("idle");
-            tidy = tidy.on_work(crate::time::Instant::now());
+            tidy = tidy.on_work(crate::time::now());
             s = lock();
             continue;
         }
         s.idle += 1;
-        let now = crate::time::Instant::now();
+        let now = crate::time::now();
         let wait = match (s.threads > KEEP, tidy.wait(now)) {
             (true, Some(due)) => Some(LINGER.min(due)),
             (true, None) => Some(LINGER),
@@ -91,7 +95,7 @@ fn worker() {
                 s.threads -= 1;
                 return;
             }
-            if tidy.take_due(crate::time::Instant::now()) {
+            if tidy.take_due(crate::time::now()) {
                 drop(s);
                 super::idle();
                 s = lock();
@@ -103,6 +107,7 @@ fn worker() {
 /// Names the thread after its task, where a profiler or debugger reads it (Windows' thread
 /// description): `rune-task: <name>`.
 #[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
 fn describe(name: &str) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
     let wide: Vec<u16> = format!("rune-task: {name}").encode_utf16().chain([0]).collect();

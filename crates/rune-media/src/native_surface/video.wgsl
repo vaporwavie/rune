@@ -71,6 +71,17 @@ fn unpack_clip_radii(w: u32) -> vec4<f32> {
         f32((w >> 21u) & 0x7fu),
     ) * (step * sgn);
 }
+fn unpack_f16x2(packed: u32) -> vec2<f32> {
+    let h = vec2<u32>(packed & 0xFFFFu, packed >> 16u);
+    let sign = (h & vec2<u32>(0x8000u)) << vec2<u32>(16u);
+    let exp = (h >> vec2<u32>(10u)) & vec2<u32>(0x1Fu);
+    let mant = h & vec2<u32>(0x03FFu);
+    let sub = sign | bitcast<vec2<u32>>(vec2<f32>(mant) * (1.0 / 16777216.0));
+    let norm = sign | ((exp + vec2<u32>(112u)) << vec2<u32>(23u)) | (mant << vec2<u32>(13u));
+    let inf_nan = sign | vec2<u32>(0x7F800000u) | (mant << vec2<u32>(13u)) | select(vec2<u32>(0u), vec2<u32>(0x00400000u), mant != vec2<u32>(0u));
+    let bits = select(select(norm, inf_nan, exp == vec2<u32>(31u)), sub, exp == vec2<u32>(0u));
+    return bitcast<vec2<f32>>(bits);
+}
 fn ramp(d: f32, width: f32) -> f32 {
     if width == 0.0 { return clamp(d + 0.5, 0.0, 1.0); }
     let x = clamp(d / abs(width), 0.0, 1.0);
@@ -108,18 +119,31 @@ fn ramp(d: f32, width: f32) -> f32 {
     }
     let half = u.node.zw*0.5;
     let distance = sd_rounded(p-u.node.xy-half, half, u.radii);
-    let hard = vec4<f32>(p-u.clip.xy, u.clip.zw-p);
-    let fade = vec4<f32>(unpack2x16float(u.fade.x), unpack2x16float(u.fade.y));
-    let offset = unpack4x8unorm(u.fade.z);
+    let hard = vec4<f32>(p - u.clip.xy, u.clip.zw - p);
+    var fade = vec4<f32>(0.0);
+    if (u.fade.x | u.fade.y) != 0u { fade = vec4<f32>(unpack_f16x2(u.fade.x), unpack_f16x2(u.fade.y)); }
     var clip = 1.0;
-    for (var edge = 0u; edge < 4u; edge++) {
-        var a = ramp(hard[edge], fade[edge]);
-        if offset[edge] >= 1.0 {
-            a = ramp(hard[edge], 0.0);
-        } else if offset[edge] > 0.0 {
-            a = min(ramp(hard[edge], 0.0), ramp(hard[edge] + offset[edge] * abs(fade[edge]), fade[edge]));
+    if u.fade.z == 0u {
+        clip = ramp(hard.x, fade.x) * ramp(hard.y, fade.y) * ramp(hard.z, fade.z) * ramp(hard.w, fade.w);
+    } else {
+        for (var edge = 0u; edge < 4u; edge++) {
+            let raw_off = (u.fade.z >> (edge * 8u)) & 0xFFu;
+            let is_stops = (raw_off & 0x80u) != 0u;
+            let off_u = raw_off & 0x7Fu;
+            // Native surfaces carry no frame-globals stop table; degrade stop-tagged edges to a
+            // linear ramp while preserving exact 7-bit offset and hard-edge (`off_u >= 127`) semantics.
+            let fw = select(fade[edge], -abs(fade[edge]), is_stops);
+            var a: f32;
+            if off_u >= 127u {
+                a = ramp(hard[edge], 0.0);
+            } else if off_u > 0u {
+                let offset = f32(off_u) * (1.0 / 127.0);
+                a = min(ramp(hard[edge], 0.0), ramp(hard[edge] + offset * abs(fw), fw));
+            } else {
+                a = ramp(hard[edge], fw);
+            }
+            clip *= a;
         }
-        clip *= a;
     }
     var mask = 1.0;
     if u.fade.w != 0u {

@@ -1,8 +1,13 @@
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) mod completion;
 mod frame;
 
 use super::*;
 use rune_core::Blend;
 use std::collections::HashMap;
+
+/// The video pass's shader; on Windows its DX12 bytecode ships precompiled (`dxbc.rs`).
+pub(super) const WGSL: &str = include_str!("video.wgsl");
 
 fn blend_state(blend: Blend) -> wgpu::BlendState {
     match blend {
@@ -85,13 +90,21 @@ impl Drop for TimingSlot {
 /// Standalone pipeline, also used by Rune's renderer. A frame must be submitted through `submit`
 /// for timing notifications; texture lifetimes are safe even with ordinary wgpu submission.
 pub struct SurfaceRenderer {
+    /// The queue timestamp resolves go to, held here so their callbacks hold it weakly.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    timing_queue: std::sync::OnceLock<Arc<wgpu::Queue>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) completion: completion::CompletionWorker,
+    /// Timestamp resolves a completion callback couldn't submit yet (`completion::Parked`).
+    #[cfg(not(target_arch = "wasm32"))]
+    resolves: Arc<completion::Parked<completion::Resolve>>,
+    #[cfg(target_os = "linux")]
+    dmabuf: Option<linux::Importer>,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     device: wgpu::Device,
     timing_pool: Option<Arc<TimingPool>>,
     queries: Option<Arc<TimingSlot>>,
     queries_used: std::sync::atomic::AtomicBool,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(super) completion: std::sync::mpsc::SyncSender<()>,
     pipeline: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
     extra: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
@@ -113,9 +126,23 @@ pub struct SurfaceRenderer {
     importer: Option<macos::Importer>,
     #[cfg(target_os = "windows")]
     shared: Option<windows::Importer>,
-    #[cfg(target_os = "linux")]
-    dmabuf: Option<linux::Importer>,
 }
+impl Drop for SurfaceRenderer {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Release the queue before joining so any in-flight completion callback won't submit
+            // another timestamp resolve to a renderer that is going away.
+            self.timing_queue.take();
+            self.completion.stop();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(dmabuf) = &mut self.dmabuf {
+            dmabuf.stop();
+        }
+    }
+}
+
 impl SurfaceRenderer {
     #[cfg(target_arch = "wasm32")]
     pub fn new(_: &wgpu::Device, _: wgpu::TextureFormat) -> Self {
@@ -150,11 +177,11 @@ impl SurfaceRenderer {
         let (punch_sender, punch) = std::sync::mpsc::sync_channel(1);
         let (device_for, layout_for) = (device.clone(), layout.clone());
         let spawned = std::thread::Builder::new().name("rune-video-pipeline".into()).spawn(move || {
-            let _ = sender.send(Self::pipeline(&device_for, &layout_for, format, Blend::SourceOver));
+            sender.send(Self::pipeline(&device_for, &layout_for, format, Blend::SourceOver)).ok();
             done();
             // A clip's layer (Windows) needs the punch; it compiles once the pictures can show.
             #[cfg(target_os = "windows")]
-            let _ = punch_sender.send(Self::pipeline_with(&device_for, &layout_for, format, PUNCH));
+            punch_sender.send(Self::pipeline_with(&device_for, &layout_for, format, PUNCH)).ok();
             #[cfg(not(target_os = "windows"))]
             drop(punch_sender);
         });
@@ -189,25 +216,8 @@ impl SurfaceRenderer {
                 free: std::sync::Mutex::new((0..TIMING_SLOTS).map(|i| i * 2).collect()),
             })
         });
-        let (completion, receiver) = std::sync::mpsc::sync_channel(1);
-        let poll_device = device.clone();
-        std::thread::Builder::new()
-            .name("rune-video-completion".into())
-            .spawn(move || {
-                // Nonblocking poll releases wgpu's snatch lock before sleeping. A fence wait here
-                // would keep that read lock and serialize queue.present's write lock behind GPU work.
-                // Wakeups are coalesced; the final frame still completes after the window goes idle.
-                while receiver.recv().is_ok() {
-                    loop {
-                        match poll_device.poll(wgpu::PollType::Poll) {
-                            Ok(wgpu::PollStatus::QueueEmpty) => break,
-                            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                            Err(_) => return,
-                        }
-                    }
-                }
-            })
-            .expect("video completion thread");
+        let resolves = Arc::new(completion::Parked::default());
+        let completion = completion::CompletionWorker::spawn(device.clone(), resolves.clone());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("video linear"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -215,11 +225,15 @@ impl SurfaceRenderer {
             ..Default::default()
         });
         Self {
+            timing_queue: std::sync::OnceLock::new(),
+            completion,
+            resolves,
+            #[cfg(target_os = "linux")]
+            dmabuf: None,
             device: device.clone(),
             timing_pool,
             queries: None,
             queries_used: std::sync::atomic::AtomicBool::new(false),
-            completion,
             pipeline,
             format,
             extra: Vec::new(),
@@ -237,8 +251,6 @@ impl SurfaceRenderer {
             importer: None,
             #[cfg(target_os = "windows")]
             shared: None,
-            #[cfg(target_os = "linux")]
-            dmabuf: None,
         }
     }
 
@@ -283,10 +295,38 @@ impl SurfaceRenderer {
     }
 
     fn pipeline_with(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: wgpu::BlendState) -> wgpu::RenderPipeline {
+        #[cfg(target_os = "windows")]
+        if let Some(pipeline) = super::dxbc::pipeline(device, |vertex, fragment| Self::make_pipeline(device, layout, format, blend, vertex, fragment)) {
+            return pipeline;
+        }
+        Self::wgsl_pipeline(device, layout, format, blend)
+    }
+
+    fn wgsl_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: wgpu::BlendState) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("video"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("video.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(WGSL.into()),
         });
+        Self::make_pipeline(device, layout, format, blend, &shader, &shader)
+    }
+
+    /// The pipeline from WGSL whatever the precompiled bytecode is, for `regen_dxbc` and its
+    /// freshness test, which take the HLSL wgpu logs while it compiles.
+    #[cfg(target_os = "windows")]
+    #[doc(hidden)]
+    pub fn compile_wgsl_now(device: &wgpu::Device, format: wgpu::TextureFormat) {
+        let layout = Self::bind_layout(device);
+        drop(Self::wgsl_pipeline(device, &layout, format, blend_state(Blend::SourceOver)));
+    }
+
+    fn make_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+        blend: wgpu::BlendState,
+        vertex: &wgpu::ShaderModule,
+        fragment: &wgpu::ShaderModule,
+    ) -> wgpu::RenderPipeline {
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("video"),
             bind_group_layouts: &[Some(layout)],
@@ -296,7 +336,7 @@ impl SurfaceRenderer {
             label: Some("video"),
             layout: Some(&pl),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: vertex,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
                 buffers: &[],
@@ -305,7 +345,7 @@ impl SurfaceRenderer {
             depth_stencil: None,
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: fragment,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {

@@ -8,7 +8,6 @@ use winit::window::Window;
 
 use super::Host;
 use crate::render::{Gpu, Renderer};
-use crate::time::Instant;
 #[cfg(target_os = "windows")]
 use crate::window::chrome;
 use crate::window::chrome::{frame_chrome, place_chrome, sync_chrome_core};
@@ -26,7 +25,8 @@ use crate::window::surface::native;
 use crate::window::surface::win;
 use crate::window::surface::{
     Backoff, BackoffEvent, HiddenPace, LoopFrame, Native, Redraw, SurfaceRetries, SurfaceStep,
-    SURFACE_TRIES, TimerFrame, Win, configure, rebuild_renderer_core, surface_config,
+    SURFACE_TRIES, TimerFrame, Win, configure, drawable_size, max_surface_dim,
+    rebuild_renderer_core, surface_config,
 };
 #[cfg(target_os = "windows")]
 use crate::window::win32::{covered_draw::CoveredDraw, cpu_frame, handover};
@@ -93,7 +93,7 @@ impl Host {
         #[cfg(target_os = "windows")]
         if visible && !cpu_first {
             // Unfocused (`App::open_inactive`), it never activates.
-            cloak.hold(&window, Instant::now() + win::READY_FALLBACK, focus);
+            cloak.hold(&window, crate::time::now() + win::READY_FALLBACK, focus);
             window.set_visible(true);
             chrome::open_as(&window, open_as);
         }
@@ -117,11 +117,12 @@ impl Host {
         #[cfg(target_os = "macos")]
         crate::platform::macos::configure_window(&window, &self.macos_window);
         #[cfg(target_os = "macos")]
-        crate::platform::macos::drop::install(&window);
+        let drop_target = crate::platform::macos::drop::install(&window);
         if self.options.click_through && let Err(error) = window.set_cursor_hittest(false) {
             eprintln!("click-through unavailable for {}: {error}", self.native_handle.key());
         }
         window.set_ime_allowed(false);
+        self.ime.clear();
         self.app.rt_mut().edit.ime_reset = true;
         #[cfg(target_os = "macos")]
         if uses_drag_regions(chrome, self.options.borderless, false) {
@@ -135,7 +136,9 @@ impl Host {
             rt.set_native_help(true);
         }
         #[cfg(windows)]
+        #[allow(unsafe_code)]
         {
+            // SAFETY: `GetDoubleClickTime` takes no arguments and reads the system setting.
             let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
             let rt = self.app.rt_mut();
             rt.double_click_interval = f64::from(ms) / 1000.0;
@@ -174,10 +177,11 @@ impl Host {
                 (Some(gpu), surface)
             }
         };
-        let adapter = &gpu.as_ref().or(self.gpu.as_ref().map(|g| &g.0)).unwrap().adapter;
+        let active_gpu = gpu.as_ref().or(self.gpu.as_ref().map(|g| &g.0)).unwrap();
         let phys = window.inner_size();
+        let initial = drawable_size(None, (phys.width, phys.height), max_surface_dim(Some(active_gpu)));
         let srgb_blend = self.app.rt().srgb_blend();
-        let (mut config, translucent) = surface_config(&surface, adapter, (phys.width, phys.height), srgb_blend)
+        let (mut config, translucent) = surface_config(&surface, &active_gpu.adapter, initial, srgb_blend)
             .ok_or("the GPU adapter can't present to this window")?;
         #[cfg(target_os = "macos")]
         let launch_drawables = LaunchDrawables::cap(&mut config);
@@ -226,7 +230,7 @@ impl Host {
         {
             let rt = self.app.rt_mut();
             rt.set_system_dark(crate::platform::preferences::window_dark(&window, self.args.theme.as_deref()));
-            rt.set_viewport((phys.width as f32 / scale, phys.height as f32 / scale), scale);
+            rt.set_viewport((config.width as f32 / scale, config.height as f32 / scale), scale);
             if (self.shown || launcher) && !built {
                 // Reopening paints the settled state in the first frame (guarantee 8).
                 rt.settle_all();
@@ -258,7 +262,9 @@ impl Host {
         let prime = if visible && panel.is_none() { native::Prime::launching() } else { native::Prime::Steady };
         #[cfg(target_os = "macos")]
         let native = Native {
-            pacing: crate::platform::display_link::DisplayLink::new(&window, self.frame_wake.clone()),
+            // A window whose first frame is drawn here, at once (`prime`), gets its display link
+            // after that frame. `RUNE_PACING_BEFORE_FRAME` keeps the old order.
+            pacing: if prime.presumes() && std::env::var_os("RUNE_PACING_BEFORE_FRAME").is_none() { None } else { crate::platform::display_link::DisplayLink::new(&window, self.frame_wake.clone()) },
             present,
             present_log: hook_log,
             shadow,
@@ -270,10 +276,11 @@ impl Host {
             prime,
             launch_drawables,
             _spot: crate::platform::macos::traffic_lights::Spot::new(&window),
+            _drop: drop_target,
         };
         // Making the GPU and surface took part of the cloak's wait; the frame gets all of it.
         #[cfg(target_os = "windows")]
-        cloak.extend(Instant::now() + win::READY_FALLBACK);
+        cloak.extend(crate::time::now() + win::READY_FALLBACK);
         #[cfg(target_os = "windows")]
         let native = {
             Native { cloak, frame, a11y_start, ..Default::default() }
@@ -283,7 +290,7 @@ impl Host {
         self.win = Some(Win {
             a11y,
             native,
-            first_frame: FirstFrame::opened(Instant::now()),
+            first_frame: FirstFrame::opened(crate::time::now()),
             surface: Some(surface),
             config,
             surface_ok: true,
@@ -301,10 +308,10 @@ impl Host {
             covered_draw: CoveredDraw::Current,
             redraw: std::cell::Cell::new(Redraw::Idle),
         });
-        if launcher { self.win.as_mut().unwrap().first_frame.prepare(Instant::now()); }
+        if launcher { self.win.as_mut().unwrap().first_frame.prepare(crate::time::now()); }
         self.apply_placement(event_loop);
         #[cfg(target_os = "macos")]
-        if visible && let Some(w) = &self.win && w.native.panel.is_some() { w.show(focus); }
+        if visible && let Some(w) = &mut self.win && w.native.panel.is_some() { w.show(focus); }
         crate::marks::mark("window.created");
         if let Some(created) = self.on_created.take() { created(self.native_handle.clone()); }
         if let Some(on_window) = self.on_window.as_mut() { on_window(&self.native_handle); }
@@ -315,7 +322,7 @@ impl Host {
             let scale = w.window.scale_factor() as f32;
             if size.width > 0 && size.height > 0 {
                 w.resize_surface(Some(&**gpu), size);
-                self.app.rt_mut().set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+                self.app.rt_mut().set_viewport((w.config.width as f32 / scale, w.config.height as f32 / scale), scale);
             }
             sync_chrome_core(self.app.rt_mut(), w, self.chrome, self.titlebar);
             sync_screen_origin_core(self.app.rt_mut(), &w.window);
@@ -333,9 +340,49 @@ impl Host {
             && self.win.as_ref().is_some_and(|w| w.native.panel.is_none() && w.window.is_minimized() != Some(true))
         {
             let presents = self.meter.totals().presents;
+            self.ime_waits = true;
+            self.pacing_waits = self.win.as_ref().is_some_and(|w| w.native.pacing.is_none());
+            let opened_with = self.app.rt().titlebar_set();
             self.redraw();
+            // The view's first run may set the titlebar (`Cx::set_titlebar`, `Cx::titlebar_height`):
+            // the traffic lights move and the view's inset with them. The shell would do that
+            // after this turn, but while AppKit launches the app the next frame is 50,000 µs
+            // away and the first one would stand on screen with the lights where `App::chrome`
+            // put them. So the frame is drawn again before either reaches the screen: at once,
+            // as a frame for a new size is (the frame pacing would put a plain redraw off).
+            // A view that set the titlebar the window opened with (the app gave `App::titlebar`
+            // the one its view sets) moved nothing: that frame is drawn once.
+            if crate::platform::macos::launching() && self.app.rt_mut().take_titlebar_changed()
+                && self.app.rt().titlebar_set().changes(opened_with, self.titlebar)
+            {
+                if let Some(w) = &self.win { sync_chrome_core(self.app.rt_mut(), w, self.chrome, self.titlebar); }
+                if self.app.rt().stale() {
+                    self.draw(true);
+                    if let Some(l) = self.win.as_mut() && !crate::platform::macos::in_live_resize(&l.window) { l.set_live_resize(false); }
+                }
+            }
+            self.ime_waits = false;
+            self.pacing_waits = false;
             drew = self.meter.totals().presents > presents;
+            if drew { crate::platform::macos::flush_while_launching(); }
+            // The text input the first frame left out, now that the frame is on its way.
+            if let Some(l) = self.win.as_ref() {
+                crate::input::host_events::sync_ime(&l.window, self.app.rt_mut(), &mut self.ime, l.window.has_focus());
+                static FIRST_IME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                crate::marks::mark_once(&FIRST_IME, "frame.first.ime");
+            }
             self.shell(event_loop);
+        }
+        // The launch's menu bar, which waited for that frame: winit's default menu, the
+        // standard items, then this window's own.
+        #[cfg(target_os = "macos")]
+        {
+            if crate::native_menu::bar_ready() && visible && let Some(w) = &self.win { crate::native_menu::list_window(&w.window); }
+            self.menus.drain();
+            // The display link that waited for the first frame, or for a window not drawn here.
+            if let Some(w) = self.win.as_mut() && w.native.pacing.is_none() {
+                w.native.pacing = crate::platform::display_link::DisplayLink::new(&w.window, self.frame_wake.clone());
+            }
         }
         if !drew && (visible || launcher) && let Some(w) = &self.win {
             w.request_redraw();
@@ -376,6 +423,7 @@ impl Host {
     /// for presentation"). The same goes for a surface whose configuration a driver refused.
     /// The next frame draws with what this makes; `replace_lost_surface` gives the window up if
     /// this keeps failing.
+    #[allow(unsafe_code)]
     pub(in crate::window) fn reattach(&mut self) -> Result<(), String> {
         let Some(w) = self.win.as_mut() else { return Err("there is no window to draw into".into()) };
         let window = w.window.clone();
@@ -414,8 +462,10 @@ impl Host {
         })?;
         let gpu = Arc::new(gpu);
         let size = window.inner_size();
+        let prev = self.win.as_ref().map(|w| (w.config.width, w.config.height));
+        let size = drawable_size(prev, (size.width, size.height), max_surface_dim(Some(&gpu)));
         let srgb_blend = self.app.rt().srgb_blend();
-        let (mut config, translucent) = surface_config(&surface, &gpu.adapter, (size.width, size.height), srgb_blend)
+        let (mut config, translucent) = surface_config(&surface, &gpu.adapter, size, srgb_blend)
             .ok_or("the GPU adapter can't present to this window")?;
         let client_frame = self.client_frame(&window);
         if transparent || client_frame {
@@ -465,6 +515,7 @@ impl Host {
     /// a lost device. Premultiplied costs DWM a blend of every region the UI presents, so it lasts
     /// only while a layer shows. Ok(false) when there's nothing to do.
     #[cfg(target_os = "windows")]
+    #[allow(unsafe_code)]
     pub(in crate::window) fn rebind_alpha(&mut self, premultiplied: bool) -> Result<bool, String> {
         let Some((gpu, _)) = self.gpu.as_ref() else { return Ok(false) };
         let Some(w) = self.win.as_mut() else { return Ok(false) };
@@ -513,7 +564,7 @@ impl Host {
         let lost = self.gpu.as_ref().is_none_or(|(gpu, _)| gpu.is_lost());
         let surface_missing = self.win.as_ref().is_some_and(|w| !w.surface_ok || w.surface.is_none());
         if !lost && !surface_missing { return true; }
-        let now = Instant::now();
+        let now = crate::time::now();
         let Some(step) = self.win.as_mut().map(|w| w.surface_retries.attempt()) else { return false };
         if step == SurfaceStep::GiveUp {
             return self.give_up_surface(format!("the window's GPU surface was replaced {SURFACE_TRIES} times without a frame reaching the screen"));

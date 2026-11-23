@@ -8,9 +8,10 @@
 
 mod gpu;
 mod scenes;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use rune::compose::{Compositor, Frame, is_glyph};
 use rune::render::{Instance, KIND_GRADIENT, KIND_LAYER, KIND_LAYER_END, KIND_RECT};
@@ -126,13 +127,15 @@ impl Compositor<Lab> for LabGfx {
     }
 
     fn render(&mut self, f: &mut Frame<'_, Lab>) {
-        let started = Instant::now();
-        let rebuilt = self.res.as_ref().is_none_or(|r| r.size != f.size || r.format != f.format);
+        let started = rune::time::now();
+        let device_key = f.device_key();
+        let rebuilt = self.res.as_ref().is_none_or(|r| r.device_key != device_key || r.size != f.size || r.format != f.format);
         if rebuilt {
-            self.res = Some(Res::new(f.device, f.queue, f.size, f.format, f.ui));
+            self.res = None;
+            self.res = Some(Res::new(f.device, f.queue, device_key, f.size, f.format, f.ui));
         }
         self.view_pending = false;
-        let _ = f.device.poll(wgpu::PollType::Poll);
+        f.device.poll(wgpu::PollType::Poll).ok();
         let res = self.res.as_mut().unwrap();
         let gpu_ms = res.timer.as_mut().and_then(|t| t.begin(f.encoder));
         let rt = &mut *f.rt;

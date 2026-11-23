@@ -5,13 +5,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use std::sync::mpsc;
 
 pub(crate) mod animated;
 mod app_icon;
 mod avif;
 mod from_url;
+#[cfg(feature = "svg")]
+mod gzip;
+#[cfg_attr(not(any(test, target_arch = "wasm32", feature = "svg")), allow(dead_code))]
+mod header;
 #[cfg(test)]
 mod mip_tests;
 mod mips;
@@ -19,6 +23,7 @@ mod mips;
 pub mod pixels;
 #[doc(hidden)]
 pub mod place;
+mod svg;
 #[cfg(test)]
 mod tests;
 
@@ -29,10 +34,19 @@ pub use from_url::font_file;
 pub use pixels::Pixels;
 pub use place::Align;
 pub use place::SurfaceFit;
+#[doc(hidden)]
+pub use svg::svg_rgba;
+pub use svg::svg_rgba_cover;
 
 #[cfg(test)]
 use mips::byte;
 use mips::mip_chain;
+
+/// Largest image side Rune decodes or accepts on native and web: 8192 pixels, so 8-bit RGBA
+/// stays within [`MAX_ALLOC`] before mips.
+pub(crate) const MAX_SIDE: u32 = 8192;
+/// Largest decoded raster buffer Rune allocates: 256 MiB.
+pub(crate) const MAX_ALLOC: u64 = 256 * 1024 * 1024;
 
 pub type ImageId = [u8; 32];
 
@@ -101,12 +115,19 @@ impl Image {
     pub(crate) fn decoded(&self) -> Option<Result<&Decoded, &ImageError>> {
         self.0.decoded.get().map(|r| r.as_ref().map(Arc::as_ref))
     }
-    // The handle is ready before its pixels wake any window, so a woken frame sees its size.
+    // Pixels are stored before `decoded` is published (so `Image::wait` and `is_ready` never see
+    // empty pixels), and windows wake after `decoded` is set (so a woken frame sees `size`).
     fn finish(&self, decoded: Result<Decoded, ImageError>) {
         let decoded = decoded.map(Arc::new);
-        let mips = decoded.as_ref().ok().cloned();
-        let _ = self.0.decoded.set(decoded);
-        if let Some(mips) = mips { self.0.pixels.set_mips(mips); }
+        let has_mips = if let Ok(mips) = &decoded {
+            self.0.pixels.store_mips(mips.clone());
+            true
+        } else {
+            false
+        };
+        if self.0.decoded.set(decoded).is_ok() && has_mips {
+            self.0.pixels.source.notify();
+        }
     }
 }
 
@@ -136,7 +157,7 @@ impl Input {
             Input::Icon(path, px) => app_icon_rgba(&path, px).and_then(|(w, h, bytes)| mip_chain(w, h, &bytes)),
             #[cfg(not(target_arch = "wasm32"))]
             Input::File(path, px) => {
-                let bytes = std::fs::read(&path).map_err(|e| ImageError(format!("{}: {e}", path.display())))?;
+                let bytes = read_regular_file(&path)?;
                 if has_svg_extension(&path) || is_svg(&bytes) {
                     svg_rgba(&bytes, px).and_then(|(w, h, bytes)| mip_chain(w, h, &bytes))
                 } else {
@@ -179,34 +200,50 @@ const DECODERS: usize = 4;
 #[cfg(not(target_arch = "wasm32"))]
 const INLINE_RGBA_PIXELS: u64 = 64 * 64;
 
-/// The process's decoder threads, shared by every cache and started by the first image to
-/// decode: an app that makes a cache per feature, or shows no image, pays no thread for it.
-/// The caller starts one; that one starts the others, so the first image (often in a window's
-/// first frame) costs its thread one spawn, not four.
+/// The images waiting to decode, shared by every cache, and how many decoders are draining them.
+/// A decoder is a task on Rune's shared threads (`task::spawn`) that decodes until none is left:
+/// a session opening on several screenshots decodes them side by side, and with nothing to
+/// decode no thread stays for it (each kept decoder thread held its stack and its allocator
+/// pages for the process's life). Task threads reserve the stack `MAX_SVG_DEPTH` needs
+/// (`rune_core::task`'s `STACK`).
 #[cfg(not(target_arch = "wasm32"))]
-fn decoders() -> &'static mpsc::Sender<Job> {
-    static JOBS: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
-    JOBS.get_or_init(|| {
-        let (jobs, receive) = mpsc::channel::<Job>();
-        // A session opening on several screenshots decodes them side by side, not one by one.
-        let receive = Arc::new(Mutex::new(receive));
-        let count = DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
-        let first = receive.clone();
-        std::thread::Builder::new().name("rune-images".into()).spawn(move || {
-            for _ in 1..count {
-                let receive = receive.clone();
-                let _ = std::thread::Builder::new().name("rune-images".into()).spawn(move || decode_jobs(&receive));
-            }
-            decode_jobs(&first);
-        }).expect("image worker");
-        jobs
-    })
+static DECODING: Mutex<(std::collections::VecDeque<Job>, usize)> = Mutex::new((std::collections::VecDeque::new(), 0));
+
+/// Queues `job`, and starts a decoder for it while fewer than one per core (at most
+/// [`DECODERS`]) run. False when no decoder runs and none could start.
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_later(job: Job) -> bool {
+    let mut d = DECODING.lock().unwrap_or_else(|e| e.into_inner());
+    d.0.push_back(job);
+    let most = DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
+    if d.1 >= most {
+        return true;
+    }
+    d.1 += 1;
+    drop(d);
+    if rune_core::task::spawn("rune-images", decode_jobs).is_ok() {
+        return true;
+    }
+    let mut d = DECODING.lock().unwrap_or_else(|e| e.into_inner());
+    d.1 -= 1;
+    if d.1 > 0 {
+        return true;
+    }
+    d.0.pop_back();
+    false
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn decode_jobs(receive: &Mutex<mpsc::Receiver<Job>>) {
+fn decode_jobs() {
     loop {
-        let Ok(job) = receive.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
+        let job = {
+            let mut d = DECODING.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(job) = d.0.pop_front() else {
+                d.1 -= 1;
+                return;
+            };
+            job
+        };
         job.image.finish(job.input.decode_caught());
         (job.waker)();
     }
@@ -238,8 +275,9 @@ impl ImageCache {
     /// [`ImageCache::svg`] to rasterize it at the size it draws at. Legacy ICNS codecs return an
     /// explicit error; callers can provide platform-decoded RGBA instead. An animation decodes
     /// every frame on the worker, and plays only while an element draws it in a shown window.
-    /// On web the browser decodes everything but PNG, SVG and ICNS, so GIF and WebP show their
-    /// first frame there.
+    /// On web the browser decodes everything but PNG, SVG and ICNS, matching the raster formats
+    /// Chrome decodes (including animated AVIF and JPEG XL), so GIF, WebP, animated AVIF and
+    /// animated JPEG XL show their first frame there.
     pub fn load(&self, bytes: impl Into<Arc<[u8]>>) -> Image {
         let bytes = bytes.into();
         let mut hash = blake3::Hasher::new();
@@ -356,8 +394,8 @@ impl ImageCache {
             return image;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if decoders().send(Job { image: image.clone(), input, waker: self.waker.clone() }).is_err() {
-            let _ = image.0.decoded.set(Err(ImageError("image worker stopped".into())));
+        if !decode_later(Job { image: image.clone(), input, waker: self.waker.clone() }) {
+            image.0.decoded.set(Err(ImageError("image worker stopped".into()))).ok();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -418,99 +456,31 @@ fn is_svg(bytes: &[u8]) -> bool {
     bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<')
 }
 
-/// Options for `usvg` that resolve nothing outside the SVG's own bytes: non-`data:` `<image>` and
-/// `<feImage>` `href`s never touch the filesystem or UNC paths, and `data:` URLs accept raster
-/// formats only (`image/svg+xml` and `text/plain` SVG fall-through are refused).
-///
-/// Rune builds `resvg` with `raster-images` off, so those raster arms are resolved in the tree but
-/// never drawn today; they—and raster decoder pixel/memory bounds—become live if `raster-images` is
-/// ever enabled (for example via feature unification).
-#[cfg(feature = "svg")]
-fn svg_options() -> resvg::usvg::Options<'static> {
-    use resvg::usvg::{ImageHrefResolver, ImageKind, Options};
-    let raster = |data: Arc<Vec<u8>>| {
-        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-            Some(ImageKind::PNG(data))
-        } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
-            Some(ImageKind::JPEG(data))
-        } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-            Some(ImageKind::GIF(data))
-        } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-            Some(ImageKind::WEBP(data))
-        } else {
-            None
-        }
-    };
-    Options {
-        image_href_resolver: ImageHrefResolver {
-            resolve_string: Box::new(|_, _| None),
-            resolve_data: Box::new(move |mime, data, _| match mime {
-                "image/png" => Some(ImageKind::PNG(data)),
-                "image/jpg" | "image/jpeg" => Some(ImageKind::JPEG(data)),
-                "image/gif" => Some(ImageKind::GIF(data)),
-                "image/webp" => Some(ImageKind::WEBP(data)),
-                "text/plain" => raster(data),
-                _ => None,
-            }),
-        },
-        ..Options::default()
+/// Reads a regular file up to [`MAX_ALLOC`] bytes, refusing directories, FIFOs, sockets and
+/// device files before and after opening so a special file cannot block or exhaust memory.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_regular_file(path: &std::path::Path) -> Result<Vec<u8>, ImageError> {
+    use std::io::Read;
+    let err = |e: std::io::Error| ImageError(format!("{}: {e}", path.display()));
+    let meta = std::fs::metadata(path).map_err(err)?;
+    if !meta.is_file() {
+        return Err(ImageError(format!("{}: not a regular file", path.display())));
     }
-}
-
-#[cfg(feature = "svg")]
-fn svg_tree(bytes: &[u8]) -> Result<resvg::usvg::Tree, ImageError> {
-    if bytes.len() > 32 << 20 { return Err(ImageError("SVG is too large".into())); }
-    resvg::usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| ImageError(format!("SVG: {e}")))
-}
-
-#[cfg(feature = "svg")]
-fn demultiply_rgba(pixmap: &resvg::tiny_skia::Pixmap) -> Vec<u8> {
-    pixmap.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    }).collect()
-}
-
-/// An SVG scaled to fit `px` square, keeping its aspect ratio, as straight-alpha sRGB RGBA8.
-/// `px == 0` rasterizes at twice the drawing's own size, at most 4096 pixels per side.
-#[cfg(feature = "svg")]
-#[doc(hidden)]
-pub fn svg_rgba(bytes: &[u8], px: u32) -> Result<(u32, u32, Vec<u8>), ImageError> {
-    use resvg::tiny_skia;
-    let tree = svg_tree(bytes)?;
-    let size = tree.size();
-    let px = if px == 0 { (size.width().max(size.height()) * 2.0).ceil().clamp(1.0, 4096.0) as u32 } else { px };
-    let k = px as f32 / size.width().max(size.height());
-    let (w, h) = (((size.width() * k).round() as u32).clamp(1, px), ((size.height() * k).round() as u32).clamp(1, px));
-    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or_else(|| ImageError("empty SVG".into()))?;
-    resvg::render(&tree, tiny_skia::Transform::from_scale(k, k), &mut pixmap.as_mut());
-    Ok((w, h, demultiply_rgba(&pixmap)))
-}
-
-#[cfg(not(feature = "svg"))]
-#[doc(hidden)]
-pub fn svg_rgba(_: &[u8], _: u32) -> Result<(u32, u32, Vec<u8>), ImageError> {
-    Err(ImageError("SVG images need rune's `svg` feature".into()))
-}
-
-/// An SVG centre-cropped to fill `px` square (`object-fit: cover`), as straight-alpha sRGB RGBA8,
-/// decoded through the same sandboxed `usvg` options as [`ImageCache`].
-#[cfg(feature = "svg")]
-pub fn svg_rgba_cover(bytes: &[u8], px: u32) -> Result<Vec<u8>, ImageError> {
-    use resvg::tiny_skia;
-    if px == 0 || px > 4096 { return Err(ImageError("invalid SVG raster size".into())); }
-    let tree = svg_tree(bytes)?;
-    let size = tree.size();
-    let k = px as f32 / size.width().min(size.height());
-    let t = tiny_skia::Transform::from_row(k, 0.0, 0.0, k, (px as f32 - size.width() * k) / 2.0, (px as f32 - size.height() * k) / 2.0);
-    let mut pixmap = tiny_skia::Pixmap::new(px, px).ok_or_else(|| ImageError("empty SVG".into()))?;
-    resvg::render(&tree, t, &mut pixmap.as_mut());
-    Ok(demultiply_rgba(&pixmap))
-}
-
-#[cfg(not(feature = "svg"))]
-pub fn svg_rgba_cover(_: &[u8], _: u32) -> Result<Vec<u8>, ImageError> {
-    Err(ImageError("SVG images need rune's `svg` feature".into()))
+    if meta.len() > MAX_ALLOC {
+        return Err(ImageError(format!("{}: file is too large", path.display())));
+    }
+    let file = std::fs::File::open(path).map_err(err)?;
+    let handle_meta = file.metadata().map_err(err)?;
+    if !handle_meta.is_file() {
+        return Err(ImageError(format!("{}: not a regular file", path.display())));
+    }
+    let cap = handle_meta.len().min(MAX_ALLOC) as usize;
+    let mut out = Vec::with_capacity(cap.min(64 * 1024));
+    file.take(MAX_ALLOC + 1).read_to_end(&mut out).map_err(err)?;
+    if out.len() as u64 > MAX_ALLOC {
+        return Err(ImageError(format!("{}: file is too large", path.display())));
+    }
+    Ok(out)
 }
 
 fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
@@ -529,9 +499,9 @@ fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format().map_err(|e| ImageError(e.to_string()))?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_ALLOC);
     reader.limits(limits.clone());
     // `ImageReader::decode`, keeping the decoder to read its EXIF orientation (a phone's JPEG
     // stores its pixels as the sensor saw them and says how to turn them upright).
@@ -572,7 +542,7 @@ fn icns_png(bytes: &[u8]) -> Result<&[u8], ImageError> {
             let w = u32::from_be_bytes(chunk[16..20].try_into().unwrap());
             let h = u32::from_be_bytes(chunk[20..24].try_into().unwrap());
             let candidate = u64::from(w) * u64::from(h);
-            if w <= 8192 && h <= 8192 && candidate > area { best = Some(chunk); area = candidate; }
+            if w <= MAX_SIDE && h <= MAX_SIDE && candidate > area { best = Some(chunk); area = candidate; }
         }
         pos = end;
     }

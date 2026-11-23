@@ -35,7 +35,7 @@ fn updates_that_change_nothing_ask_no_window_for_a_frame() {
 #[test]
 fn updates_that_change_nothing_do_not_delay_due_timers() {
     let mut rt = Runtime::new(0u32, |_, _| crate::el(), (10.0, 10.0), crate::Env::default());
-    rt.wall_start = Some(Instant::now());
+    rt.wall_start = Some(crate::time::now());
     rt.frame(0.0);
     // A second idle since that frame.
     rt.wall_start = rt.wall_start.map(|t| t - Duration::from_secs(1));
@@ -43,7 +43,7 @@ fn updates_that_change_nothing_do_not_delay_due_timers() {
     rt.update_if(|_, tx| { tx.wake_after(Duration::ZERO); false });
     rt.schedule_pending_wakes();
     let due = timer_deadline(&rt).expect("armed");
-    assert!(due <= Instant::now(), "due now, not a frame interval from now");
+    assert!(due <= crate::time::now(), "due now, not a frame interval from now");
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(2));
         rt.update_if(|_, _| false);
@@ -60,7 +60,7 @@ fn a_timer_asking_for_the_next_frame_waits_a_frame_without_a_display_link() {
     fn poll(polls: &mut u32, _: f64, tx: &mut Tx) -> bool { *polls += 1; tx.wake_after(Duration::ZERO); false }
     let mut rt = Runtime::new(0u32, |_, _| crate::el(), (10.0, 10.0), crate::Env::default());
     rt.poll = Some(poll);
-    let start = Instant::now() - Duration::from_secs(1);
+    let start = crate::time::now() - Duration::from_secs(1);
     rt.wall_start = Some(start);
     rt.frame(0.0);
     assert_eq!(rt.state, 1);
@@ -113,6 +113,53 @@ fn a_frame_that_draws_the_same_pixels_is_the_same() {
     assert!(!p.same(&rt, &config), "a glyph upload draws again");
     rt.text.atlas.dirty = None;
 
+    // A GPU-filled glyph advances `rasterized` and queues a fill without marking CPU rows dirty.
+    // Select an outline-drawn mode explicitly: macOS defaults to `FontSmoothing::On` (CPU masks).
+    rt.text.set_font_smoothing(crate::FontSmoothing::WindfoilChromium);
+    rt.text.atlas.outlines.set_support(crate::text::outline::Support::Drawn);
+    let mut quads = Vec::new();
+    let rasterized_before = rt.text.atlas.rasterized();
+    rt.text.glyphs("A", crate::TextStyle::new(16.0, 400.0), 2.0, [0.0, 0.0], &mut quads);
+    assert!(rt.text.atlas.rasterized() > rasterized_before, "expected glyph rasterization");
+    assert!(rt.text.atlas.dirty.is_none(), "GPU-filled masks leave CPU rows clean");
+    assert!(!p.same(&rt, &config), "a GPU-filled glyph draws again without dirty CPU rows");
+    // Even after the renderer drains the queued fills, the presented frame predates the glyph work.
+    assert!(!rt.text.atlas.take_fills().is_empty(), "expected queued GPU fill");
+    assert!(!p.same(&rt, &config), "glyphs rasterized since the presented frame draw again even after fills drain");
+
+    // Re-record on the drained atlas, then re-queue a fill without advancing counters or dirty rows.
+    Presented::record(&mut presented, &rt, &config, false);
+    let p = presented.as_ref().unwrap();
+    assert!(p.same(&rt, &config));
+    rt.text.atlas.rows_uploaded(0, (0, crate::text::ATLAS_SIZE));
+    assert!(rt.text.atlas.dirty.is_none());
+    assert!(!p.same(&rt, &config), "queued GPU fills draw again even when counters and dirty rows match");
+    assert!(!rt.text.atlas.take_fills().is_empty());
+    assert!(p.same(&rt, &config), "draining the queued fills restores match");
+
+    // An atlas page eviction advances `resets` and clears `dirty`, without advancing `rasterized`.
+    const ICON: crate::text::Icon = crate::text::Icon {
+        name: "box",
+        view: 16.0,
+        body: r#"<rect x="1" y="1" width="14" height="14" fill="currentColor"/>"#,
+    };
+    for px in [1500, 1501, 1502] {
+        assert!(rt.text.icon_quad(&ICON, px, [0.0, 0.0]).is_some());
+    }
+    // End the burst frame (zeroing `live_texels` while keeping the overflow page), then record.
+    rt.text.begin_frame();
+    rt.text.atlas.dirty = None;
+    for page in &mut rt.text.atlas.pages { page.dirty = None; }
+    let _ = rt.text.atlas.take_fills();
+    Presented::record(&mut presented, &rt, &config, false);
+    let p = presented.as_ref().unwrap();
+    let (rasterized_before, resets_before) = (rt.text.atlas.rasterized(), rt.text.atlas.resets());
+    rt.text.begin_frame();
+    assert!(rt.text.atlas.resets() > resets_before, "expected atlas page eviction");
+    assert_eq!(rt.text.atlas.rasterized(), rasterized_before);
+    assert!(rt.text.atlas.dirty.is_none() && rt.text.atlas.pages.iter().all(|pg| pg.dirty.is_none()));
+    assert!(!p.same(&rt, &config), "an atlas reset draws again even with dirty cleared");
+
     rt.update(|n, _| *n = 8);
     rt.settle_all();
     rt.frame(0.0);
@@ -129,7 +176,7 @@ fn a_timer_frame_that_draws_the_same_still_draws_while_a_poll_steps() {
     }
     let mut rt = Runtime::new(false, |_, _| crate::el().size(20.0, 20.0), (20.0, 20.0), crate::Env::default());
     rt.poll = Some(poll);
-    rt.wall_start = Some(Instant::now());
+    rt.wall_start = Some(crate::time::now());
     rt.frame(0.0);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -145,7 +192,7 @@ fn a_timer_frame_that_draws_the_same_still_draws_while_a_poll_steps() {
     let mut presented = None;
     Presented::record(&mut presented, &rt, &config, false);
     let p = presented.as_ref().unwrap();
-    let next_tick = Some(Instant::now() + Duration::from_millis(8));
+    let next_tick = Some(crate::time::now() + Duration::from_millis(8));
     assert!(p.unchanged(&rt, &config, false, next_tick), "a slow timer leaves the drawable");
     rt.state = true;
     rt.frame(0.0);
@@ -168,7 +215,7 @@ fn launch_frames_hold_two_drawables_until_the_window_rests() {
         view_formats: vec![],
         color_space: Default::default(),
     };
-    let t0 = Instant::now();
+    let t0 = crate::time::now();
     let mut launch = LaunchDrawables::cap(&mut config);
     assert_eq!(config.desired_maximum_frame_latency, 1, "Metal makes latency + 1 drawables");
     assert_eq!(launch.settle(false, t0), None);
@@ -226,7 +273,7 @@ impl CompHost {
     fn new(comp: Option<bool>, poll: fn(&mut u32, f64, &mut Tx) -> bool) -> Self {
         fn view(_: &u32, _: &mut crate::Cx<u32>) -> crate::El { crate::el().key("box").size(20.0, 20.0).fill(crate::Color::WHITE) }
         let mut rt = Runtime::new(0u32, view, (20.0, 20.0), crate::Env::default());
-        rt.frame.test_clock = Some(crate::Clock::manual(1.0 / crate::frame::clock::RESUME_STEP));
+        rt.frame.set_test_clock(crate::ManualClock::new(1.0 / crate::frame::clock::RESUME_STEP));
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: wgpu::TextureFormat::Bgra8UnormSrgb,
@@ -250,8 +297,8 @@ impl CompHost {
     /// As `draw`: a quiet frame (only a timer asked for it) that draws what's on screen presents
     /// nothing, unless a compositor draws it. Returns whether it presented.
     fn frame(&mut self, quiet: bool) -> bool {
-        let started = Instant::now();
-        self.rt.frame.test_clock.as_mut().unwrap().step();
+        let started = crate::time::now();
+        self.rt.frame.test_clock_mut().unwrap().step();
         let animating = self.rt.frame(crate::frame::clock::RESUME_STEP);
         let update_ms = started.elapsed().as_secs_f64() * 1000.0;
         if quiet && self.comp.is_none() && self.presented.as_ref().is_some_and(|p| p.unchanged(&self.rt, &self.config, animating, None)) {
@@ -271,7 +318,7 @@ impl CompHost {
     fn timer_wake(&mut self) -> bool {
         let due = self.rt.wake_deadline().expect("a timer is armed");
         // Advance host time, not rt.clock: rests() still examines the last poll's time.
-        let clock = self.rt.frame.test_clock.as_mut().unwrap();
+        let clock = self.rt.frame.test_clock_mut().unwrap();
         clock.seek(clock.now().max(due));
         let rests = self.idle && !composing(self.comp.as_deref()) && self.presented.is_some();
         let frame = match rests.then(|| self.rt.resting_wake()).flatten() {
@@ -396,7 +443,7 @@ fn reporting_frames_changes_no_frame_skip_or_redraw() {
 
 #[test]
 fn hidden_pace_renders_a_change_at_once_then_at_most_every_refresh() {
-    let t0 = Instant::now();
+    let t0 = crate::time::now();
     let mut pace = HiddenPace::default();
     assert!(pace.changed(t0), "the first change renders at once");
     pace.rendered(t0);
@@ -418,7 +465,7 @@ fn hidden_pace_renders_a_change_at_once_then_at_most_every_refresh() {
 #[test]
 fn missed_frames_never_poll() {
     use wgpu::CurrentSurfaceTexture as S;
-    let now = Instant::now();
+    let now = crate::time::now();
     for status in [S::Occluded, S::Timeout, S::Outdated, S::Lost, S::Validation] {
         let missed = Missed::of(status).err().expect("a miss");
         for paced in [false, true] {
@@ -469,15 +516,15 @@ fn a_timer_frame_that_never_comes_runs_its_timer_covered_instead_of_spinning() {
     }
     let mut rt = Runtime::new(Due::default(), |_, _| crate::el().size(20.0, 20.0), (20.0, 20.0), crate::Env::default());
     rt.poll = Some(poll);
-    rt.wall_start = Some(Instant::now());
+    rt.wall_start = Some(crate::time::now());
     rt.frame(0.0);
     // A change since that frame, as a `wake` whose poll it hasn't drawn leaves it.
     rt.invalidate();
     assert!(rt.stale() && !rt.rests(), "the window doesn't rest: its frame is still to come");
     // As `new_events` at the timer, which is due by the time the loop runs for it.
     let due = timer_deadline(&rt).expect("a timer is armed");
-    rt.wall_start = rt.wall_start.map(|t| t - due.saturating_duration_since(Instant::now()) - Duration::from_millis(1));
-    let now = Instant::now();
+    rt.wall_start = rt.wall_start.map(|t| t - due.saturating_duration_since(crate::time::now()) - Duration::from_millis(1));
+    let now = crate::time::now();
     assert!(timer_deadline(&rt).expect("armed") <= now, "the timer is due: this is what turned the loop");
 
     let mut frame = TimerFrame::default();
@@ -491,11 +538,11 @@ fn a_timer_frame_that_never_comes_runs_its_timer_covered_instead_of_spinning() {
     covered_step(&mut rt);
     assert_eq!(rt.state.polls, polls + 1, "the due timer polled");
     let next = timer_deadline(&rt).expect("its next timer is armed");
-    assert!(next > Instant::now(), "the next timer is ahead: {next:?}");
+    assert!(next > crate::time::now(), "the next timer is ahead: {next:?}");
     // The covered step takes the frame's place, and a timer still ahead keeps its own time.
     frame.drawn();
-    frame.asked_quiet(Instant::now());
-    assert_eq!(frame.wait(timer_deadline(&rt), Instant::now()), Some(next), "the loop sleeps until its next timer");
+    frame.asked_quiet(crate::time::now());
+    assert_eq!(frame.wait(timer_deadline(&rt), crate::time::now()), Some(next), "the loop sleeps until its next timer");
     frame.drawn();
     assert!(!frame.stalled(now + TIMER_FRAME_STALL), "a frame that comes clears it");
 }
@@ -565,11 +612,12 @@ fn noop_instance() -> wgpu::Instance {
 
 /// A GPU on wgpu's noop backend: its device takes anything and refuses every surface.
 #[cfg(all(target_os = "linux", feature = "test-gpu-noop"))]
+#[allow(unsafe_code)]
 fn noop_gpu(instance: &wgpu::Instance) -> (Gpu, wgpu::Surface<'static>) {
     use std::num::NonZeroU32;
     use std::ptr::NonNull;
     use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
-    // The noop backend takes any handle and reports no capabilities, so configuring fails.
+    // SAFETY: `instance` uses only wgpu's NOOP backend, which never dereferences the raw handles.
     let surface = unsafe {
         instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
             raw_display_handle: Some(RawDisplayHandle::Xcb(XcbDisplayHandle::new(Some(NonNull::dangling()), 0))),
@@ -652,7 +700,7 @@ fn a_destroyed_device_that_has_not_reported_its_loss_is_not_configured() {
 #[test]
 fn surface_replacements_give_up_after_a_bounded_number_of_tries() {
     use super::surface::win::{SurfaceStep, SURFACE_TRIES};
-    let now = Instant::now();
+    let now = crate::time::now();
     let mut retries = SurfaceRetries::default();
     let mut waits = Vec::new();
     loop {
@@ -798,4 +846,68 @@ fn a_square_window_never_fades_its_corners() {
     for (i, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(pixel[3], 255, "pixel {i} faded with no radius");
     }
+}
+
+/// Windows can transiently report a negative client height wrapped to `u16` (e.g. `65527` for `-9`
+/// in `WM_SIZE`) or `u32` (from `GetClientRect`). A resize exceeding `max_texture_dimension_2d` or
+/// with a zero edge keeps the previous drawable size until a valid size arrives, and initial
+/// surface creation clamps each edge to `1..=max_dim`.
+#[test]
+fn a_drawable_never_takes_a_size_exceeding_the_texture_limit() {
+    use super::surface::{CPU_MAX_SURFACE_DIM, drawable_size, max_surface_dim};
+
+    let limit = 16_384;
+    let prev = Some((1156, 777));
+
+    // Normal resizes up to the device limit pass through unchanged.
+    assert_eq!(drawable_size(prev, (1172, 777), limit), (1172, 777));
+    assert_eq!(drawable_size(prev, (limit, limit), limit), (limit, limit));
+
+    // Wrapped negative extents and zero dimensions keep the previous valid drawable.
+    assert_eq!(drawable_size(prev, (1156, 65527), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (1156, u32::MAX - 8), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (65527, 777), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (limit + 1, 777), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (1156, 0), limit), (1156, 777));
+    assert_eq!(drawable_size(prev, (0, 0), limit), (1156, 777));
+
+    // Reattaching on a device with a smaller limit clamps the fallback previous size too.
+    assert_eq!(drawable_size(Some((10_000, 600)), (1156, 65527), 8192), (8192, 600));
+
+    // Initial surface creation has no previous size: clamp into 1..=max_dim.
+    assert_eq!(drawable_size(None, (1156, 65527), limit), (1156, limit));
+    assert_eq!(drawable_size(None, (0, 0), limit), (1, 1));
+    assert_eq!(drawable_size(None, (829, 550), limit), (829, 550));
+
+    // Without a GPU attached yet (Windows CPU boot), the fallback cap still rejects wrapped u16.
+    assert_eq!(max_surface_dim(None), CPU_MAX_SURFACE_DIM);
+    assert_eq!(drawable_size(prev, (1156, 65527), max_surface_dim(None)), (1156, 777));
+}
+
+#[test]
+fn no_direct_surface_configure_outside_helper() {
+    fn walk(dir: &std::path::Path, bad: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "tests") { continue; }
+                walk(&path, bad);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") { continue; }
+            let rel = path.to_string_lossy().replace('\\', "/");
+            if rel.ends_with("window/surface/configure.rs") { continue; }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (idx, line) in src.lines().enumerate() {
+                if line.contains("surface.configure(") {
+                    bad.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut bad = Vec::new();
+    walk(&root, &mut bad);
+    assert!(bad.is_empty(), "direct surface.configure calls bypass window::configure:\n{}", bad.join("\n"));
 }

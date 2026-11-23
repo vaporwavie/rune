@@ -68,7 +68,7 @@ use requests::{Requests, Update, Visibility};
 #[path = "overlay/surface.rs"]
 mod surface;
 #[path = "overlay/xwayland.rs"]
-mod xwayland;
+pub(crate) mod xwayland;
 
 pub(crate) use app::OverlayHost;
 use app::OverlayApp;
@@ -342,6 +342,9 @@ impl<T: 'static> OverlayHandle<T> {
 /// An overlay before the event loop runs: the shell gives it a wake-up and the GPU pool.
 pub(crate) trait PendingOverlay: AnyHost {
     fn connect(&mut self, wake: Waker, frame_wake: Waker, slot_wake: Waker, gpu: Rc<RefCell<Weak<Gpu>>>);
+    fn inherit_font_smoothing(&mut self, mode: crate::FontSmoothing);
+    #[cfg(test)]
+    fn font_smoothing(&self) -> crate::FontSmoothing;
 }
 
 enum Backing {
@@ -423,7 +426,7 @@ pub(in crate::overlay) struct OverlayCore {
     cursor: Option<crate::cursor::os::OsCursor>,
     mods: winit::keyboard::ModifiersState,
     control_click: bool,
-    ime_allowed: bool,
+    ime: crate::input::host_events::ImeSync,
     renderer: Option<Renderer>,
     gpu: Option<Arc<Gpu>>,
     gpu_pool: Rc<RefCell<Weak<Gpu>>>,
@@ -439,6 +442,9 @@ pub(in crate::overlay) struct OverlayCore {
     /// This loop turn already read the panel's occlusion (`sync_occlusion`).
     #[cfg(target_os = "macos")]
     occlusion_read: bool,
+    /// The frames right after a show, which may draw before AppKit reports the panel on screen.
+    #[cfg(target_os = "macos")]
+    prime: crate::window::Prime,
     /// When to try a frame again that had no drawable, or the next frame of motion with no
     /// display link to pace it, and the waits behind it (`window::Backoff`).
     backoff: crate::window::Backoff,
@@ -452,6 +458,9 @@ pub(in crate::overlay) struct OverlayCore {
     meter: crate::frame::surface_stats::SurfaceMeter,
     /// The display `refollow_pointer` last found the pointer on, away from the overlay's.
     refollow_away: Option<winit::monitor::MonitorHandle>,
+    /// Test hook mirroring an outstanding Wayland `wl_surface.frame` callback on all hosts.
+    #[cfg(test)]
+    layer_frame_pending: bool,
 }
 
 impl OverlayCore {
@@ -474,7 +483,7 @@ impl OverlayCore {
         rt.set_system_accent(crate::system_accent());
         crate::platform::scroll_bars::watch();
         rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current());
-        rt.wall_start = Some(Instant::now());
+        rt.wall_start = Some(crate::time::now());
         rt.host.native_overlay = true;
         rt.set_os_drag(crate::drag_out::SUPPORTED);
         rt.host.surface_stats = Some(meter.shared());
@@ -504,7 +513,7 @@ impl OverlayCore {
             x11: None,
             mods: Default::default(),
             control_click: false,
-            ime_allowed: false,
+            ime: Default::default(),
             renderer: None,
             gpu: None,
             gpu_pool: Rc::default(),
@@ -514,9 +523,11 @@ impl OverlayCore {
             runtime_idle: false,
             quiet: Default::default(),
             turn_frame: Default::default(),
-            clock: FrameClock::new(Instant::now()),
+            clock: FrameClock::new(crate::time::now()),
             #[cfg(target_os = "macos")]
             occlusion_read: false,
+            #[cfg(target_os = "macos")]
+            prime: crate::window::Prime::Steady,
             backoff: Default::default(),
             hidden_pace: Default::default(),
             #[cfg(target_os = "macos")]
@@ -525,6 +536,8 @@ impl OverlayCore {
             slot_wake: None,
             meter,
             refollow_away: None,
+            #[cfg(test)]
+            layer_frame_pending: false,
         }
     }
 
@@ -640,13 +653,13 @@ impl OverlayCore {
         // A parked window takes the size now; its surface is made at it.
         if let Some(Backing::Window(w)) = self.surface.parked() {
             let w = w.clone();
-            let _ = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
+            let _size = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
             return self.place_window(app.rt_mut(), event_loop, &w);
         }
         let Some(live) = self.surface.live_mut() else { return };
         match &mut live.backing {
             Backing::Window(w) => {
-                let _ = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
+                let _size = w.request_inner_size(LogicalSize::new(self.at.size.0 as f64, self.at.size.1 as f64));
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             Backing::Layer(layer) => {

@@ -31,6 +31,9 @@ pub(in crate::runtime) struct Titlebar {
     /// What a run without a window draws for `App::titlebar` (`headless_chrome`), so a new
     /// `Cx::set_titlebar` or `Cx::titlebar_height` draws again.
     headless: Option<(crate::Chrome, crate::Titlebar)>,
+    /// The resolved macOS chrome last computed by `headless_chrome`, kept current when
+    /// `set_titlebar` runs so headless `--chrome` overlays and overlap checks follow it.
+    headless_chrome: crate::Chrome,
 }
 
 /// The window menu (Restore, Move, Size, Minimize, Maximize, Close) a custom titlebar opens
@@ -229,19 +232,40 @@ impl RuntimeCore {
     /// its window would at rest: `Cx::titlebar_inset`, `Cx::chrome_insets` and the caption
     /// buttons. Returns the frame the headless traffic-light checks see.
     pub(crate) fn headless_chrome(&mut self, chrome: crate::Chrome, titlebar: Option<crate::Titlebar>, borderless: bool) -> crate::Chrome {
+        self.headless_chrome_with(chrome, titlebar, borderless, crate::labels::rtl())
+    }
+
+    fn headless_chrome_with(&mut self, chrome: crate::Chrome, titlebar: Option<crate::Titlebar>, borderless: bool, rtl: bool) -> crate::Chrome {
         let titlebar = titlebar.filter(|_| !borderless);
         self.host.titlebar.headless = titlebar.map(|t| (chrome, t));
         let titlebar = titlebar.map(|t| self.host.titlebar.set.over(t));
-        let chrome = match titlebar {
-            Some(t) if cfg!(target_os = "macos") => t.mac_chrome(chrome),
-            _ => chrome,
+        // A borderless window has no title bar and no traffic lights, even under `Chrome::DEFAULT`
+        // or explicit `Chrome::traffic_lights`. Headless `--chrome` models macOS traffic lights on
+        // every platform, so `App::titlebar` (and `Cx::set_titlebar` / `Cx::titlebar_height`)
+        // resolves through `Titlebar::mac_chrome` everywhere.
+        let chrome = if borderless {
+            crate::Chrome { full_size_content: false, traffic_lights: None, ..chrome }
+        } else {
+            match titlebar {
+                Some(t) => t.mac_chrome(chrome),
+                None => chrome,
+            }
         };
-        let inset = if borderless { 0.0 } else { chrome.titlebar_inset() };
+        self.host.titlebar.headless_chrome = chrome;
+        let inset = chrome.titlebar_inset();
         self.set_titlebar_inset(inset);
-        let caption = titlebar.filter(|_| cfg!(target_os = "windows")).map(|t| crate::titlebar::Caption::new(t.height()));
+        let caption = titlebar.filter(|_| cfg!(target_os = "windows")).map(|t| {
+            let mut caption = crate::titlebar::Caption::new(t.height());
+            caption.mirrored = rtl;
+            caption
+        });
         let height = titlebar.filter(|_| cfg!(any(target_os = "macos", target_os = "windows"))).map_or(0.0, |t| t.height());
-        let leading = if cfg!(target_os = "macos") { inset } else { 0.0 };
-        let trailing = caption.map_or(0.0, |c| c.width(self.env.scale));
+        let lights = if cfg!(target_os = "macos") { inset } else { 0.0 };
+        let buttons = caption.map_or(0.0, |c| c.width(self.env.scale));
+        // The traffic lights' room is on the right in a right-to-left app on macOS, as the
+        // caption buttons' is on the left on Windows.
+        let (leading, trailing) = if rtl { (0.0, lights) } else { (lights, 0.0) };
+        let (leading, trailing) = if caption.is_some_and(|c| c.mirrored) { (leading + buttons, trailing) } else { (leading, trailing + buttons) };
         self.set_chrome_insets(crate::ChromeInsets::new(leading, trailing, height));
         self.set_caption(caption);
         chrome
@@ -269,6 +293,13 @@ impl RuntimeCore {
     /// Alt+Space no handler took opens the window menu (`Unhandled::WindowMenu`).
     pub(in crate::runtime) fn request_window_menu(&mut self) {
         self.host.titlebar.window_menu = Some(WindowMenu::Keyboard);
+    }
+
+    /// The resolved macOS chrome last computed by `headless_chrome`, updated whenever the view
+    /// changes its titlebar (`Cx::set_titlebar`, `Cx::titlebar_height`).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn headless_chrome_current(&self) -> crate::Chrome {
+        self.host.titlebar.headless_chrome
     }
 
     /// `Cx::set_titlebar` and `Cx::titlebar_height`, as the last view set them; empty keeps
@@ -319,3 +350,7 @@ impl RuntimeCore {
             && n.handlers.drag_out.is_none() && self.textbox_input(t).is_none()
     }
 }
+
+#[cfg(test)]
+#[path = "titlebar_tests.rs"]
+mod tests;

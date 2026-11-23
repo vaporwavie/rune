@@ -4,6 +4,8 @@
 //! free one on the GPU, the copy signals a fence, and Rune's D3D12 device samples the texture in
 //! place (`native_surface::windows::DecodedPlanes`). Pictures never pass through the CPU.
 
+#![allow(unsafe_code)]
+
 use super::mf::{self, Picture};
 use crate::native_surface::windows::{DecodedPlanes, VideoFences, device_generation, presenting_device};
 use std::sync::{Arc, Mutex};
@@ -76,6 +78,16 @@ pub(super) fn device() -> Result<Arc<Device>, String> {
     Ok(device)
 }
 
+/// Drops the kept decoder device once Rune's device under it is removed: it holds that device.
+/// Decoders still holding their own reference let go as they see the loss (`lost_since`).
+pub(crate) fn release_removed_device() {
+    let mut slot = DEVICE.lock().unwrap();
+    // SAFETY: a plain query on a device this slot holds.
+    if slot.as_ref().is_some_and(|d| unsafe { d.d3d12.GetDeviceRemovedReason() }.is_err()) {
+        *slot = None;
+    }
+}
+
 /// Rune's device was replaced since `generation`, or the one it presents with is removed.
 pub(super) fn lost_since(generation: u64) -> bool {
     // SAFETY: a plain query on a live device.
@@ -104,7 +116,7 @@ fn make(d3d12: ID3D12Device, luid: LUID, generation: u64) -> Result<Device, Stri
         let context = ID3D11DeviceContext::from_raw(context);
         // Decoders and players' threads share the device.
         if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-            let _ = mt.SetMultithreadProtected(true);
+            let _prev = mt.SetMultithreadProtected(true);
         }
         let device5 = device.cast::<ID3D11Device5>().map_err(|_| "D3D11 fences need Windows 10 1703")?;
         let context = context.cast::<ID3D11DeviceContext4>().map_err(|_| "D3D11 fences need Windows 10 1703")?;
@@ -120,6 +132,16 @@ impl Device {
         unsafe { manager.ResetDevice(&self.device, token) }.map_err(|e| e.message())?;
         Ok(manager)
     }
+}
+
+/// A slot's `value` once its picture is known never to reach Rune (`Ring::unread`), or before
+/// it has held one.
+pub(super) const UNREAD: u64 = 0;
+
+/// Whether a slot can take a new picture: only the ring holds its last one (`holders`), and
+/// Rune's draw of that one or of a later one is done (`released`), or none will ever come.
+pub(super) fn writable(holders: usize, value: u64, released: u64) -> bool {
+    holders == 1 && (value == UNREAD || released >= value)
 }
 
 /// One texture of the ring.
@@ -170,7 +192,7 @@ impl Ring {
             let handle = device.d3d12.CreateSharedHandle(&ready12, None, GENERIC_ALL.0, None).map_err(|e| format!("share fence: {}", e.message()))?;
             let mut ready: Option<ID3D11Fence> = None;
             let opened = device.device5.OpenSharedFence(handle, &mut ready);
-            let _ = CloseHandle(handle);
+            CloseHandle(handle).ok();
             opened.map_err(|e| format!("open fence: {}", e.message()))?;
             (Arc::new(VideoFences { ready: ready12, release }), ready.ok_or("open fence")?)
         };
@@ -186,7 +208,7 @@ impl Ring {
     fn reusable(&self) -> Option<usize> {
         // SAFETY: a plain read of the fence's value.
         let released = unsafe { self.fences.release.GetCompletedValue() };
-        self.slots.iter().position(|s| Arc::strong_count(&s.planes) == 1 && (s.value == 0 || released >= s.value))
+        self.slots.iter().position(|s| writable(Arc::strong_count(&s.planes), s.value, released))
     }
 
     /// A free slot, made when every made one is busy and the ring isn't full: a clip that shows
@@ -203,11 +225,12 @@ impl Ring {
         Ok(Some(self.slots.len() - 1))
     }
 
-    /// A picture that never reached Rune (its layer showed it instead): its slot is free once the
-    /// last reference goes, with no read of Rune's to wait for.
-    pub(super) fn unread(&mut self, planes: &Arc<DecodedPlanes>) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| Arc::ptr_eq(&s.planes, planes)) {
-            slot.value = 0;
+    /// The picture written as `value` never reached Rune (dropped as an earlier seek's or as
+    /// late, or its layer showed it instead): its slot is free once the last reference goes, with
+    /// no read of Rune's to wait for.
+    pub(super) fn unread(&mut self, planes: &Arc<DecodedPlanes>, value: u64) {
+        if let Some(slot) = self.slots.iter_mut().find(|s| Arc::ptr_eq(&s.planes, planes) && s.value == value) {
+            slot.value = UNREAD;
         }
     }
 
@@ -237,7 +260,7 @@ impl Ring {
         self.slots[i].value = self.value;
         // SAFETY: a signal after the copy on the immediate context; the flush sends both to the GPU.
         unsafe {
-            let _ = self.device.context.Signal(&self.ready, self.value);
+            self.device.context.Signal(&self.ready, self.value).ok();
             self.device.context.Flush();
         }
         (self.slots[i].planes.clone(), self.value)
@@ -266,7 +289,7 @@ fn slot(device: &Device, fences: &Arc<VideoFences>, w: u32, h: u32) -> Result<Sl
         let handle = texture.cast::<IDXGIResource1>().and_then(|r| r.CreateSharedHandle(None, GENERIC_ALL.0, None)).map_err(|e| format!("share video texture: {}", e.message()))?;
         let mut resource: Option<ID3D12Resource> = None;
         let opened = device.d3d12.OpenSharedHandle(handle, &mut resource);
-        let _ = CloseHandle(handle);
+        CloseHandle(handle).ok();
         opened.map_err(|e| format!("open video texture: {}", e.message()))?;
         let planes = Arc::new(DecodedPlanes {
             resource: resource.ok_or("open video texture")?,
@@ -274,6 +297,9 @@ fn slot(device: &Device, fences: &Arc<VideoFences>, w: u32, h: u32) -> Result<Sl
             fences: fences.clone(),
             device: device.d3d12.as_raw() as usize,
         });
-        Ok(Slot { texture, planes, value: 0 })
+        Ok(Slot { texture, planes, value: UNREAD })
     }
 }
+
+#[cfg(test)]
+mod tests;

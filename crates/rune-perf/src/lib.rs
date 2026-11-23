@@ -1,6 +1,8 @@
 //! Bounded local diagnostics. Apps explicitly choose a directory and install their hooks.
 //! No network, global allocator installation, redraws, or per-frame formatting.
 
+// Unit benchmark `recorder::tests::instrumentation_overhead` calls `GlobalAlloc::alloc`/`dealloc` directly.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -20,6 +22,19 @@ pub(crate) const RECENT: usize = 600;
 pub(crate) const WINDOW_MS: u64 = 60_000;
 pub(crate) const SLOW_MS: f64 = 1000.0 / 60.0;
 pub(crate) const LARGE_BYTES: u64 = 8 << 20;
+
+// rune-perf is native-only and has no rune-core dependency.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn now() -> std::time::Instant { std::time::Instant::now() }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
 
 /// How long the recorder waits with nothing to write before [`Config::on_idle`] runs.
 pub const IDLE: std::time::Duration = std::time::Duration::from_secs(10);

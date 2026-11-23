@@ -91,11 +91,12 @@ fn secure_revealed_uses_plain_display_and_words_while_keeping_protections() {
     e.key(&alt_left, None);
     assert_eq!(e.focus, 8);
     e.key(&alt_left, None);
+    assert_eq!(e.focus, 3, "an emoji is a stop of its own, as Chromium's symbols are");
+    e.key(&alt_left, None);
     assert_eq!(e.focus, 0);
     e.key(&alt_right, None);
-    // Words go by UAX #29: on macOS a word forward ends at "hé", an emoji being a word of its
-    // own; off macOS it lands past the space, at the next word's start.
-    assert_eq!(e.focus, if cfg!(target_os = "macos") { 3 } else { 8 });
+    // A word forward ends at "hé" on every platform: the emoji right after it is a stop of its own.
+    assert_eq!(e.focus, 3);
 
     // Copy, cut, undo, redo and IME remain blocked when revealed.
     e.set_selection(1, 7);
@@ -221,13 +222,19 @@ fn hidden_multiline_pristine_replace_and_delete() {
     assert_eq!(e.text, "new-key\nline-2\nline-3");
 
     // 3. Deletions while pristine empty the whole value, then subsequent typing starts fresh.
-    for del in [
+    let mut deletions = vec![
         k(Key::Backspace),
         k(Key::Delete),
         KeyEvent { key: Key::Backspace, mods: Mods { cmd: true, ..Mods::default() } },
         KeyEvent { key: Key::Backspace, mods: Mods { alt: true, ..Mods::default() } },
-        KeyEvent { key: Key::Text("k".into()), mods: Mods { ctrl: true, ..Mods::default() } },
-    ] {
+        KeyEvent { key: Key::Backspace, mods: Mods { ctrl: true, cmd: !cfg!(target_os = "macos"), ..Mods::default() } },
+        KeyEvent { key: Key::Delete, mods: Mods { ctrl: true, cmd: !cfg!(target_os = "macos"), ..Mods::default() } },
+    ];
+    // Ctrl-K is an AppKit control-letter binding on macOS only (`KeyEvent::control_binding`).
+    if cfg!(target_os = "macos") {
+        deletions.push(KeyEvent { key: Key::Text("k".into()), mods: Mods { ctrl: true, ..Mods::default() } });
+    }
+    for del in deletions {
         let mut e = TextEdit::new("existing-fictional-key\nline-two").secure();
         e.set_single_line(false);
         e.set_caret(4);
@@ -238,6 +245,14 @@ fn hidden_multiline_pristine_replace_and_delete() {
         e.key(&k(Key::Text("x".into())), None);
         e.key(&k(Key::Text("y".into())), None);
         assert_eq!(e.text, "xy");
+    }
+    if !cfg!(target_os = "macos") {
+        let mut e = TextEdit::new("existing-fictional-key\nline-two").secure();
+        e.set_single_line(false);
+        e.set_caret(4);
+        e.key(&KeyEvent { key: Key::Text("k".into()), mods: Mods { ctrl: true, ..Mods::default() } }, None);
+        assert_eq!(e.text, "existing-fictional-key\nline-two", "Ctrl+K is a command chord off macOS");
+        assert!(e.is_pristine());
     }
 
     // 4. Toggling revealed (Show -> Hide) without editing keeps pristine; editing while revealed clears it.
@@ -468,6 +483,16 @@ fn altgr_text_still_types() {
     assert_eq!(e.text, "€");
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn alt_chords_type_nothing_off_macos() {
+    let mut e = TextEdit::new("");
+    e.key(&chord("d", Mods { alt: true, ..Mods::default() }), None);
+    e.key(&chord("D", Mods { alt: true, shift: true, ..Mods::default() }), None);
+    assert_eq!(e.text, "");
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn option_text_still_types() {
     let mut e = TextEdit::new("").secure();
@@ -899,3 +924,63 @@ fn assert_invariants(e: &TextEdit, ctx: &str) {
 }
 
 include!("rich_tests.rs");
+
+/// Option/Ctrl+Left from the end and Option/Ctrl+Right from the start, as Chromium 158 steps (its
+/// `moveWordLeft` / `moveWordRight` commands in a textarea, headless, on macOS 27 and Windows 11):
+/// the stops in characters, the right-hand ones on macOS, then elsewhere.
+#[test]
+fn word_moves_stop_where_chromium_stops() {
+    let mut cases: Vec<(&str, &[usize], &[usize], &[usize])> = vec![
+        ("foo.bar_baz qux", &[12, 4, 3, 0], &[3, 4, 11, 15], &[3, 4, 12, 15]),
+        ("src/util/format.ts", &[16, 15, 9, 8, 4, 3, 0], &[3, 4, 8, 9, 15, 16, 18], &[3, 4, 8, 9, 15, 16, 18]),
+        ("aaa bbb ccc", &[8, 4, 0], &[3, 7, 11], &[4, 8, 11]),
+        ("hello, world! it's done", &[19, 14, 12, 7, 5, 0], &[5, 6, 12, 13, 18, 23], &[5, 7, 12, 14, 19, 23]),
+        ("x = a.b(c) + 1.5;", &[16, 13, 11, 9, 8, 7, 6, 5, 4, 2, 0], &[1, 3, 5, 6, 7, 8, 9, 10, 12, 16, 17], &[2, 4, 5, 6, 7, 8, 9, 11, 13, 16, 17]),
+        ("can't stop", &[6, 0], &[5, 10], &[6, 10]),
+        ("foo-bar baz", &[8, 4, 3, 0], &[3, 4, 7, 11], &[3, 4, 8, 11]),
+        ("user@example.com path", &[17, 13, 12, 5, 4, 0], &[4, 5, 12, 13, 16, 21], &[4, 5, 12, 13, 17, 21]),
+        ("v1.2.3 ok", &[7, 0], &[6, 9], &[7, 9]),
+        ("a  b", &[3, 0], &[1, 4], &[3, 4]),
+        ("snake_case_name()", &[15, 0], &[15, 17], &[15, 17]),
+        ("  lead", &[2, 0], &[6], &[2, 6]),
+        ("trail  ", &[0], &[5, 7], &[5, 7]),
+        ("a  b  c", &[6, 3, 0], &[1, 4, 7], &[3, 6, 7]),
+        ("opencode --port 4096", &[16, 11, 9, 0], &[8, 11, 15, 20], &[9, 11, 16, 20]),
+        ("a:b c", &[4, 2, 1, 0], &[1, 2, 3, 5], &[1, 2, 4, 5]),
+        ("1,000.50 x", &[9, 0], &[8, 10], &[9, 10]),
+        ("e.g. ok", &[5, 3, 2, 1, 0], &[1, 2, 3, 4, 7], &[1, 2, 3, 5, 7]),
+        ("x // y", &[5, 2, 0], &[1, 4, 6], &[2, 5, 6]),
+        ("😀😀 hi", &[3, 0], &[2, 5], &[3, 5]),
+    ];
+    // Chinese and Japanese words come from a dictionary: ICU4X's natively, Windows' own
+    // (`icu.dll`) once it has loaded, so not in a Windows test. ICU4X's and Chromium's ICU's
+    // dictionaries differ at the edges (`東京タワー` is two words in ICU4X's, one in Chromium's).
+    if !cfg!(target_os = "windows") {
+        cases.push(("xx 日本語 yy", &[7, 3, 0], &[2, 6, 9], &[3, 7, 9]));
+    }
+    let alt = |key| KeyEvent { key, mods: Mods { alt: true, ..Mods::default() } };
+    let chars = |e: &TextEdit| e.text[..e.focus].chars().count();
+    for (text, left, right_mac, right_other) in cases {
+        let walk = |from: usize, key: Key| {
+            let mut e = TextEdit::new(text);
+            e.set_caret(from);
+            let mut stops = Vec::new();
+            loop {
+                e.key(&alt(key.clone()), None);
+                if stops.last() == Some(&chars(&e)) || (stops.is_empty() && e.focus == from) {
+                    break;
+                }
+                stops.push(chars(&e));
+            }
+            stops
+        };
+        assert_eq!(walk(text.len(), Key::Left), left, "word left in {text:?}");
+        let right = if cfg!(target_os = "macos") { right_mac } else { right_other };
+        assert_eq!(walk(0, Key::Right), right, "word right in {text:?}");
+        // A word delete takes what a word move passes over.
+        let mut e = TextEdit::new(text);
+        e.set_caret(text.len());
+        e.key(&KeyEvent { key: Key::Backspace, mods: Mods { alt: true, ..Mods::default() } }, None);
+        assert_eq!(e.text.chars().count(), left[0], "word delete in {text:?}");
+    }
+}

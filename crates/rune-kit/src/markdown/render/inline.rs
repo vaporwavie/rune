@@ -4,6 +4,11 @@
 use super::super::*;
 use super::{Renderer, hash_of};
 
+/// Inline math's size against the text around it, on top of KaTeX's own 1.21 em: 1.1 em, so
+/// its digits and letters stand as tall as the sans text's beside them.
+#[cfg(feature = "math")]
+const INLINE_MATH_SIZE: f32 = 1.1 / 1.21;
+
 thread_local! {
     static PAD_SIZES: RefCell<std::collections::HashMap<u64, f32>> = RefCell::new(std::collections::HashMap::new());
 }
@@ -47,13 +52,11 @@ impl Renderer {
                 out.insert(at, sp);
                 continue;
             }
-            if matches!(st, Style::Strike) {
+            if matches!(st, Style::Strike | Style::Math) {
                 continue;
             }
             let in_link = links.iter().find(|l| l.start <= a as u32 && b as u32 <= l.end);
             let mut sp = Span::new(a, b);
-            // Code in a link is a chip in the link's colour, not underlined as well.
-            let no_line = in_link.is_some_and(|l| l.underline.is_some()).then_some(Color::TRANSPARENT);
             match st {
                 Style::Code if self.code_link_color(a, b, inl).is_some() => {
                     sp.mono = true;
@@ -68,20 +71,22 @@ impl Renderer {
                     sp.mono = true;
                     sp.weight = Some(s.inline_code_weight);
                     sp.size = Some(link_base * s.inline_code_scale);
-                    sp.underline = no_line;
-                    if in_link.is_none_or(|l| l.bg.is_none()) {
+                    // Code inside a link reads as part of the link's label: it inherits the link's
+                    // colour, underline and hover with no code-pill background or padding.
+                    if in_link.is_none() {
                         sp = sp.bg(s.code_bg, s.inline_code_pad);
                     }
                     code.push(sp);
                     continue;
                 }
                 Style::CodePad => {
-                    sp.size = Some(pad_size(font, s.inline_code_pad));
-                    sp.underline = no_line;
+                    if in_link.is_none() {
+                        sp.size = Some(pad_size(font, s.inline_code_pad));
+                    }
                 }
                 Style::Strong => sp.weight = Some(s.strong_weight),
                 Style::Em => sp.italic = true,
-                Style::Strike | Style::Link => unreachable!(),
+                Style::Strike | Style::Link | Style::Math => unreachable!(),
             }
             out.push(sp);
         }
@@ -102,6 +107,15 @@ impl Renderer {
         }
         if let Some((rc, rw)) = ring {
             th = th.ring(rc, rw);
+        }
+        if let Some(pad) = hl.pad {
+            th = th.pad(pad);
+        }
+        if let Some(radius) = hl.radius {
+            th = th.radius(radius);
+        }
+        if let Some(vpad) = hl.vpad {
+            th = th.vpad(vpad);
         }
         th
     }
@@ -146,10 +160,35 @@ impl Renderer {
         }
     }
 
+    /// `e`, the text of `inl` in `font`, with each inline math drawn over its source once it has
+    /// rendered in `ink`. Until then, or when it fails, the source shows as written.
+    pub(in crate::markdown) fn with_math(&self, e: El, inl: &Inline, font: TextStyle, ink: Color) -> El {
+        #[cfg(feature = "math")]
+        {
+            let mut e = e;
+            for &(a, b, st) in &inl.spans {
+                let Some(raw) = (st == Style::Math).then(|| inl.text.get(a..b)).flatten() else { continue };
+                let size = font.size * INLINE_MATH_SIZE;
+                if let crate::math::MathStatus::Ready(r) = crate::math::poll_inline(raw, size, ink, self.s.math_scale) {
+                    let m = r.margin_pt;
+                    let image = rune::InlineImage::new(r.pixels, r.width_pt - 2.0 * m, r.baseline_pt - m, r.height_pt - r.baseline_pt - m);
+                    e = e.inline_image(a..b, image.bleed(m));
+                }
+            }
+            e
+        }
+        #[cfg(not(feature = "math"))]
+        {
+            let _ = (inl, font, ink);
+            e
+        }
+    }
+
     pub(in crate::markdown) fn para(&self, inl: &Inline, map: Option<&SpanMap>, style: TextStyle, color: Color) -> El {
         // Lines keep their own 22.4 points, as a page's do, so a long list doesn't drift a
         // point per item.
-        let e = self.with_reveal(rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines()).w_full();
+        let e = rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines();
+        let e = self.with_reveal(self.with_math(e, inl, style, color)).w_full();
         let e = bidi::directed(bidi::isolated(e, inl), bidi::inline_dir(inl));
         // A copy puts a blank line around a paragraph, one newline around a list item's first
         // with its marker before it.

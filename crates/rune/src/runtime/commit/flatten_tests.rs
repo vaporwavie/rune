@@ -46,7 +46,7 @@ fn run_flatten<E: FlattenEl>(el: E, foreground: Option<Color>) -> (Vec<Node>, La
     let mut nodes = Vec::new();
     let mut path_buf = String::new();
     let mut old_nodes = Vec::new();
-    let old_index = HashMap::default();
+    let old_index = NodeIndex::default();
     let committed = HashMap::default();
     let mut path_ids = HashMap::default();
     let mut next_id = 1u64;
@@ -63,6 +63,7 @@ fn run_flatten<E: FlattenEl>(el: E, foreground: Option<Color>) -> (Vec<Node>, La
         path_ids: &mut path_ids,
         next_id: &mut next_id,
         foreground,
+        missed_virtual_memo: false,
     };
     let _ = flatten_node(el, None, &mut path_buf, 0, crate::tok::motion::DEFAULT, RowLayout::Free, true, None, &mut taffy, &mut nodes, 2.0, &mut memo_ctx);
     taffy.finish_flatten();
@@ -89,6 +90,7 @@ fn assert_nodes_match(owned: &[Node], borrowed: &[Node], taffy_owned: Option<&La
         assert_eq!(a.in_row, b.in_row, "node {i} in_row");
         assert_eq!(a.width_leads, b.width_leads, "node {i} width_leads");
         assert_eq!(a.instant_changes, b.instant_changes, "node {i} instant_changes");
+        assert_eq!(a.animated_changes, b.animated_changes, "node {i} animated_changes");
         assert_eq!(a.streaming, b.streaming, "node {i} streaming");
         assert_eq!(a.whole, b.whole, "node {i} whole");
         assert_eq!(a.inert, b.inert, "node {i} inert");
@@ -180,6 +182,7 @@ fn cold_packing_handles_el_only_cold_meta_only_and_shared_clones() {
     assert!(by_key(&owned_unique, "plain").cold.is_empty());
     assert!(by_key(&owned_unique, "el-only").cold.is_empty());
     assert_eq!(by_key(&owned_unique, "el-only").motion, own_spring);
+    assert!(by_key(&owned_unique, "el-only").animated_changes);
     assert_eq!(by_key(&owned_unique, "el-only").time_scale, 0.5);
     assert!(by_key(&owned_unique, "el-only").ime_option_as_alt);
     assert!(!by_key(&owned_unique, "pic-only").cold.is_empty());
@@ -188,4 +191,120 @@ fn cold_packing_handles_el_only_cold_meta_only_and_shared_clones() {
     assert_eq!(matched.matched.as_ref().map(|(id, m)| (&**id, *m)), Some(("card", Some(own_spring))));
     assert_eq!(matched.label.as_deref(), Some("Card"));
     assert_eq!(matched.help.as_deref(), Some("Open card"));
+}
+
+#[test]
+fn push_usize_formats_single_and_multi_digit_indices() {
+    for n in [0usize, 1, 9, 10, 42, 999, 1_234_567, usize::MAX] {
+        let mut buf = String::from("root/#");
+        push_usize(&mut buf, n);
+        assert_eq!(buf, format!("root/#{n}"));
+    }
+}
+
+#[test]
+fn path_segment_encoding_is_injective_and_preserves_unambiguous_paths() {
+    use super::path::*;
+
+    // Unambiguous keys stay verbatim.
+    for plain in ["root", "ancestor:a", "row:R-94#dup1", "width:50%", "C:\\dir\\file", "#header", "#fff", "#"] {
+        assert_eq!(node_path("#0", Some(plain), 0), format!("#0/{plain}"));
+        assert_eq!(decode_key_segment(plain).as_deref(), Some(plain));
+        assert!(segment_matches_key(plain, plain));
+    }
+
+    // Distinct keys and positional indices never collide, and round-trip through decode.
+    let tricky = [
+        "", "#0", "#12", "#!", "#!foo", "#!a%2Fb", "a/b", "a/b/c",
+        "ancestor:a/#0", "ancestor:a%2F#0", "#!ancestor:a%2F#0", "a/b%25c", "café/50%/%2F",
+    ];
+    let mut encoded = std::collections::HashSet::new();
+    for &k in &tricky {
+        let p = node_path("#0", Some(k), 0);
+        let mut buf = String::from("#0");
+        push_segment(&mut buf, Some(k), 0);
+        assert_eq!(p, buf, "node_path and push_segment agree for {k:?}");
+        let seg = p.strip_prefix("#0/").unwrap();
+        assert!(!seg.is_empty() && !seg.contains('/'), "encoded segment {seg:?} for {k:?}");
+        assert!(!is_unkeyed_segment(seg), "escaped key {seg:?} must not read as unkeyed");
+        assert!(encoded.insert(seg.to_owned()), "collision for {k:?} -> {seg:?}");
+        assert_eq!(decode_key_segment(seg).as_deref(), Some(k), "round-trip for {k:?}");
+        assert!(segment_matches_key(seg, k));
+        assert!(in_scope(&p, Some(k)));
+    }
+    assert!(encoded.insert("#0".to_owned()), "unkeyed #0 must not collide with any escaped key");
+    assert_eq!(decode_key_segment("#0"), None);
+
+    // Child path vs sibling key containing '/'.
+    let child_path = node_path(&node_path("#0", Some("ancestor:a"), 0), None, 0);
+    let sibling_path = node_path("#0", Some("ancestor:a/#0"), 1);
+    assert_eq!(child_path, "#0/ancestor:a/#0");
+    assert_ne!(child_path, sibling_path);
+
+    // Keyed suffix matching across unkeyed nodes and escaped '/' keys.
+    let row_field = node_path(&node_path("#0/viewport/rows", Some("row/0"), 0), Some("field"), 0);
+    assert!(keyed_suffix_matches(&row_field, "row/0/field"));
+    assert!(keyed_suffix_matches(&row_field, "rows/row/0/field"));
+    assert!(crate::flight::selects("row/0/field", &row_field, Some("field")));
+    assert!(!keyed_suffix_matches(&row_field, "viewport/field"));
+}
+
+#[test]
+fn text_input_color_drives_uninked_caret_placeholder_and_selection() {
+    let edit = TextEdit::new("");
+    let st = TextStyle::new(14.0, 400.0);
+    let ink = Color { r: 0.1, g: 0.15, b: 0.2, a: 1.0 };
+    let ink2 = Color { r: 0.2, g: 0.4, b: 0.1, a: 1.0 };
+    let fg = Color { r: 0.9, g: 0.9, b: 0.95, a: 1.0 };
+    let custom_caret = Color { r: 0.9, g: 0.1, b: 0.3, a: 1.0 };
+    let custom_sel = Color { r: 0.1, g: 0.5, b: 0.9, a: 0.3 };
+    let custom_ph = Color { r: 0.4, g: 0.4, b: 0.4, a: 1.0 };
+
+    let input_colors = |el: El, foreground: Option<Color>| {
+        let (nodes, _) = run_flatten(el, foreground);
+        let i = nodes[0].input.as_ref().unwrap();
+        (nodes[0].text.as_ref().unwrap().color, i.caret, i.placeholder_color, i.selection)
+    };
+
+    // Field with .color(ink) and no Cx::foreground derives caret, placeholder and selection from ink.
+    assert_eq!(
+        input_colors(text_input(&edit, st).color(ink), None),
+        (ink, ink, ink.alpha(0.4), ink.alpha(0.2)),
+    );
+
+    // Field's own .color(ink) beats Cx::foreground(fg), matching CSS caret-color: auto.
+    assert_eq!(
+        input_colors(text_input(&edit, st).color(ink), Some(fg)),
+        (ink, ink, ink.alpha(0.4), ink.alpha(0.2)),
+    );
+
+    // Uncoloured field still follows Cx::foreground(fg).
+    assert_eq!(
+        input_colors(text_input(&edit, st), Some(fg)),
+        (fg, fg, fg.alpha(0.4), fg.alpha(0.2)),
+    );
+
+    // Chaining .color updates uninked defaults to the latest colour.
+    assert_eq!(
+        input_colors(text_input(&edit, st).color(ink).color(ink2), None),
+        (ink2, ink2, ink2.alpha(0.4), ink2.alpha(0.2)),
+    );
+
+    // Explicit .caret, .placeholder and .selection_color survive .color regardless of call order.
+    assert_eq!(
+        input_colors(text_input(&edit, st).caret(custom_caret, custom_sel).color(ink), Some(fg)),
+        (ink, custom_caret, ink.alpha(0.4), custom_sel),
+    );
+    assert_eq!(
+        input_colors(text_input(&edit, st).color(ink).caret(custom_caret, custom_sel), Some(fg)),
+        (ink, custom_caret, ink.alpha(0.4), custom_sel),
+    );
+    assert_eq!(
+        input_colors(text_input(&edit, st).placeholder("Hint", custom_ph).color(ink), Some(fg)),
+        (ink, ink, custom_ph, ink.alpha(0.2)),
+    );
+    assert_eq!(
+        input_colors(text_input(&edit, st).selection_color(custom_sel).color(ink), Some(fg)),
+        (ink, ink, ink.alpha(0.4), custom_sel),
+    );
 }

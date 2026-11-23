@@ -152,14 +152,14 @@ impl RuntimeCore {
     /// [`Runtime::resolve_popup`], and one that can't open answers `None` now.
     pub(crate) fn open_popup_headless(&mut self, app: &mut dyn AppDriver) {
         while let Some(None) = self.take_popup() {
-            let _ = self.resolve_popup(app, None);
+            self.resolve_popup(app, None).ok();
         }
     }
 
     /// Drawn rect of the element a menu anchors to, matched as [`Runtime::find`] matches.
     fn anchor_rect(&self, key: &str) -> Option<[f32; 4]> {
         let i = self.live_named(None, key)?;
-        self.paint.drawn.get(i).copied()
+        self.paint.drawn.get(i).copied().filter(|r| r[2] > 0.0 || r[3] > 0.0)
     }
 
     pub(crate) fn popup_json(&self) -> Option<serde_json::Value> {

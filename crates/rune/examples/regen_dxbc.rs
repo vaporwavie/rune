@@ -11,6 +11,8 @@
 //! the build also checks pinned fragments (`render/dxbc.rs` `PINNED_FRESH`) so one compiled from
 //! other WGSL, or beside another vertex stage, isn't used.
 
+#![allow(unsafe_code)]
+
 #[cfg(target_os = "windows")]
 fn main() {
     // The bytecode in the tree may match nothing now; make the pipeline from WGSL either way.
@@ -40,7 +42,7 @@ fn main() {
     let dual_end = pinned_logged.first().map_or(logged.len(), |p| p.1);
     let (dual_vertex, dual_fragment) = (stage(&logged[uber_logged..dual_end], "vs"), stage(&logged[uber_logged..dual_end], "fs"));
     let (vs, fs) = (fxc(&vertex, "vs", "vs_5_1"), fxc(&fragment, "fs", "ps_5_1"));
-    let started = std::time::Instant::now();
+    let started = rune::time::now();
     let (vs_dual, fs_dual) = (fxc(&dual_vertex, "vs", "vs_5_1"), fxc(&dual_fragment, "fs", "ps_5_1"));
     println!("FXC took {:.1} s for the subpixel variant", started.elapsed().as_secs_f64());
     // The hash the build took of the WGSL it joined, CRLF read as LF (crates/rune/build.rs).
@@ -57,7 +59,7 @@ fn main() {
     let mut pinned_fs = Vec::new();
     for (n, &(kind, at)) in pinned_logged.iter().enumerate() {
         let end = pinned_logged.get(n + 1).map_or(logged.len(), |p| p.1);
-        let started = std::time::Instant::now();
+        let started = rune::time::now();
         let fs_pinned = fxc(&stage(&logged[at..end], "fs"), "fs", "ps_5_1");
         std::fs::write(format!("{dxbc_dir}/uber.fs-k{kind}.dxbc"), &fs_pinned).unwrap();
         pinned_fs.push(format!("\"{}\"", blake3::hash(&fs_pinned).to_hex()));
@@ -133,6 +135,23 @@ fn main() {
     let blur_wgsl_hash = blake3::hash(read("backdrop_blur.wgsl").as_bytes()).to_hex();
     let composite_wgsl_hash = blake3::hash(format!("{}\n{}", read("clip.wgsl"), read("backdrop_composite.wgsl")).as_bytes()).to_hex();
     println!("backdrop blur: {} bytes in 5 stages, WGSL {blur_wgsl_hash} and {composite_wgsl_hash}", backdrop.iter().map(|(_, b)| b.len()).sum::<usize>());
+
+    drop(logged);
+
+    // rune-media's video pass (native surfaces: browser pages, video frames), written into rune-media.
+    let start = HLSL.lock().unwrap().len();
+    rune::native_surface::SurfaceRenderer::compile_wgsl_now(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+    let logged = HLSL.lock().unwrap();
+    let (video_vs, video_fs) = (fxc(&stage(&logged[start..], "vs"), "vs", "vs_5_1"), fxc(&stage(&logged[start..], "fs"), "fs", "ps_5_1"));
+    let media = format!("{root}/../rune-media");
+    std::fs::create_dir_all(format!("{media}/shaders/dxbc")).unwrap();
+    std::fs::write(format!("{media}/shaders/dxbc/video.vs.dxbc"), &video_vs).unwrap();
+    std::fs::write(format!("{media}/shaders/dxbc/video.fs.dxbc"), &video_fs).unwrap();
+    let video_wgsl = blake3::hash(std::fs::read_to_string(format!("{media}/src/native_surface/video.wgsl")).unwrap().replace("\r\n", "\n").as_bytes()).to_hex();
+    std::fs::write(format!("{media}/src/native_surface/dxbc_hash.rs"), format!(
+        "// Written by `cargo run -p rune --example regen_dxbc` on Windows.\n\
+         pub(super) const VIDEO_DXBC_WGSL_BLAKE3: &str = \"{video_wgsl}\";\n")).unwrap();
+    println!("video.vs.dxbc {} bytes, video.fs.dxbc {} bytes, WGSL {video_wgsl}", video_vs.len(), video_fs.len());
 
     std::fs::write(format!("{root}/src/render/uber/pass_dxbc_hash.rs"), format!(
         "// Written by `cargo run -p rune --example regen_dxbc` on Windows.\n\

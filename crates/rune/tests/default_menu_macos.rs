@@ -20,10 +20,11 @@ mod standard;
 fn main() {}
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn main() {
-    use objc2::{sel, rc::Retained};
+    use objc2::{MainThreadMarker, msg_send, sel, rc::Retained};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags as Flags, NSMenu, NSMenuItem};
-    use objc2_foundation::{MainThreadMarker, NSProcessInfo, NSString};
+    use objc2_foundation::{NSProcessInfo, NSString};
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -37,11 +38,11 @@ fn main() {
         let titles: Vec<_> = (0..menu.numberOfItems()).map(|i| menu.itemAtIndex(i).unwrap().title().to_string()).collect();
         assert_eq!(titles, [format!("About {name}"), "".into(), "Services".into(), format!("Hide {name}"),
             "Hide Others".into(), "Show All".into(), "".into(), format!("Quit {name}")]);
-        let command = Flags::NSEventModifierFlagCommand;
+        let command = Flags::Command;
         for (index, selector, key, modifiers) in [
             (0, sel!(orderFrontStandardAboutPanel:), "", command),
             (3, sel!(hide:), "h", command),
-            (4, sel!(hideOtherApplications:), "h", command | Flags::NSEventModifierFlagOption),
+            (4, sel!(hideOtherApplications:), "h", command | Flags::Option),
             (5, sel!(unhideAllApplications:), "", command),
             (7, sel!(terminate:), "q", command),
         ] {
@@ -88,11 +89,11 @@ fn main() {
         let plan = |menu: &NSMenu| (0..menu.numberOfItems()).map(|i| {
             let item = menu.itemAtIndex(i).unwrap();
             if item.isSeparatorItem() { return (s("-"), None, s(""), command, true); }
-            (item.title().to_string(), item.action().map(|a| a.name().to_owned()), item.keyEquivalent().to_string(),
+            (item.title().to_string(), item.action().map(|a| a.name().to_string_lossy().into_owned()), item.keyEquivalent().to_string(),
                 item.keyEquivalentModifierMask(), item.target().is_none())
         }).collect::<Vec<_>>();
         assert_eq!(&tops(&root)[1..], ["Edit", "Window"]);
-        let shift = command | Flags::NSEventModifierFlagShift;
+        let shift = command | Flags::Shift;
         assert_eq!(plan(&root.itemAtIndex(1).unwrap().submenu().unwrap()), [
             (s("Undo"), Some(s("undo:")), s("z"), command, true),
             (s("Redo"), Some(s("redo:")), s("z"), shift, true),
@@ -101,15 +102,47 @@ fn main() {
             (s("Copy"), Some(s("copy:")), s("c"), command, true),
             (s("Paste"), Some(s("paste:")), s("v"), command, true),
             (s("Select All"), Some(s("selectAll:")), s("a"), command, true),
+            (s("-"), None, s(""), command, true),
+            (s("Start Dictation…"), Some(s("startDictation:")), s(""), command, true),
+            (s("Emoji & Symbols"), Some(s("orderFrontCharacterPalette:")), s(" "), command | Flags::Control, true),
         ]);
         assert_eq!(plan(&root.itemAtIndex(2).unwrap().submenu().unwrap()), [
             (s("Minimize"), Some(s("performMiniaturize:")), s("m"), command, true),
+            (s("Zoom"), Some(s("performZoom:")), s(""), command, true),
             (s("Close"), Some(s("performClose:")), s("w"), command, true),
+            (s("-"), None, s(""), command, true),
+            (s("Bring All to Front"), Some(s("arrangeInFront:")), s(""), command, true),
         ]);
         assert_eq!(root.itemAtIndex(0).unwrap().submenu().unwrap().numberOfItems(), 8, "the app menu is untouched");
         default_macos::add_standard(&app);
         assert_eq!(tops(&root).len(), 3, "adding twice changes nothing");
-        assert_eq!(root.itemAtIndex(2).unwrap().submenu().unwrap().numberOfItems(), 2);
+        assert_eq!(root.itemAtIndex(2).unwrap().submenu().unwrap().numberOfItems(), 5);
+        // An app's own Edit item goes before the system items, which stay last as in AppKit's Edit menu.
+        let edit_menu = root.itemAtIndex(1).unwrap().submenu().unwrap();
+        let find = NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str("Find"), Some(sel!(runeMenuAction:)), &NSString::from_str("f"));
+        default_macos::adding(&app, || edit_menu.addItem(&find));
+        let edit_titles: Vec<_> = plan(&edit_menu).into_iter().map(|e| e.0).collect();
+        assert_eq!(&edit_titles[6..], ["Select All", "Find", "-", "Start Dictation…", "Emoji & Symbols"]);
+        edit_menu.removeItem(&find);
+        default_macos::sync_standard(&app);
+        // AppKit ends the launch of an app that has an Edit menu by then with a separator and
+        // AutoFill at its end: AutoFill joins the system items where every Mac app has it, and
+        // stays there when the app adds its own.
+        let autofill = NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str("AutoFill"), None, &NSString::from_str(""));
+        let _: () = msg_send![&autofill, setIdentifier: &*NSString::from_str("_NSMenuItemAutoFillIdentifier")];
+        let appkit_separator = NSMenuItem::separatorItem(mtm);
+        edit_menu.addItem(&appkit_separator);
+        edit_menu.addItem(&autofill);
+        default_macos::sync_standard(&app);
+        let edit_titles: Vec<_> = plan(&edit_menu).into_iter().map(|e| e.0).collect();
+        assert_eq!(&edit_titles[6..], ["Select All", "-", "AutoFill", "Start Dictation…", "Emoji & Symbols"]);
+        default_macos::adding(&app, || edit_menu.addItem(&find));
+        let edit_titles: Vec<_> = plan(&edit_menu).into_iter().map(|e| e.0).collect();
+        assert_eq!(&edit_titles[6..], ["Select All", "Find", "-", "AutoFill", "Start Dictation…", "Emoji & Symbols"]);
+        edit_menu.removeItem(&find);
+        edit_menu.removeItem(&autofill);
+        default_macos::sync_standard(&app);
+        assert_eq!(plan(&edit_menu).len(), 10, "the Edit menu is as it was");
 
         // An app's custom menus take the Mac order around the standard ones, and an item of
         // its own with a standard equivalent takes it from the standard item, set before or after.
@@ -129,7 +162,7 @@ fn main() {
         assert_eq!(key_of(&root, "Window", "Minimize"), "m");
         let paste_plain = NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str("Paste Plain"),
             Some(sel!(runeMenuAction:)), &NSString::from_str("V"));
-        paste_plain.setKeyEquivalentModifierMask(command | Flags::NSEventModifierFlagOption);
+        paste_plain.setKeyEquivalentModifierMask(command | Flags::Option);
         default_macos::adding(&app, || file.addItem(&paste_plain));
         assert_eq!(key_of(&root, "Edit", "Paste"), "v", "⌥⇧⌘V isn't ⌘V");
         file.removeItem(&close_tab);
@@ -154,7 +187,7 @@ fn main() {
         default_macos::remove_top_if_empty(&root, &window_top);
         default_macos::sync_standard(&app);
         assert_eq!(&tops(&root)[1..], ["Edit", "Window"], "the shared menu stays for the standard items");
-        assert_eq!(plan(&window).into_iter().map(|e| (e.0, e.2)).collect::<Vec<_>>(), [(s("Minimize"), s("m")), (s("Close"), s("w"))]);
+        assert_eq!(plan(&window).into_iter().map(|e| (e.0, e.2)).collect::<Vec<_>>(), [(s("Minimize"), s("m")), (s("Zoom"), s("")), (s("Close"), s("w")), (s("-"), s("")), (s("Bring All to Front"), s(""))]);
 
         // An app's own Edit menu keeps its items; only missing actions join it.
         app.setMainMenu(None);
@@ -170,7 +203,7 @@ fn main() {
         default_macos::add_standard(&app);
         assert_eq!(tops(&supplied), ["Edit", "Window"]);
         let edit_titles: Vec<_> = plan(&edit).into_iter().map(|e| e.0).collect();
-        assert_eq!(edit_titles, ["Copy Link", "Undo", "Redo", "-", "Cut", "Paste", "Select All"]);
+        assert_eq!(edit_titles, ["Copy Link", "Undo", "Redo", "-", "Cut", "Paste", "Select All", "-", "Start Dictation…", "Emoji & Symbols"]);
 
         // An accessory app's standard items wait without Quit until its Dock icon shows.
         app.setMainMenu(None);

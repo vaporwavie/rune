@@ -104,9 +104,9 @@ pub(crate) fn selects(selector: &str, path: &str, key: Option<&str>) -> bool {
     let Some(key) = key else { return false };
     if selector == key { return true; }
     let Some(scope) = selector.strip_suffix(key).and_then(|s| s.strip_suffix('/')) else { return false };
-    let Some(above) = path.strip_suffix(key).and_then(|s| s.strip_suffix('/')) else { return false };
-    let mut keyed = above.rsplit('/').filter(|seg| !seg.starts_with('#'));
-    scope.rsplit('/').all(|seg| keyed.next() == Some(seg))
+    let Some((above, own)) = path.rsplit_once('/') else { return false };
+    crate::runtime::element_path::segment_matches_key(own, key)
+        && crate::runtime::element_path::keyed_suffix_matches(above, scope)
 }
 
 /// Whether `selector` names a highlight keyed `key` in the text at `path`: [`selects`] for
@@ -114,8 +114,7 @@ pub(crate) fn selects(selector: &str, path: &str, key: Option<&str>) -> bool {
 pub(crate) fn selects_under(selector: &str, path: &str, key: &str) -> bool {
     if selector == key { return true; }
     let Some(scope) = selector.strip_suffix(key).and_then(|s| s.strip_suffix('/')) else { return false };
-    let mut keyed = path.rsplit('/').filter(|seg| !seg.starts_with('#'));
-    scope.rsplit('/').all(|seg| keyed.next() == Some(seg))
+    crate::runtime::element_path::keyed_suffix_matches(path, scope)
 }
 
 /// Transform glyph geometry without changing its atlas footprint. Clip edges share the same
@@ -138,7 +137,7 @@ pub(crate) fn transformed(mut q: Instance, from: Rect, to: Rect, scale: f32, alp
     ];
     q.fill = q.fill.map(|v| v * alpha);
     q.clip = clip.map(|v| v * scale);
-    q.fade = crate::render::pack_fade(fade.map(|v| v * scale), q.clip, q.clip);
+    q.fade = crate::render::pack_fade(fade.map(|v| (v * scale).clamp(-65504.0, 65504.0)), q.clip, q.clip);
     q
 }
 

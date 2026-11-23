@@ -15,7 +15,8 @@ impl OverlayCore {
         let fading = self.presence.fading();
         let size = self.at.size;
         self.resolve_size(event_loop);
-        if self.surface.live().is_none() {
+        let was_live = self.surface.live().is_some();
+        if !was_live {
             self.prepare(app, event_loop, true);
             if self.shared.failure.lock().unwrap().is_some() { return; }
         }
@@ -31,8 +32,18 @@ impl OverlayCore {
             if self.surface.live().is_none() { return; }
             // Retained alpha-zero hosts already have pixels. A hidden update must reach
             // the surface before exposing it, rather than flashing the old frame.
-            if !fading { self.refresh_for_reveal_at(app, Instant::now()); }
+            if !fading { self.refresh_for_reveal_at(app, crate::time::now()); }
             self.show_window(&window, fade);
+            // A retained macOS panel drew while hidden during prewarm and does not mark itself
+            // dirty on reveal, so exposing its retained pixels is the first visible present.
+            if frame::retained_reveal_presents(self.retained(), self.dirty, self.surface.live().is_some()) {
+                frame::record_presented(false);
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(Live { backing: Backing::Xwayland(surface), .. }) = self.surface.live_mut() {
+            if was_live && size == self.at.size { surface.place(self.at, &self.options); }
+            surface.show();
         }
         let effects = self.presence.step(presence::Event::Show, self.release);
         self.carry_out(app, effects);
@@ -42,6 +53,8 @@ impl OverlayCore {
         #[cfg(target_os = "macos")]
         {
             self.occlusion_read = false;
+            // AppKit updates `occlusionState` some milliseconds after the order-in.
+            if self.panel.is_some() { self.prime.arm(); }
             self.sync_occlusion(app);
             if !self.presence.occluded() { self.ensure_pacing(); }
         }
@@ -143,10 +156,10 @@ impl OverlayCore {
         // Any Fn change the monitor saw reaches the view while it's still shown; the hide
         // then releases what it held.
         #[cfg(target_os = "macos")]
-        self.fn_key(app);
+        { self.fn_key(app); self.prime.stop(); }
         // Only macOS and Windows fade the window; elsewhere it goes at once, and so does drawing.
         let fade = if cfg!(any(target_os = "macos", target_os = "windows")) { fade } else { Duration::ZERO };
-        let effects = self.presence.step(presence::Event::Hide { fade, now: Instant::now() }, self.release);
+        let effects = self.presence.step(presence::Event::Hide { fade, now: crate::time::now() }, self.release);
         self.carry_out(app, effects);
     }
 
@@ -189,7 +202,7 @@ impl OverlayCore {
         if self.options.keys == KeyPolicy::OnDemand { app.rt_mut().keys_lost(); }
         self.mods = Default::default();
         self.control_click = false;
-        self.ime_allowed = false;
+        self.ime.clear();
         app.popup_cancel(&mut self.popup);
         app.rt_mut().cancel_pointer();
         self.apply_cursor(app.rt());
@@ -220,7 +233,26 @@ impl OverlayCore {
                 window.set_visible(false);
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-            Backing::Layer(_) | Backing::Xwayland(_) => { self.surface.take_live(); }
+            Backing::Layer(_) | Backing::Xwayland(_) => {
+                self.surface.take_live();
+                self.drop_hidden_images(app);
+            }
+        }
+    }
+
+    /// Drops the last shown frame's `Pixels` references, CPU image atlas pages and GPU image
+    /// textures when a Wayland overlay's surface is destroyed on hide. The next show rebuilds
+    /// the view and uploads whatever images it still draws.
+    #[cfg_attr(not(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))), allow(dead_code))]
+    pub(super) fn drop_hidden_images(&mut self, app: &mut dyn OverlayApp) {
+        app.rt_mut().drop_images();
+        let dropped_gpu = self.renderer.as_mut().is_some_and(Renderer::clear_images);
+        if dropped_gpu && self.release != Release::Now
+            && let Some(gpu) = &self.gpu
+            && !gpu.is_lost()
+        {
+            gpu.queue.submit(std::iter::empty());
+            rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
         }
     }
 
@@ -320,7 +352,7 @@ impl OverlayCore {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = window.set_cursor_hittest(self.options.input.resolved(self.interactive) == OverlayInput::All);
+            window.set_cursor_hittest(self.options.input.resolved(self.interactive) == OverlayInput::All).ok();
             #[cfg(all(unix, not(target_os = "ios"), not(target_os = "android")))]
             {
                 self.x11 = crate::platform::x11::overlay::InputWindow::new(&window, self.shared.wake.lock().unwrap().clone(), self.options.input.resolved(self.interactive), self.options.follow_pointer, self.options.keys);
@@ -373,21 +405,40 @@ impl OverlayCore {
     /// screen-sized panels that join every Space empty Mission Control's Space thumbnails.
     /// There the window goes too, and the next show makes a new one.
     pub(super) fn park(&mut self) {
-        if !matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Window(_))) { return; }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        self.release();
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            let Some(Live { alpha, surface, backing, .. }) = self.surface.take_live() else { return };
-            // The surface goes before the device that made it and the window it draws into.
-            drop(alpha);
-            drop(surface);
-            self.surface.park(backing);
+        if let Some(live) = self.surface.live() {
+            if !matches!(live.backing, Backing::Window(_)) { return; }
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            self.release();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                let Some(Live { alpha, surface, backing, .. }) = self.surface.take_live() else { return };
+                // The surface goes before the device that made it and the window it draws into.
+                drop(alpha);
+                drop(surface);
+                self.surface.park(backing);
+            }
         }
         // The device goes to the next surface rather than with this one; one another
-        // surface still draws with stays there.
-        if let (Some(gpu), Some(renderer)) = (self.gpu.take(), self.renderer.take()) && let Ok(gpu) = Arc::try_unwrap(gpu) {
-            crate::render::park_gpu(gpu, renderer);
+        // surface still draws with stays there, polled now so finished frames and this
+        // overlay's dropped surface and renderer resources retire immediately.
+        match (self.gpu.take(), self.renderer.take()) {
+            (Some(gpu), Some(renderer)) => match Arc::try_unwrap(gpu) {
+                Ok(gpu) => crate::render::park_gpu(gpu, renderer),
+                Err(gpu) => {
+                    drop(renderer);
+                    if !gpu.is_lost() {
+                        gpu.queue.submit(std::iter::empty());
+                        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
+                    }
+                }
+            },
+            (Some(gpu), None) => {
+                if !gpu.is_lost() {
+                    gpu.queue.submit(std::iter::empty());
+                    rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
+                }
+            }
+            (None, renderer) => drop(renderer),
         }
         *self.shared.surface.lock().unwrap() = None;
     }

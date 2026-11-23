@@ -5,10 +5,10 @@ use std::hash::{Hash, Hasher};
 
 use accesskit::{Action as Ak, Affine, Live, Node as AkNode, Role, Toggled};
 
-use super::*;
-use super::a11y_tree::{Walk, hash_str, mix, rect};
-use crate::a11y::roles::{self, RoleCtx};
+use super::roles::{self, RoleCtx};
+use super::tree::{Walk, element_id, hash_str, mix, rect};
 use crate::el::Checked;
+use crate::runtime::RuntimeCore;
 
 /// Text named from an element's content stops here.
 const NAME_MAX: usize = 400;
@@ -83,25 +83,30 @@ impl RuntimeCore {
         }
         // A text's lines come from its layout and where it scrolled; a long field's drawn lines
         // live under `lines_box_id`, whose own fingerprint tracks its layout and scroll band.
-        if !long_field {
+        if !long_field && !secure {
             n.text_layout.as_ref().map(crate::text::TextLayout::address).hash(&mut h);
         }
-        n.elided.map(|e| (e.head, e.tail)).hash(&mut h);
+        if !secure {
+            n.elided.map(|e| (e.head, e.tail)).hash(&mut h);
+        }
         if let Some(input) = n.input.as_deref() {
             let e = &input.edit;
-            if !secure && (long_key.is_none() || e.preedit().is_some()) {
-                if long_field {
-                    // During IME composition on a long field, `t.content` is the display string and
-                    // `long_key` already hashed it; only hash `e.text.len()` + preedit metadata.
-                    e.text.len().hash(&mut h);
-                } else {
-                    e.text.hash(&mut h);
+            if !secure {
+                if long_key.is_none() || e.preedit().is_some() {
+                    if long_field {
+                        // During IME composition on a long field, `t.content` is the display string and
+                        // `long_key` already hashed it; only hash `e.text.len()` + preedit metadata.
+                        e.text.len().hash(&mut h);
+                    } else {
+                        e.text.hash(&mut h);
+                    }
+                }
+                (e.anchor, e.focus, e.preedit().map(|p| (p.0.len(), p.1))).hash(&mut h);
+                if !long_field {
+                    self.edit.input_scroll.get(&n.path).map(|v| v.to_bits()).hash(&mut h);
                 }
             }
-            (e.anchor, e.focus, e.preedit().map(|p| (p.0.len(), p.1)), e.focused, &input.placeholder, input.single_line, input.access.is_some()).hash(&mut h);
-            if !long_field {
-                self.edit.input_scroll.get(&n.path).map(|v| v.to_bits()).hash(&mut h);
-            }
+            (e.focused, &input.placeholder, input.single_line, input.access.is_some()).hash(&mut h);
         }
         let handlers = n.handlers.get();
         (handlers.is_some_and(|h| h.on_press.is_some()), handlers.is_some_and(|h| h.on_secondary_press.is_some()),
@@ -197,7 +202,7 @@ impl RuntimeCore {
                 Some(false) => node.set_sort_direction(accesskit::SortDirection::Descending),
                 None => {}
             }
-            if let Some(j) = self.a11y_active_descendant(i) { node.set_active_descendant(super::a11y_tree::element_id(self.tree.nodes[j].id)); }
+            if let Some(j) = self.a11y_active_descendant(i) { node.set_active_descendant(element_id(self.tree.nodes[j].id)); }
             if m.busy { node.set_busy(); }
         }
         if let Some(v) = more.and_then(|m| m.value.as_deref()) { node.set_value(v); }
@@ -222,7 +227,8 @@ impl RuntimeCore {
         match live {
             Some(crate::LiveRegion::Polite) => node.set_live(Live::Polite),
             Some(crate::LiveRegion::Assertive) => node.set_live(Live::Assertive),
-            _ => {}
+            Some(crate::LiveRegion::Off) => node.set_live(Live::Off),
+            None => {}
         }
         if modal { node.set_modal(); }
         if !enabled { node.set_disabled(); }
@@ -254,12 +260,12 @@ impl RuntimeCore {
             if n.focus.step.is_some() {
                 node.add_action(Ak::Increment);
                 node.add_action(Ak::Decrement);
-                if more.and_then(|m| m.range).is_some_and(|r| r.step.is_some_and(|s| s > 0.0)) { node.add_action(Ak::SetValue); }
+                if more.and_then(|m| m.range).is_some_and(|r| r.usable_step().is_some()) { node.add_action(Ak::SetValue); }
             }
             if input.is_some_and(|i| i.access.is_some()) {
                 node.add_action(Ak::SetValue);
                 node.add_action(Ak::ReplaceSelectedText);
-                node.add_action(Ak::SetTextSelection);
+                if !secure { node.add_action(Ak::SetTextSelection); }
             }
             if scroll.is_some() {
                 node.add_action(Ak::ScrollUp);

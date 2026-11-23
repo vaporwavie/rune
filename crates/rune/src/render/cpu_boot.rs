@@ -22,8 +22,6 @@
 //!
 //! Nothing here runs or allocates until it's called: no statics to initialise, no tables.
 
-use crate::time::Instant;
-
 use super::{Instance, Kind};
 use crate::pixels::ImageAtlas;
 use crate::text::{Atlas, FontSmoothing};
@@ -48,6 +46,8 @@ mod tests;
 
 pub use drift::{Drift, Pixels, drift, drift_wanted, last_drift};
 pub use fill::{FillReport, attach_text, fill_masks};
+#[cfg(test)]
+pub(crate) use painter::UploadPlan;
 pub use painter::{CpuPainter, Painted};
 
 /// One frame's draw data, borrowed from the runtime that built it.
@@ -70,6 +70,8 @@ pub struct Scene<'a> {
     atlas_resets: u64,
     /// How the GPU that takes over rounds into half floats (layers, blur levels).
     half: HalfRounding,
+    /// Packed explicit scroll-fade stops (`Runtime::fade_stops`), matching `Globals::flags[2..4]`.
+    fade_stops: [f32; 2],
 }
 
 /// How a GPU stores a float into an `Rgba16Float` target. Vendors differ, and a layer's pixels
@@ -110,6 +112,7 @@ struct Flags {
     lcd: bool,
     smoothing: Option<FontSmoothing>,
     half: HalfRounding,
+    fade_stops: [u32; 2],
 }
 
 /// An image atlas page: RGBA8 texels, `width * 4` bytes a row.
@@ -128,7 +131,13 @@ impl<'a> Scene<'a> {
     pub fn new(instances: &'a [Instance], atlas: &'a Atlas, images: &'a ImageAtlas, size: (u32, u32), clear: [f32; 4]) -> Self {
         let glyph_pages = (0..atlas.page_count()).filter_map(|p| atlas.page_data(p)).collect();
         let images = images.pages.iter().map(|p| Image { width: p.width, data: &p.data, dirty: p.dirty }).collect();
-        Scene { instances, glyph_pages, outlines: Some(&atlas.outlines), images, size, clear, lcd: atlas.lcd, srgb_blend: true, native_surfaces: false, compositor: false, smoothing: None, atlas_resets: atlas.resets(), half: HalfRounding::default() }
+        Scene { instances, glyph_pages, outlines: Some(&atlas.outlines), images, size, clear, lcd: atlas.lcd, srgb_blend: true, native_surfaces: false, compositor: false, smoothing: None, atlas_resets: atlas.resets(), half: HalfRounding::default(), fade_stops: [0.0; 2] }
+    }
+
+    /// Packed explicit scroll-fade stops (`Runtime::fade_stops`).
+    pub fn fade_stops(mut self, stops: [f32; 2]) -> Self {
+        self.fade_stops = stops;
+        self
     }
 
     /// Whether the frame blends in sRGB encoding (`Runtime::srgb_blend`). Linear blending needs
@@ -160,7 +169,7 @@ impl<'a> Scene<'a> {
 
     /// The scene-wide switches, which a frame that only recolours keeps.
     fn flags(&self) -> Flags {
-        Flags { srgb_blend: self.srgb_blend, native_surfaces: self.native_surfaces, compositor: self.compositor, lcd: self.lcd, smoothing: self.smoothing, half: self.half }
+        Flags { srgb_blend: self.srgb_blend, native_surfaces: self.native_surfaces, compositor: self.compositor, lcd: self.lcd, smoothing: self.smoothing, half: self.half, fade_stops: [self.fade_stops[0].to_bits(), self.fade_stops[1].to_bits()] }
     }
 
     /// How the GPU that will take over rounds half floats (`HalfRounding::of_vendor`).
@@ -190,7 +199,7 @@ impl<'a> Scene<'a> {
             Some(Kind::BackdropBlur) if depth > 0 => Some(NeedsGpu::BackdropBlur),
             Some(Kind::Effect) if self.compositor => Some(NeedsGpu::Effect),
             // Slug's rays (coverage 1) have no CPU form; Windfoil's box does (outline::coverage).
-            Some(Kind::Glyph) if i.radii[3] > 0.0 && (self.outlines.is_none() || i.border[3] == 1.0) => Some(NeedsGpu::OutlineGlyph),
+            Some(Kind::Glyph) if i.radii[3] > 0.0 && (self.outlines.is_none() || i.border[3] == super::instance::shader_consts::OUTLINE_MODE_SLUG as f32) => Some(NeedsGpu::OutlineGlyph),
             Some(
                 Kind::Rect | Kind::Shadow | Kind::Glyph | Kind::Inset | Kind::Gradient
                 | Kind::Segment | Kind::Triangle | Kind::Image | Kind::Dashed | Kind::Radial
@@ -278,12 +287,12 @@ pub struct Report {
 pub fn paint(scene: &Scene<'_>, target: &mut Target<'_>, threads: usize) -> Result<Report, NeedsGpu> {
     if let Some(why) = scene.needs_gpu() { return Err(why); }
     check_target(scene, target)?;
-    let start = Instant::now();
+    let start = crate::time::now();
     let bins = bin::Bins::of(scene);
-    let binned = Instant::now();
+    let binned = crate::time::now();
     let tiles: Vec<u32> = (0..bins.tile_count() as u32).collect();
     let mut report = raster::run(scene, &bins, target, &tiles, &raster::Spawn(threads.max(1)), &raster::Spawn(threads.max(1)));
-    let done = Instant::now();
+    let done = crate::time::now();
     report.bin_ns = ns(binned - start);
     report.raster_ns = ns(done - binned);
     report.total_ns = ns(done - start);

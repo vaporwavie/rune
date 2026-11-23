@@ -99,8 +99,8 @@ fn debug_builds_warn_when_a_live_only_handler_changed_what_the_view_reads() {
     rt.frame(0.5);
     rt.key(KeyEvent { key: Key::Right, mods: Mods::default() });
     rt.frame(1.0 / 120.0);
-    assert_eq!(rt.frame.live_only_warnings.len(), 1, "{:?}", rt.frame.live_only_warnings);
-    assert!(rt.frame.live_only_warnings[0].contains("on_key"), "{}", rt.frame.live_only_warnings[0]);
+    assert_eq!(rt.frame.live_only_warnings().len(), 1, "{:?}", rt.frame.live_only_warnings());
+    assert!(rt.frame.live_only_warnings()[0].contains("on_key"), "{}", rt.frame.live_only_warnings()[0]);
 
     // Used as meant, the check commits and stays quiet; events between checks skip the view.
     let mut rt = app(false);
@@ -110,8 +110,8 @@ fn debug_builds_warn_when_a_live_only_handler_changed_what_the_view_reads() {
         rt.key_up(KeyEvent { key: Key::Right, mods: Mods::default() });
         rt.frame(1.0 / 120.0);
     }
-    assert!(rt.frame.live_only_warnings.is_empty(), "{:?}", rt.frame.live_only_warnings);
-    assert_eq!((rt.stats.commits - before, rt.frame.live_checks, rt.frame.live_only_skips), (1, 1, 9));
+    assert!(rt.frame.live_only_warnings().is_empty(), "{:?}", rt.frame.live_only_warnings());
+    assert_eq!((rt.stats.commits - before, rt.frame.live_checks(), rt.frame.live_only_skips), (1, 1, 9));
 }
 
 #[test]
@@ -124,8 +124,8 @@ fn the_check_ignores_a_change_another_event_made_in_the_same_frame() {
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(1.0 / 120.0);
-    assert_eq!((rt.state.count, rt.frame.live_checks), (1, 1));
-    assert!(rt.frame.live_only_warnings.is_empty(), "{:?}", rt.frame.live_only_warnings);
+    assert_eq!((rt.state.count, rt.frame.live_checks()), (1, 1));
+    assert!(rt.frame.live_only_warnings().is_empty(), "{:?}", rt.frame.live_only_warnings());
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn debug_check_does_not_blame_live_only_for_layout_feedback_before_a_key() {
     rt.key_up(KeyEvent { key: Key::Right, mods: Mods::default() });
     rt.key(KeyEvent { key: Key::Left, mods: Mods::default() });
     rt.frame(0.0);
-    assert!(rt.frame.live_only_warnings.is_empty(), "{:?}", rt.frame.live_only_warnings);
+    assert!(rt.frame.live_only_warnings().is_empty(), "{:?}", rt.frame.live_only_warnings());
 }
 
 #[test]
@@ -287,16 +287,146 @@ fn a_commit_records_why_for_the_frame_log() {
         let mut rt = app(false);
         rt.check_live_only(false);
         rt.frame(0.0);
-        rt.commit.commit_why = 0;
+        rt.commit.clear_commit_why();
         rt.key_up(KeyEvent { key: Key::Right, mods: Mods::default() });
         rt.frame(0.0);
-        assert_eq!(rt.commit.commit_why, 0, "a live-only key commits nothing");
+        assert_eq!(rt.commit.commit_why(), 0, "a live-only key commits nothing");
         if source == 0 { rt.poll = Some(|s, _, _| { s.count += 1; true }); }
         if source == 1 {
             let (x, y) = rt.find("camera").unwrap();
             rt.pointer_down(x, y); rt.pointer_up(x, y);
         }
         rt.frame(0.0);
-        assert_eq!(rt.commit.commit_why & want, want, "source {source}: {:?}", CommitWhy::names(rt.commit.commit_why));
+        assert_eq!(rt.commit.commit_why() & want, want, "source {source}: {:?}", CommitWhy::names(rt.commit.commit_why()));
     }
+}
+
+#[test]
+fn live_only_without_live_subscriptions_rests_after_one_frame() {
+    fn view(_: &(), _: &mut Cx<()>) -> El {
+        el().size(200.0, 200.0)
+            .child(el().key("target").size(100.0, 100.0).focusable(true)
+                .on_physical_input(|_: &mut (), e, tx| {
+                    if !matches!(e, PhysicalInput::Key { pressed: false, .. }) { return false; }
+                    tx.live_only();
+                    true
+                })
+                .on_wheel(|_: &mut (), _, tx| { tx.live_only(); true }))
+    }
+    let mut rt = Runtime::new((), view, (200.0, 200.0), Env::new(true, 1.0));
+    rt.check_live_only(false);
+    rt.on_key = Some(|_, _, tx| { tx.live_only(); true });
+    rt.frame(0.0);
+    let (x, y) = rt.find("target").unwrap();
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    for _ in 0..60 { rt.frame(1.0 / 120.0); }
+    assert!(!rt.live_pending());
+    assert_eq!(rt.core().waiting_work(), None);
+    let before = rt.stats.commits;
+
+    // 1. Key handler via physical_with_fallback (native path).
+    let (ev, fallback) = key(PhysicalKeyCode::KeyJ, Key::Text("j".into()), true);
+    rt.physical_with_fallback(ev, fallback);
+    rt.frame(1.0 / 120.0);
+    assert_eq!(rt.stats.commits, before);
+    assert!(!rt.live_pending(), "key live_only must not stick live_pending without subscriptions");
+    assert_eq!(rt.core().waiting_work(), None);
+
+    // 2. Physical release observation at rest (outside frame_step).
+    let release = PhysicalInput::Key { key: PhysicalKeyCode::ShiftLeft, mods: Mods::default(), pressed: false, repeat: false };
+    assert!(rt.physical_with_fallback(release, None));
+    assert!(!rt.live_pending(), "physical observation must not mark live_pending without subscriptions");
+    rt.frame(1.0 / 120.0);
+    assert_eq!(rt.stats.commits, before);
+    assert!(!rt.live_pending());
+    assert_eq!(rt.core().waiting_work(), None);
+
+    // 3. Wheel handler calling live_only.
+    rt.wheel(x, y, -20.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!(rt.stats.commits, before);
+    assert!(!rt.live_pending(), "wheel live_only must not stick live_pending without subscriptions");
+    assert_eq!(rt.core().waiting_work(), None);
+}
+
+#[test]
+fn live_value_published_in_poll_draws_one_frame_without_extra_live_wake() {
+    struct SpriteState {
+        offset: Live<[f32; 2]>,
+        pixels: crate::Pixels,
+        step_live: bool,
+        step_pixels: bool,
+        tick: u32,
+    }
+    fn view(s: &SpriteState, _: &mut Cx<SpriteState>) -> El {
+        el().size(200.0, 200.0)
+            .child(el().key("sprite").absolute(0.0, 0.0).size(16.0, 16.0).live_offset(&s.offset).pixels(&s.pixels))
+    }
+    let state = SpriteState {
+        offset: Live::new([0.0, 0.0]),
+        pixels: crate::Pixels::new(),
+        step_live: false,
+        step_pixels: false,
+        tick: 0,
+    };
+    let mut rt = Runtime::new(state, view, (200.0, 200.0), Env::new(true, 1.0));
+    rt.poll = Some(|s, _, tx| {
+        if s.step_live {
+            s.step_live = false;
+            s.tick += 1;
+            s.offset.set([s.tick as f32 * 4.0, 0.0]);
+            tx.wake_after(std::time::Duration::from_millis(40));
+        }
+        if s.step_pixels {
+            s.step_pixels = false;
+            s.tick += 1;
+            let v = (s.tick % 255) as u8;
+            s.pixels.set(2, 2, vec![v; 2 * 2 * 4]);
+        }
+        false
+    });
+    rt.frame(0.0);
+    let commits = rt.stats.commits;
+    assert!(!rt.live_pending());
+
+    // Simulate a host loop that draws one frame on each timer tick and keeps drawing
+    // while animating or live_pending. Each Live publication in poll must draw once.
+    let mut frames_drawn = 0u32;
+    for step in 1..=5u32 {
+        rt.state.step_live = true;
+        loop {
+            let animating = rt.frame(0.04);
+            frames_drawn += 1;
+            if !(animating || rt.live_pending()) { break; }
+            assert!(frames_drawn <= 20, "live_pending looped without settling");
+        }
+        let sprite = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("sprite")).unwrap();
+        assert_eq!(sprite.rect[0], step as f32 * 4.0, "step {step} drawn on its own frame");
+        assert!(!rt.live_pending(), "step {step} must not leave live_pending set after drawing");
+    }
+    assert_eq!(frames_drawn, 5, "five poll live updates must draw 5 frames, not 10");
+    assert_eq!(rt.stats.commits, commits, "poll live updates must not rebuild the view");
+
+    // Fixed-size Pixels (no has_pixel_aspect) published in poll also draws once.
+    let mut pixel_frames = 0u32;
+    for _ in 0..3 {
+        rt.state.step_pixels = true;
+        loop {
+            let animating = rt.frame(0.04);
+            pixel_frames += 1;
+            if !(animating || rt.live_pending()) { break; }
+            assert!(pixel_frames <= 20, "pixel live_pending looped without settling");
+        }
+        assert!(!rt.live_pending());
+    }
+    assert_eq!(pixel_frames, 3, "three fixed-size pixel updates must draw 3 frames");
+
+    // A hidden runtime still retains a publication for when it shows again.
+    rt.set_live_visible(false);
+    rt.state.offset.set([99.0, 0.0]);
+    rt.frame(0.04);
+    assert!(!rt.live_pending(), "hidden runtime reports not live_pending while hidden");
+    rt.set_live_visible(true);
+    assert!(rt.live_pending(), "retained wake resurfaces on show");
 }

@@ -13,10 +13,10 @@ impl RuntimeCore {
     /// Per node of the last build: neither it nor anything under it drew. Empty before the first
     /// build and after a commit, until the next one draws.
     pub(in crate::runtime) fn drew_nothing(&self) -> Vec<bool> {
-        if !self.tree.built || self.paint.seen.len() != self.tree.nodes.len() || self.paint.inh_scratch.len() != self.tree.nodes.len() {
+        if !self.tree.built || self.paint.seen().len() != self.tree.nodes.len() || self.paint.inh_scratch.len() != self.tree.nodes.len() {
             return Vec::new();
         }
-        let mut seen = self.paint.seen.clone();
+        let mut seen = self.paint.seen().to_vec();
         mark_ancestors(&self.tree.nodes, &mut seen);
         seen.iter().zip(&self.paint.inh_scratch).map(|(&seen, h)| !seen || h.opacity < 1.0 / 512.0).collect()
     }
@@ -43,17 +43,30 @@ impl RuntimeCore {
 
     /// Ends the exits that drew nothing last frame. A flight paints outside its clips, so it stays.
     pub(in crate::runtime) fn end_unseen_exits(&mut self) {
-        if !self.tree.built { return; }
+        if !self.tree.built || self.scene.exiting().is_empty() { return; }
         let mut hid: Option<Vec<bool>> = None;
-        for i in 0..self.tree.nodes.len() {
-            let id = self.tree.nodes[i].id;
+        let mut unmount: Vec<(usize, NodeId)> = Vec::new();
+        #[cfg(test)]
+        let mut checks = 0u64;
+        for &id in self.scene.exiting() {
+            #[cfg(test)]
+            { checks += 1; }
+            let Some(&i) = self.tree.node_index.get(&id) else { continue };
             let faded = self.paint.inh_scratch.get(i).is_some_and(|h| h.opacity < 1.0 / 512.0);
-            if (!faded && self.paint.seen.get(i).is_none_or(|&s| s)) || !self.is_exiting(id) || self.motion.flying.iter().any(|f| f.0 == id) {
+            if (!faded && self.paint.was_seen(i, true)) || self.motion.flying.iter().any(|f| f.0 == id) {
                 continue;
             }
             if hid.get_or_insert_with(|| self.drew_nothing()).get(i).copied().unwrap_or(false) {
-                self.scene.unmount(id);
+                unmount.push((i, id));
             }
+        }
+        #[cfg(test)]
+        { self.motion.unseen_exit_checks += checks; }
+        if unmount.len() > 1 {
+            unmount.sort_unstable_by_key(|&(i, _)| i);
+        }
+        for (_, id) in unmount {
+            self.scene.unmount(id);
         }
     }
 
@@ -64,7 +77,7 @@ impl RuntimeCore {
         if !unseen.contains(&nodes[i].id) { return; }
         let Some(p) = nodes[i].parent else { return };
         let Some(v) = self.commit.virtuals.get_mut(&nodes[p].path) else { return };
-        let Some(key) = nodes[i].path.strip_prefix(nodes[p].path.as_str()).and_then(|k| k.strip_prefix('/')) else { return };
+        let Some(key) = nodes[i].key.as_deref() else { return };
         if !v.replaced_view() { return; }
         v.entering.insert(key.to_owned());
         self.scene.reenter(nodes[i].id);
@@ -81,7 +94,7 @@ impl RuntimeCore {
         let mut land = Vec::new();
         for (path, v) in &mut self.commit.virtuals {
             for key in v.entering.drain() {
-                let Some(&id) = self.tree.path_ids.get(&format!("{path}/{key}")) else { continue };
+                let Some(&id) = self.tree.path_ids.get(&node_path(path, Some(&key), 0)) else { continue };
                 let Some(&i) = self.tree.node_index.get(&id) else { continue };
                 let Some(&[x, y, rw, rh]) = self.paint.drawn.get(i) else { continue };
                 let clip = screen_clip_of(self.tree.nodes[i].parent, &self.paint.inh_scratch, &self.paint.turn_scratch);
@@ -186,3 +199,7 @@ impl RuntimeCore {
         (0..nodes.len()).map(|i| !after[i] && olds[i].is_none_or(|o| !seen[o])).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "unseen_presence_tests.rs"]
+mod tests;

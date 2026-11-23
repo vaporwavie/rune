@@ -1,14 +1,15 @@
 //! A Metal surface whose window reports itself covered, with no window server needed: the layer's
 //! delegate stands in for the backing view, and is its own window.
 
+#![allow(unsafe_code)]
+
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 
 use super::*;
 use crate::frame::surface_stats::SurfaceMeter;
 use crate::render::Gpu;
-use crate::time::Instant;
-use objc2_video::{ClassType, define_class, msg_send, rc::Retained, runtime::{AnyClass, AnyObject, NSObject}};
+use objc2::{ClassType, define_class, msg_send, rc::Retained, runtime::{AnyClass, AnyObject, NSObject}};
 
 /// The fake window's `occlusionState`: 0 covered, 2 (`NSWindowOcclusionStateVisible`) shown.
 static OCCLUSION: AtomicUsize = AtomicUsize::new(0);
@@ -31,11 +32,15 @@ define_class!(
 /// wgpu-core 30.0.1) and a re-check at most every two seconds; uncovered, it draws.
 #[test]
 fn an_occluded_surface_never_asks_wgpu_and_draws_once_visible() {
+    // SAFETY: `FakeView` is a registered `NSObject` subclass; `+new` returns a retained instance.
     let view: Retained<FakeView> = unsafe { msg_send![FakeView::class(), new] };
+    // SAFETY: `+[CAMetalLayer new]` allocates and returns a retained `CAMetalLayer`.
     let layer: Retained<AnyObject> = unsafe { msg_send![AnyClass::get(c"CAMetalLayer").expect("QuartzCore"), new] };
+    // SAFETY: `layer` and `view` are live ObjC objects owned by this test; `view` outlives `layer`.
     let _: () = unsafe { msg_send![&*layer, setDelegate: &*view] };
     let instance = Gpu::instance();
     let target = wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(Retained::as_ptr(&layer) as *mut std::ffi::c_void);
+    // SAFETY: `layer` is a live `CAMetalLayer` that outlives `surface` in this test.
     let surface = unsafe { instance.create_surface_unsafe(target) }.expect("a Metal layer surface");
     let gpu = match Gpu::try_new(instance, Some(&surface)) {
         Ok(gpu) => gpu,
@@ -47,9 +52,10 @@ fn an_occluded_surface_never_asks_wgpu_and_draws_once_visible() {
     surface.configure(&gpu.device, &config);
 
     OCCLUSION.store(0, Ordering::Relaxed);
+    // SAFETY: `layer` is a live `CAMetalLayer` whose delegate is the live `FakeView` above.
     assert!(unsafe { crate::platform::macos::layer_occluded(&layer) });
     let mut meter = SurfaceMeter::new("occluded", Arc::default());
-    let start = Instant::now();
+    let start = crate::time::now();
     let (mut at, mut backoff, mut checks) = (start, Backoff::default(), 0u64);
     while at < start + Duration::from_secs(3600) {
         if let Ok(_frame) = acquire(&surface, &gpu, &config, true, 1, &mut meter) { panic!("an occluded surface got a drawable"); }
@@ -97,11 +103,15 @@ define_class!(
 /// `PresumeShown` gets it a drawable from wgpu, and puts the layer's own delegate back.
 #[test]
 fn a_presumed_shown_surface_gets_its_first_drawable_while_reported_covered() {
+    // SAFETY: `CoveredView` is a registered `NSObject` subclass; `+new` returns a retained instance.
     let view: Retained<CoveredView> = unsafe { msg_send![CoveredView::class(), new] };
+    // SAFETY: `+[CAMetalLayer new]` allocates and returns a retained `CAMetalLayer`.
     let layer: Retained<AnyObject> = unsafe { msg_send![AnyClass::get(c"CAMetalLayer").expect("QuartzCore"), new] };
+    // SAFETY: `layer` and `view` are live ObjC objects owned by this test; `view` outlives `layer`.
     let _: () = unsafe { msg_send![&*layer, setDelegate: &*view] };
     let instance = Gpu::instance();
     let target = wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(Retained::as_ptr(&layer) as *mut std::ffi::c_void);
+    // SAFETY: `layer` is a live `CAMetalLayer` that outlives `surface` in this test.
     let surface = unsafe { instance.create_surface_unsafe(target) }.expect("a Metal layer surface");
     let gpu = match Gpu::try_new(instance, Some(&surface)) {
         Ok(gpu) => gpu,
@@ -116,14 +126,18 @@ fn a_presumed_shown_surface_gets_its_first_drawable_while_reported_covered() {
 
     let shown = crate::platform::macos::PresumeShown::new(&surface).expect("a Metal surface");
     assert!(!crate::platform::macos::surface_occluded(&surface));
+    // SAFETY: `layer` is a live `CAMetalLayer` while `shown` holds its stand-in delegate alive.
     let stand_in: *const AnyObject = unsafe { msg_send![&*layer, delegate] };
+    // SAFETY: `+[NSNull null]` returns the process-lifetime singleton pointer.
     let null: *const AnyObject = unsafe { msg_send![AnyClass::get(c"NSNull").expect("Foundation"), null] };
+    // SAFETY: `stand_in` is the live `ShownWindow` delegate installed by `PresumeShown::new`.
     let action: *const AnyObject = unsafe { msg_send![stand_in, actionForLayer: &*layer, forKey: std::ptr::null::<AnyObject>()] };
     assert_eq!(action, null, "PresumeShown suppresses implicit Core Animation actions");
     let frame = acquire(&surface, &gpu, &config, true, 1, &mut meter).expect("the first frame's drawable");
     drop(frame);
     drop(shown);
 
+    // SAFETY: `layer` is still alive and `PresumeShown::drop` restored its previous delegate.
     let delegate: *const AnyObject = unsafe { msg_send![&*layer, delegate] };
     assert!(std::ptr::eq(delegate, Retained::as_ptr(&view).cast()), "the layer's delegate is back");
     assert!(crate::platform::macos::surface_occluded(&surface));

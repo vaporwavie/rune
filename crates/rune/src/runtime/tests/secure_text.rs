@@ -683,7 +683,7 @@ fn secure_rich_labels_have_no_links_flights_or_retained_measure_hashes() {
     assert!(!rt.element_is_secure("missing"));
     assert!(!crate::tooling::tree_json(&rt, 0.0).to_string().contains("fictional-"));
     rt.capture_text_flight("secret".into(), "target".into());
-    assert!(rt.motion.flights.is_empty(), "a revealed secret must not survive as flying glyphs");
+    assert!(rt.motion.flights().is_empty(), "a revealed secret must not survive as flying glyphs");
     rt.update(|s, _| *s = false);
     rt.frame(0.0);
     let n = rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some("secret")).unwrap();
@@ -801,4 +801,158 @@ fn hidden_multiline_pristine_composes_with_runtime_and_app_on_change() {
     rt.key(KeyEvent { key: Key::Text("n".into()), mods: Mods::default() });
     rt.frame(0.0);
     assert_eq!(rt.state.secret.text, "n");
+}
+
+#[test]
+fn secure_field_tree_dump_trace_events_and_debug_omit_value_and_length() {
+    use crate::{text_input, Key, KeyEvent, Mods, TextEdit, TextStyle};
+    struct S {
+        single: TextEdit,
+        multi: TextEdit,
+        handled_keys: usize,
+    }
+    fn view(s: &S, _: &mut Cx<S>) -> El {
+        col().size(300.0, 200.0)
+            .child(text_input(&s.single, TextStyle::new(16.0, 400.0)).single_line().key("pw-one").label("Password").w(200.0)
+                .on_edit(|s: &mut S| &mut s.single))
+            .child(text_input(&s.multi, TextStyle::new(16.0, 400.0)).key("pw-multi").label("Recovery key").w(200.0)
+                .on_edit(|s: &mut S| &mut s.multi))
+    }
+    const SECRET_ONE: &str = "hunter2secret"; // 13 bytes
+    const SECRET_TWO: &str = "recovery-key-nineteen"; // 21 bytes
+    let mut single = TextEdit::new(SECRET_ONE).secure();
+    single.focused = true;
+    let multi = TextEdit::new(SECRET_TWO).secure().revealed(true);
+    let mut rt = Runtime::new(S { single, multi, handled_keys: 0 }, view, (300.0, 200.0), Env::new(true, 1.0));
+    rt.on_key = Some(|s, _, _| { s.handled_keys += 1; true });
+    rt.frame(0.0);
+
+    // --tree JSON omits password text, mask dots, caret geometry, and selection/length.
+    let tree = crate::tooling::tree_json(&rt, 0.0);
+    let serialized = tree.to_string();
+    assert!(!serialized.contains(SECRET_ONE) && !serialized.contains(SECRET_TWO), "--tree leaked secret: {serialized}");
+    assert!(!serialized.contains('•'), "--tree leaked mask: {serialized}");
+    for key in ["pw-one", "pw-multi"] {
+        let el = tree["elements"].as_array().unwrap().iter().find(|e| e["key"] == key).unwrap();
+        assert_eq!(el["secure"], true);
+        assert!(el.get("text").is_none(), "{key} leaked text in --tree");
+        assert!(el.get("selection").is_none(), "{key} leaked selection in --tree");
+        assert!(el.get("caret").is_none(), "{key} leaked caret in --tree");
+    }
+    assert!(!tree["accessibility"].to_string().contains("\"selection\""), "--tree accessibility leaked selection");
+
+    // Debug output of TextEdit and node specs redacts both value and byte-length offsets.
+    let dbg_single = format!("{:?}", rt.state.single);
+    let dbg_multi = format!("{:?}", rt.state.multi);
+    assert!(!dbg_single.contains(SECRET_ONE) && !dbg_single.contains("13"), "TextEdit Debug leaked secret or length: {dbg_single}");
+    assert!(!dbg_multi.contains(SECRET_TWO) && !dbg_multi.contains("21"), "TextEdit Debug leaked secret or length: {dbg_multi}");
+
+    // Event log / trace redacts keys handled by app.on_key while a secure field has focus.
+    rt.events.clear();
+    rt.key(KeyEvent { key: Key::Command('k'), mods: Mods { cmd: true, ..Mods::default() } });
+    rt.frame(0.0);
+    assert_eq!(rt.state.handled_keys, 1);
+    assert!(rt.events.iter().any(|e| e == "key [redacted]"), "events: {:?}", rt.events);
+    assert!(rt.events.iter().all(|e| !e.contains("Command('k')")), "events leaked key: {:?}", rt.events);
+}
+
+#[test]
+fn secure_focus_sync_wipes_old_text_on_growth_shrink_and_clear() {
+    use crate::tooling::test_alloc::{ReleaseCheck, watch_release};
+    use crate::{text_input, TextEdit, TextStyle};
+
+    struct Form {
+        pw: TextEdit,
+        view_sec: TextEdit,
+        turned_sec: TextEdit,
+        plain: TextEdit,
+    }
+    fn view(s: &Form, _: &mut Cx<Form>) -> El {
+        let style = TextStyle::new(14.0, 400.0);
+        col().size(300.0, 200.0)
+            .child(text_input(&s.pw, style).single_line().key("pw").label("Password").size(200.0, 32.0).on_edit(|s: &mut Form| &mut s.pw))
+            .child(text_input(&s.view_sec, style).single_line().secure().key("view-sec").label("View secret").size(200.0, 32.0).on_edit(|s: &mut Form| &mut s.view_sec))
+            .child(text_input(&s.turned_sec, style).single_line().key("turned-sec").label("Turned secret").size(200.0, 32.0).on_edit(|s: &mut Form| &mut s.turned_sec))
+            .child(text_input(&s.plain, style).single_line().key("plain").label("Plain").size(200.0, 32.0).on_edit(|s: &mut Form| &mut s.plain))
+    }
+    let mut rt = Runtime::new(
+        Form {
+            pw: TextEdit::new("old-secret-value").secure(),
+            view_sec: TextEdit::new("view-marked-secret"),
+            turned_sec: TextEdit::new("turned-secure-secret"),
+            plain: TextEdit::new("plain-draft-buffer-reused"),
+        },
+        view,
+        (300.0, 200.0),
+        Env::new(true, 1.0),
+    );
+    rt.frame(0.0);
+
+    let path_of = |rt: &Runtime<Form>, key: &str| {
+        rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some(key)).unwrap().path.clone()
+    };
+    fn text_of<'a>(rt: &'a Runtime<Form>, key: &str) -> &'a String {
+        &rt.tree.nodes.iter().find(|n| n.key.as_deref() == Some(key)).unwrap().input.as_ref().unwrap().edit.text
+    }
+
+    let pw_path = path_of(&rt, "pw");
+    let view_sec_path = path_of(&rt, "view-sec");
+    let turned_sec_path = path_of(&rt, "turned-sec");
+    let plain_path = path_of(&rt, "plain");
+
+    // 1. Growing a secure field past its copy's capacity must wipe the old buffer before release.
+    rt.set_focus(Some(pw_path.clone()), true);
+    let (old_ptr, old_len) = {
+        let t = text_of(&rt, "pw");
+        (t.as_ptr(), t.len())
+    };
+    rt.state.pw.replace_text("a-much-longer-replacement-secret-beyond-old-capacity");
+    let (_, check) = watch_release(old_ptr, old_len, || rt.set_focus(None, false));
+    assert_eq!(check, ReleaseCheck::Zeroed, "growing secure field must wipe old buffer before release");
+    assert_eq!(text_of(&rt, "pw"), "a-much-longer-replacement-secret-beyond-old-capacity");
+
+    // 2. Shrinking a secure field must wipe and drop the old buffer rather than leaving tail bytes in spare capacity.
+    let (old_ptr, old_len) = {
+        let t = text_of(&rt, "pw");
+        (t.as_ptr(), t.len())
+    };
+    rt.state.pw.replace_text("tiny");
+    let (_, check) = watch_release(old_ptr, old_len, || rt.set_focus(Some(pw_path.clone()), true));
+    assert_eq!(check, ReleaseCheck::Zeroed, "shrinking secure field must wipe old buffer");
+    assert_eq!((text_of(&rt, "pw").as_str(), text_of(&rt, "pw").capacity()), ("tiny", 4));
+
+    // 3. Clearing a secure field (e.g. after sign-in) must wipe and free the old buffer.
+    let (old_ptr, old_len) = {
+        let t = text_of(&rt, "pw");
+        (t.as_ptr(), t.len())
+    };
+    rt.state.pw.clear();
+    let (_, check) = watch_release(old_ptr, old_len, || rt.set_focus(None, false));
+    assert_eq!(check, ReleaseCheck::Zeroed, "clearing secure field must wipe old buffer");
+    assert_eq!((text_of(&rt, "pw").as_str(), text_of(&rt, "pw").capacity()), ("", 0));
+
+    // 4. A field marked secure on the view element also wipes its old copy on refresh.
+    let (old_ptr, old_len) = {
+        let t = text_of(&rt, "view-sec");
+        (t.as_ptr(), t.len())
+    };
+    rt.state.view_sec.clear();
+    let (_, check) = watch_release(old_ptr, old_len, || rt.set_focus(Some(view_sec_path), true));
+    assert_eq!(check, ReleaseCheck::Zeroed, "view-marked secure field must wipe old buffer on clear");
+
+    // 5. A field whose app-owned model turned secure before sync also wipes its old copy.
+    let (old_ptr, old_len) = {
+        let t = text_of(&rt, "turned-sec");
+        (t.as_ptr(), t.len())
+    };
+    rt.state.turned_sec.set_secure(true);
+    rt.state.turned_sec.clear();
+    let (_, check) = watch_release(old_ptr, old_len, || rt.set_focus(Some(turned_sec_path), true));
+    assert_eq!(check, ReleaseCheck::Zeroed, "field turned secure on model must wipe old buffer");
+
+    // 6. Plain (non-secure) fields still reuse their buffer without reallocating when shrinking.
+    let old_ptr = text_of(&rt, "plain").as_ptr();
+    rt.state.plain.replace_text("plain");
+    rt.set_focus(Some(plain_path), true);
+    assert_eq!(text_of(&rt, "plain").as_ptr(), old_ptr, "plain field should keep reusing its buffer");
 }

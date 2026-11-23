@@ -13,6 +13,8 @@ pub struct Gpu {
     /// Windows' Modern Standby) can't configure a surface, and wgpu drops that error, so nothing
     /// else would report it. See `is_lost`.
     pub(super) lost: Arc<AtomicBool>,
+    /// D3D12 removes a device before wgpu hears of it (`Gpu::is_lost`).
+    pub(super) removal: rune_gpu::health::Removal,
 }
 
 /// The most views and buffers a device binds at once (`Limits::max_non_sampler_bindings`).
@@ -55,7 +57,11 @@ impl Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     fn try_picked(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, translucent: bool, presented: bool) -> Result<Gpu, String> {
         let _serial = GPU_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        // D3D12 keeps one device per adapter in a process: while a removed one is still held, a
+        // new device on that adapter is the removed one again.
+        crate::native_surface::release_removed_device();
         let pick = crate::gpu::pick::pick(&instance, surface, presented)?;
+        let named = pick.reason == crate::gpu::pick::Reason::EnvName;
         crate::marks::mark("gpu.adapter");
         if !crate::marks::noted("adapter") { crate::marks::note("adapter", Box::leak(pick.adapter.get_info().name.into_boxed_str())); }
         let adapter = match surface {
@@ -68,6 +74,8 @@ impl Gpu {
                 crate::native_surface::note_device(&device, surface.is_some() || presented);
                 Ok(Gpu::made(instance, adapter, device, queue, surface.is_some() || presented))
             }
+            // A named adapter (`WGPU_ADAPTER_NAME`) never falls through to another GPU.
+            Err(error) if named => Err(error),
             // A driver that can't make a device (a broken integrated GPU on a hybrid laptop)
             // leaves the window to the next adapter that presents to its surface.
             Err(error) => {
@@ -232,9 +240,29 @@ impl Gpu {
     }
 
     fn new_wgpu_instance(backends: wgpu::Backends) -> wgpu::Instance {
+        #[cfg(target_os = "linux")]
+        {
+            Self::select_wgpu_instance(
+                |allow_noncompliant| wgpu::Instance::new(Self::instance_descriptor(backends, allow_noncompliant)),
+                |instance| !pollster::block_on(instance.enumerate_adapters(backends)).is_empty(),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            wgpu::Instance::new(Self::instance_descriptor(backends, false))
+        }
+    }
+
+    /// Builds a `wgpu::InstanceDescriptor` for `backends`. When `allow_noncompliant` is true,
+    /// `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` is set so Vulkan drivers reporting conformance
+    /// version `0.0.0.0` (such as Mesa Honeykrisp/Aurora on Apple silicon Linux) are enumerated.
+    fn instance_descriptor(backends: wgpu::Backends, allow_noncompliant: bool) -> wgpu::InstanceDescriptor {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends;
         descriptor.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        if allow_noncompliant {
+            descriptor.flags.insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
+        }
         // An HWND's DXGI swapchain is opaque only; DirectComposition composites alpha on every GPU.
         descriptor.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
         // A window waits for room in its swap chain itself, in the loop rather than in
@@ -244,7 +272,27 @@ impl Gpu {
         // dxcompiler.dll on PATH, where another app's incompatible copy crashes the first
         // shader compile (Hex #587).
         descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
-        wgpu::Instance::new(descriptor)
+        descriptor
+    }
+
+    /// Builds a conformant-only instance first and returns it whenever it sees at least one
+    /// adapter, so machines with a conformant adapter never expose non-conformant drivers. Only
+    /// when the conformant instance finds no adapters at all does it retry with
+    /// `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` (Apple silicon Linux Asahi/Aurora Honeykrisp).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn select_wgpu_instance<I>(
+        mut build: impl FnMut(bool) -> I,
+        mut has_adapters: impl FnMut(&I) -> bool,
+    ) -> I {
+        let compliant = build(false);
+        if has_adapters(&compliant) {
+            return compliant;
+        }
+        let noncompliant = build(true);
+        if has_adapters(&noncompliant) {
+            return noncompliant;
+        }
+        compliant
     }
 
     /// The GPU for a window's first surface, which `surface` makes from the instance:
@@ -371,3 +419,7 @@ fn report_gpu_allocations(device: wgpu::Device) {
         out
     });
 }
+
+#[cfg(test)]
+#[path = "device_tests.rs"]
+mod tests;

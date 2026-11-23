@@ -9,11 +9,13 @@ fn prewarm_gpu_on_chooses_before_it_starts() {
 
 /// `prewarm_gpu` and how a window picks it up, on a bare Metal layer (no window server needed).
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod macos {
     use super::super::{Gpu, Renderer};
-    use objc2_video::{rc::Retained, runtime::{AnyClass, AnyObject}, msg_send};
+    use objc2::{rc::Retained, runtime::{AnyClass, AnyObject}, msg_send};
 
     fn layer() -> Retained<AnyObject> {
+        // SAFETY: `+[CAMetalLayer new]` allocates and returns a retained `CAMetalLayer`.
         unsafe { msg_send![AnyClass::get(c"CAMetalLayer").expect("QuartzCore"), new] }
     }
 

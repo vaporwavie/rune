@@ -75,9 +75,15 @@ enum Wake {
     Start,
     /// The GPU came, or couldn't.
     Ready,
-    /// Time to see whether the page is quiet enough to start the GPU (`Browser::maybe_start_gpu`).
-    StartGpu,
+    /// Time to see whether the page is quiet enough to start the GPU (`Browser::gpu_startup_due`).
+    StartGpu(crate::machine::Attempt),
+    /// A CPU-first WebGPU probe failed; defer WebGL2 fallback until quiet or stay on CPU.
+    WebGpuFailed,
     App,
+    /// A live value published: asks for a frame only while one is still pending.
+    Live,
+    /// A resize reconfigured the canvas, which clears it: draw now, before the browser paints.
+    ResizeRedraw,
 }
 
 /// How a page's frames start: on the CPU until WebGPU takes over (a full-window app, the
@@ -115,7 +121,7 @@ fn text_probe() {
     let lines = wasm_bindgen::closure::Closure::<dyn Fn(String, f32, f32, f32) -> Vec<u32>>::new(|text: String, size: f32, weight: f32, width: f32| {
         crate::text::line_starts(&text, size, weight, width).into_iter().map(|b| text[..b].encode_utf16().count() as u32).collect::<Vec<u32>>()
     });
-    let _ = js_sys::Reflect::set(&global, &"__runeLines".into(), lines.as_ref());
+    js_sys::Reflect::set(&global, &"__runeLines".into(), lines.as_ref()).ok();
     lines.forget();
 }
 
@@ -131,11 +137,13 @@ fn spawn(mut app: PendingApp) -> Result<(), String> {
     let proxy = event_loop.create_proxy();
     let shared = app.shared.clone();
     let wake = proxy.clone();
-    shared.connect(Arc::new(move || { let _ = wake.send_event(Wake::App); }));
+    shared.connect(Arc::new(move || { wake.send_event(Wake::App).ok(); }));
     page::occupy(quitting(&shared), app.same_tab_router.take());
-    event_loop.spawn_app(Browser { app: Some(app), shared, proxy, window: None, embedded: false, document: false, owns_canvas: true,
+    let resize_redraw = frame::ResizeRedraw::new(proxy.clone());
+    event_loop.spawn_app(Browser { app: Some(app), shared, proxy, resize_redraw, window: None, embedded: false, document: false, owns_canvas: true,
         borrowed: page::Borrowed::default(), start: Start::GpuFirst, fonts: Rc::default(), pending: Rc::default(), warmed: Rc::default(), running: Rc::default(),
-        lost: Rc::default(), webgl_watch: None, webgl_restored: Rc::default(), webgl_restoring: false, waiting: None, first_at: None, drawn_at: None, gpu_asked: false });
+        lost: Rc::default(), webgl_watch: None, webgl_restored: Rc::default(), webgl_restoring: false, waiting: None,
+        gpu_startup: (crate::machine::Seq::default(), web_math::GpuStartup::default()), webgpu_err: Rc::default() });
     Ok(())
 }
 
@@ -150,6 +158,7 @@ struct Browser {
     app: Option<PendingApp>,
     shared: Arc<SharedCore>,
     proxy: EventLoopProxy<Wake>,
+    resize_redraw: frame::ResizeRedraw,
     window: Option<Arc<Window>>,
     /// Inline in the page at its parent's width, rather than covering the viewport.
     embedded: bool,
@@ -178,12 +187,11 @@ struct Browser {
     /// browser task for each new control flow and aborts the last one's, so the same deadline
     /// isn't set again.
     waiting: Option<u64>,
-    /// For a page that starts on the CPU: when its first frame was presented, when it last drew
-    /// one that changed more than an ambient loop (a spinner's step), and whether the GPU was
-    /// asked for.
-    first_at: Option<Instant>,
-    drawn_at: Option<Instant>,
-    gpu_asked: bool,
+    /// For a page that starts on the CPU: schedules the early WebGPU probe and gates
+    /// synchronous GPU / WebGL2 setup on a quiet window after non-ambient draws.
+    gpu_startup: (crate::machine::Seq, web_math::GpuStartup),
+    /// Error from a failed CPU-first WebGPU probe, kept for the combined error if WebGL2 fails too.
+    webgpu_err: Rc<RefCell<Option<String>>>,
 }
 
 struct Running {
@@ -199,6 +207,9 @@ struct Running {
     document: bool,
     /// The first frame is on screen.
     presented: bool,
+    /// What the GPU canvas currently shows, while nothing has invalidated it. A requested frame
+    /// that would draw these same pixels skips acquiring a canvas texture and presenting.
+    last_presented: Option<crate::window::Presented>,
     /// `App::on_ready`, which runs once that first frame is presented, as a window's does.
     on_ready: Option<crate::app::OnWindow>,
     /// `App::font_url_later`'s fonts, fetched once that first frame is presented.
@@ -238,13 +249,13 @@ fn error(message: &str, target: Option<&web_sys::HtmlCanvasElement>, embedded: b
     if let Ok(label) = doc.create_element("pre") {
         label.set_text_content(Some(message));
         if embedded && let Some(canvas) = target && let Some(parent) = canvas.parent_element() {
-            let _ = label.set_attribute("style", "margin:0;padding:16px;white-space:pre-wrap;background:Canvas;color:CanvasText;border:1px solid #444;border-radius:8px");
-            let _ = parent.insert_before(&label, Some(canvas));
+            label.set_attribute("style", "margin:0;padding:16px;white-space:pre-wrap;background:Canvas;color:CanvasText;border:1px solid #444;border-radius:8px").ok();
+            parent.insert_before(&label, Some(canvas)).ok();
             return;
         }
         if let Some(body) = doc.body() {
-            let _ = label.set_attribute("style", "position:fixed;inset:0;z-index:1;padding:24px;white-space:pre-wrap;background:Canvas;color:CanvasText");
-            let _ = body.append_child(&label);
+            label.set_attribute("style", "position:fixed;inset:0;z-index:1;padding:24px;white-space:pre-wrap;background:Canvas;color:CanvasText").ok();
+            body.append_child(&label).ok();
         }
     }
 }
@@ -304,12 +315,15 @@ impl Browser {
         let mut size = winit::dpi::PhysicalSize::new(fixed.0, fixed.1);
         let dark = web_sys::window().and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten()).is_some_and(|q| q.matches());
         let proxy = self.proxy.clone();
-        let wake: crate::Waker = Arc::new(move || { let _ = proxy.send_event(Wake::App); });
+        let wake: crate::Waker = Arc::new(move || { proxy.send_event(Wake::App).ok(); });
+        let live_proxy = self.proxy.clone();
+        let live_wake: crate::Waker = Arc::new(move || { live_proxy.send_event(Wake::Live).ok(); });
         let app::StartedWebApp { mut app, menus, shortcuts, fonts: spec_fonts } = pending.start(
             fonts,
             (size.width as f32 / scale, size.height as f32 / scale),
             Env::new(dark, scale),
             wake.clone(),
+            live_wake,
         );
         // A page brings its own fonts for its mirror; an app's are the page's (`page_fonts`).
         let page_fonts = if document { &[][..] } else { spec_fonts };
@@ -329,7 +343,7 @@ impl Browser {
             app.rt_mut().set_viewport((w, h), scale);
             size.height = (h * scale).round().max(1.0) as u32;
             if let Some(canvas) = window.canvas() {
-                let _ = canvas.style().set_property("height", &format!("{h}px"));
+                canvas.style().set_property("height", &format!("{h}px")).ok();
             }
         }
         let now = Instant::now();
@@ -338,7 +352,7 @@ impl Browser {
             rt.set_os_drag(false);
             rt.wall_start = Some(now);
             rt.host.open_urls_natively = true;
-            rt.frame.record_events = false;
+            rt.frame.set_record_events(false);
         }
         let mut clipboard = crate::clipboard::Client::default();
         clipboard.connect(wake);
@@ -373,7 +387,7 @@ impl Browser {
             input::Mode { embedded: self.embedded, fit_height, document });
         *self.running.borrow_mut() = Some(Running { draw, app, shared: self.shared.clone(), input, clipboard,
             clock: crate::frame::clock::FrameClock::new(now), suspended: false, full_redraw: true, embedded: self.embedded,
-            document, presented: false, band: None, size: physical, on_ready, late_fonts, fonts: page_fonts,
+            document, presented: false, last_presented: None, band: None, size: physical, on_ready, late_fonts, fonts: page_fonts,
             cursor, _menus: menus, shortcuts });
         crate::marks::mark("web.started");
         window.request_redraw();
@@ -420,19 +434,19 @@ impl ApplicationHandler<Wake> for Browser {
         };
         let canvas = window.canvas().expect("winit web canvas");
         if !canvas.has_attribute("tabindex") {
-            let _ = canvas.set_attribute("tabindex", "0");
+            canvas.set_attribute("tabindex", "0").ok();
         }
         if self.document {
             // The browser scrolls the page over a canvas that is part of the document, not fixed
             // to the screen: the compositor moves the pixels Rune drew at the display's own rate,
             // and a frame is only drawn when the window nears the band's edge. Rune puts it in a
             // clipper as tall as the page (the bridge) and translates it to `page.top`.
-            let _ = canvas.set_attribute("tabindex", "-1");
+            canvas.set_attribute("tabindex", "-1").ok();
             canvas.style().set_css_text("position:absolute;left:0;top:0;width:100%;display:block;transform:translate3d(0,0,0);will-change:transform;pointer-events:auto;touch-action:pan-y pinch-zoom;outline:none;user-select:none;-webkit-user-select:none");
             if let Some(document) = web_sys::window().and_then(|w| w.document()) {
                 self.borrowed.viewport(&document);
                 document.set_title(app.title);
-                if let Some(body) = document.body() { let _ = body.style().set_property("margin", "0"); }
+                if let Some(body) = document.body() { body.style().set_property("margin", "0").ok(); }
             }
         } else if self.embedded {
             let touch = if app.fit_height { "pan-y" } else { "none" };
@@ -448,7 +462,7 @@ impl ApplicationHandler<Wake> for Browser {
                 if let Some(body) = document.body() {
                     let style = body.style();
                     for (name, value) in [("margin", "0"), ("overflow", "hidden"), ("overscroll-behavior", "none")] {
-                        let _ = style.set_property(name, value);
+                        style.set_property(name, value).ok();
                     }
                 }
             }
@@ -466,7 +480,7 @@ impl ApplicationHandler<Wake> for Browser {
         } else {
             Start::CpuFirst
         };
-        if self.start != Start::GpuFirst { let _ = canvas.style().set_property("opacity", "0"); }
+        if self.start != Start::GpuFirst { canvas.style().set_property("opacity", "0").ok(); }
         // The fonts download while the GPU starts; the CPU's first frame needs only them.
         let fonts: Vec<_> = app.font_urls.iter().map(|url| (url.clone(), platform::fetch_bytes(url))).collect();
         self.window = Some(window);
@@ -480,11 +494,11 @@ impl ApplicationHandler<Wake> for Browser {
                 }
             }
             *slot.borrow_mut() = Some(loaded);
-            let _ = proxy.send_event(Wake::Start);
+            proxy.send_event(Wake::Start).ok();
         });
-        // A page that starts on the CPU asks for the GPU once its first frames are up and it's
-        // quiet (`maybe_start_gpu`): asked at once, the browser's GPU process makes the adapter
-        // and compiles the renderer's pipelines while the first frame waits on it to show.
+        // A page that starts on the CPU asks for the GPU once its first frame is presented
+        // (`gpu_startup`): asked at once, the browser's GPU process makes the adapter and
+        // compiles the renderer's pipelines while the first frame waits on it to show.
         if self.start == Start::GpuFirst { self.ask_gpu(); }
     }
 
@@ -498,8 +512,20 @@ impl ApplicationHandler<Wake> for Browser {
                 self.start_app(event_loop);
                 self.gpu_came();
             }
-            Wake::StartGpu => self.maybe_start_gpu(),
+            Wake::StartGpu(attempt) => { self.gpu_startup_due(attempt); return; }
+            Wake::WebGpuFailed => { self.webgpu_probe_failed(); return; }
             Wake::App => self.hand_over_if_done(),
+            Wake::Live => {
+                if let Some(r) = &mut *self.running.borrow_mut() && r.app.rt().live_pending() {
+                    r.full_redraw = true;
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                }
+                return;
+            }
+            Wake::ResizeRedraw => {
+                if self.resize_redraw.fired() { self.redraw(event_loop); }
+                return;
+            }
         }
         let Some(window) = self.window.as_ref() else { return };
         if let Some(r) = &mut *self.running.borrow_mut() {
@@ -525,18 +551,23 @@ impl ApplicationHandler<Wake> for Browser {
         let mut running = self.running.borrow_mut();
         let (Some(window), Some(r)) = (&self.window, &mut *running) else { return };
         let _input = crate::input::time::arrived(&event);
-        r.full_redraw = true;
-        if r.window_input(&event, window) { window.request_redraw(); return; }
+        if r.window_input(&event, window) { r.full_redraw = true; window.request_redraw(); return; }
         match event {
+            // Reconfiguring the surface clears the canvas. These arrive from winit's
+            // ResizeObserver, after this frame's rAF and before it paints, so a requested redraw
+            // would land a frame late over a blank canvas. winit holds its canvas borrowed while
+            // it delivers them, so the frame is drawn in the microtask right after.
             WindowEvent::Resized(size) => {
+                r.full_redraw = true;
                 r.resize_surface(window, size, window.scale_factor() as f32);
-                window.request_redraw();
+                self.resize_redraw.resized();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                r.full_redraw = true;
                 r.resize_surface(window, window.inner_size(), scale_factor as f32);
-                window.request_redraw();
+                self.resize_redraw.resized();
             }
-            WindowEvent::ThemeChanged(theme) => { r.app.rt_mut().set_system_dark(theme == winit::window::Theme::Dark); window.request_redraw(); }
+            WindowEvent::ThemeChanged(theme) => { r.full_redraw = true; r.app.rt_mut().set_system_dark(theme == winit::window::Theme::Dark); window.request_redraw(); }
             _ => {}
         }
     }
@@ -589,6 +620,25 @@ impl ApplicationHandler<Wake> for Browser {
 fn after(delay: Duration, f: impl FnOnce() + 'static) {
     let callback = wasm_bindgen::closure::Closure::once_into_js(f);
     if let Some(window) = web_sys::window() {
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), delay.as_millis().min(i32::MAX as u128) as i32);
+        window.set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), delay.as_millis().min(i32::MAX as u128) as i32).ok();
     }
+}
+
+/// Yields one browser macrotask (`setTimeout(0)`), letting the browser paint and handle input
+/// before the next synchronous step runs.
+async fn yield_turn() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let Some(window) = web_sys::window() else {
+            resolve.call0(&wasm_bindgen::JsValue::UNDEFINED).ok();
+            return;
+        };
+        let done = resolve.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+            done.call0(&wasm_bindgen::JsValue::UNDEFINED).ok();
+        });
+        if window.set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0).is_err() {
+            resolve.call0(&wasm_bindgen::JsValue::UNDEFINED).ok();
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }

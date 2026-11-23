@@ -3,6 +3,8 @@
 //! first lays its props over it (`ui.icon("copy", STYLE, { color = ink })`). The standard layout
 //! props (`w`, `pad`, `key`, `label`, ...) apply after the app's build, except the ones it read.
 
+#![allow(unsafe_code)]
+
 use std::cell::Cell;
 use std::os::raw::c_int;
 use std::rc::Rc;
@@ -24,11 +26,23 @@ type BuildNode = dyn Fn(&mut NodeArgs) -> Result<El, String>;
 pub struct HostNode {
     pub(crate) name: String,
     pub(crate) build: Rc<BuildNode>,
+    /// The props the node has ([`HostNode::props`]): a key that is neither one of them nor a
+    /// standard prop is unknown ([`super::unknown_prop`]).
+    known: Option<Rc<dyn Fn(&str) -> bool>>,
 }
 
 impl HostNode {
     pub fn new(name: impl Into<String>, build: impl Fn(&mut NodeArgs) -> Result<El, String> + 'static) -> Self {
-        HostNode { name: name.into(), build: Rc::new(build) }
+        HostNode { name: name.into(), build: Rc::new(build), known: None }
+    }
+
+    /// The props the node has, as its contract lists them. With it, a script's prop that is
+    /// neither one of these nor a standard prop is an error in debug builds and a warning (once
+    /// per script) in release, instead of being dropped without a word. Without it the node's
+    /// unknown props go unreported, as a prop its build reads only sometimes can't be told apart.
+    pub fn props(mut self, known: impl Fn(&str) -> bool + 'static) -> Self {
+        self.known = Some(Rc::new(known));
+        self
     }
 }
 
@@ -87,6 +101,13 @@ impl Press {
         let mut el = el;
         (self.attach.press)(&mut el, self.cb.clone(), self.key.clone(), fields.into());
         el
+    }
+
+    /// Runs the function now, as a `press` of the node with `fields` added to its event: for
+    /// input the host node takes itself, such as a key its element handles (`El::on_key`), where
+    /// there is no press to attach to.
+    pub fn run<S: 'static>(&self, s: &mut S, tx: &mut rune::Tx, fields: Vec<(&'static str, Data)>) {
+        super::run_press(s, tx, &self.cb, self.key.as_deref(), &fields.into());
     }
 }
 
@@ -245,12 +266,12 @@ pub(crate) unsafe extern "C-unwind" fn ui_host(state: *mut ffi::lua_State) -> c_
             let node = top(|frame| frame.env.nodes.get(index).cloned()).flatten().ok_or("unknown host node")?;
             let el = (node.build)(&mut args).map_err(|e| format!("ui.{}: {e}", node.name))?;
             // Standard layout props still apply, after the host's own.
-            build_from(state, el, [props_at, over_at], &args)
+            build_from(state, el, [props_at, over_at], &args, &node)
         })
     }
 }
 
-unsafe fn build_from(state: *mut ffi::lua_State, el: El, tables: [c_int; 2], args: &NodeArgs) -> Result<c_int, String> {
+unsafe fn build_from(state: *mut ffi::lua_State, el: El, tables: [c_int; 2], args: &NodeArgs, node: &HostNode) -> Result<c_int, String> {
     top(|frame| {
         let Frame { arena, attach, env } = frame;
         let slot = arena.alloc(el)?;
@@ -264,10 +285,24 @@ unsafe fn build_from(state: *mut ffi::lua_State, el: El, tables: [c_int; 2], arg
                     iter = ffi::lua_rawiter(state, props_at, iter);
                     iter >= 0
                 } {
-                    let own = matches!(props::read(state, -2), Value::Str(k) if args.read().any(|u| u == k));
+                    let key = match props::read(state, -2) {
+                        Value::Str(k) => Some(k),
+                        _ => None,
+                    };
+                    let own = key.is_some_and(|k| args.read().any(|u| u == k));
+                    // Neither read by the build nor in the node's listed props.
+                    let unknown = |name: &str| !own && node.known.as_ref().is_some_and(|known| !known(name));
                     match props::key_atom(state, -2) {
-                        Ok(Atom::OnPress | Atom::OnHover | Atom::OnMiddlePress) => {}
+                        // The build attaches the handlers it takes; one it didn't read is unknown.
+                        Ok(Atom::OnPress | Atom::OnHover | Atom::OnMiddlePress) => {
+                            if let Some(k) = key
+                                && unknown(k)
+                            {
+                                super::unknown_prop(env, Some(&node.name), k)?;
+                            }
+                        }
                         Ok(atom) if !own => p.decode_at(el, state, atom, -1, env, false)?,
+                        Err(name) if unknown(name) => super::unknown_prop(env, Some(&node.name), name)?,
                         _ => {}
                     }
                     ffi::lua_settop(state, -3);
@@ -312,3 +347,7 @@ unsafe fn host_props(state: *mut ffi::lua_State, idx: c_int, frame: &Frame) -> R
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

@@ -34,35 +34,31 @@ struct ListPlan {
     built_rows: Vec<(usize, El)>,
 }
 
-impl RuntimeCore {
+impl CommitState {
     /// Whether a commit that resized nothing and changed nothing the view reads
     /// ([`Runtime::commit_kind`]) only shifts or fills `virtual_rows` windows, so `view` and
     /// already mounted subtrees need not rebuild.
-    pub(in crate::runtime) fn virtual_only(&self) -> bool {
-        #[cfg(feature = "hot")]
-        if self.frame.hot.is_some() {
+    pub(in crate::runtime) fn virtual_only(&self, tree: &types::TreeState, hot: bool, checking_live_only: bool) -> bool {
+        if hot || checking_live_only || self.virtuals.is_empty() || tree.nodes.is_empty() {
             return false;
         }
-        if self.checking_live_only() || self.commit.virtuals.is_empty() || self.tree.nodes.is_empty() {
-            return false;
-        }
-        if !self.tree.nodes.iter().all(|n| {
-            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted && t.cold.live.is_none())
+        if !tree.nodes.iter().all(|n| {
+            relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted)
         }) {
             return false;
         }
-        for (path, v) in &self.commit.virtuals {
+        for (path, v) in &self.virtuals {
             if !v.indexed || !v.selection.pins.source().and_then(|s| s.rebuild()).is_some_and(|s| s.count == v.keys.len()) {
                 return false;
             }
-            let Some(&list_id) = self.tree.path_ids.get(path) else { return false };
-            let Some(&list_idx) = self.tree.node_index.get(&list_id) else { return false };
-            if !self.tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.growth.is_some()) {
+            let Some(&list_id) = tree.path_ids.get(path) else { return false };
+            let Some(&list_idx) = tree.node_index.get(&list_id) else { return false };
+            if !tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.virtual_list && n.growth.is_some()) {
                 return false;
             }
-            let Some(&scroll_id) = self.tree.path_ids.get(&v.scroll_path) else { return false };
-            let Some(&scroll_idx) = self.tree.node_index.get(&scroll_id) else { return false };
-            if !self.tree.nodes.get(scroll_idx).is_some_and(|n| {
+            let Some(&scroll_id) = tree.path_ids.get(&v.scroll_path) else { return false };
+            let Some(&scroll_idx) = tree.node_index.get(&scroll_id) else { return false };
+            if !tree.nodes.get(scroll_idx).is_some_and(|n| {
                 n.id == scroll_id
                     && n.path == v.scroll_path
                     && n.scroll.is_some()
@@ -71,7 +67,7 @@ impl RuntimeCore {
             }) {
                 return false;
             }
-            if self.commit.virtuals.keys().any(|other| {
+            if self.virtuals.keys().any(|other| {
                 other != path && other.strip_prefix(path.as_str()).is_some_and(|r| r.starts_with('/'))
             }) {
                 return false;
@@ -147,7 +143,7 @@ fn build_indexed_row(
 }
 
 impl Measurement<'_> {
-    pub(in crate::runtime) fn remount_virtuals(mut self) -> RemountOutcome {
+    pub(in crate::runtime) fn remount_virtuals(mut self, text: &mut TextSystem) -> RemountOutcome {
         self.virtual_culled.clear();
         self.virtual_inputs.clear();
 
@@ -190,12 +186,12 @@ impl Measurement<'_> {
             let delta = v.anchor_delta();
             offset = (offset + delta).max(0.0);
             if let Some(st) = self.scrolls.get_mut(&scroll_id) && !held {
-                st.offset = (st.offset + f64::from(delta)).max(0.0);
+                st.shift_anchor(delta);
             }
             let shown = std::mem::take(&mut v.shown);
             v.select(offset, pinned, Some(&shown));
             for key in shown.iter().filter(|k| v.index_of(k).is_some_and(|i| !v.range.contains(&i))) {
-                self.virtual_culled.insert(format!("{path}/{key}"));
+                self.virtual_culled.insert(node_path(path, Some(key), 0));
             }
             v.shown = shown;
 
@@ -424,6 +420,7 @@ impl Measurement<'_> {
                             path_ids: &mut *self.path_ids,
                             next_id: &mut *self.next_id,
                             foreground: self.defaults.foreground,
+                            missed_virtual_memo: false,
                         };
                         let (kid_slot, kid_dirty) = flatten_with_buf(
                             row_el,
@@ -515,7 +512,7 @@ impl Measurement<'_> {
         self.memo.path_scratch = path_buf;
         taffy.finish_flatten();
         let root_id = nodes[0].taffy;
-        let (layout, mut nodes) = self.solve(taffy, root_id, nodes);
+        let (layout, mut nodes) = self.solve(text, taffy, root_id, nodes);
         if self.measure_virtuals(&nodes, false) {
             memo_reuse::restore_moved_nodes(self.nodes, &mut nodes, &reused, &[]);
             nodes.clear();
@@ -551,6 +548,7 @@ impl<S: 'static> Runtime<S> {
     /// the fallback left in the lists before the full rebuild that follows it fills them again.
     pub(in crate::runtime) fn remount_falls_back(&mut self) -> bool {
         let (core, app) = self.split_mut();
-        matches!(core.measurement(&app, true).remount_virtuals(), RemountOutcome::Fallback)
+        let (m, text) = core.measurement(&app, true);
+        matches!(m.remount_virtuals(text), RemountOutcome::Fallback)
     }
 }

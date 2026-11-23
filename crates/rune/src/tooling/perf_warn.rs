@@ -49,7 +49,22 @@ const OVERBUILD_RATIO: usize = 4;
 #[cfg(debug_assertions)]
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("RUNE_PERF_WARN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| rune_core::env::var_os("RUNE_PERF_WARN").is_none_or(|v| v != "0"))
+}
+
+/// Initializes the cached `RUNE_PERF_WARN` flag up front so the first timed callback does not
+/// heap-allocate while reading the environment variable, and starts Windows' thread cycle-rate
+/// calibration early without waiting.
+#[inline(always)]
+pub(crate) fn warm() {
+    #[cfg(debug_assertions)]
+    {
+        let _ = enabled();
+        #[cfg(windows)]
+        if enabled() {
+            let _ = crate::frame::host_clock::cycles_per_ns();
+        }
+    }
 }
 
 /// Prints `message` the first time `site` warns.
@@ -81,6 +96,65 @@ thread_local! {
 #[cfg(all(test, debug_assertions))]
 pub(crate) fn take_log() -> Vec<String> { LOG.take() }
 
+#[cfg(all(test, debug_assertions))]
+#[derive(Clone, Copy)]
+struct FakeSample {
+    wall_ms: f64,
+    cpu_ms: Option<f64>,
+    wait_ms: Option<f64>,
+}
+
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    static FAKE_STALL: std::cell::Cell<Option<FakeSample>> = const { std::cell::Cell::new(None) };
+}
+
+/// Replaces `Stall`'s wall, CPU and run-queue readings on this thread with synthetic counters
+/// until dropped, so tests do not depend on OS scheduling or host load.
+#[cfg(all(test, debug_assertions))]
+pub(super) struct FakeStallClock {
+    previous: Option<FakeSample>,
+}
+
+#[cfg(all(test, debug_assertions))]
+impl FakeStallClock {
+    pub(super) fn new() -> Self {
+        let previous = FAKE_STALL.replace(Some(FakeSample { wall_ms: 0.0, cpu_ms: Some(0.0), wait_ms: Some(0.0) }));
+        Self { previous }
+    }
+
+    pub(super) fn advance(wall_ms: f64, cpu_ms: f64, wait_ms: Option<f64>) {
+        FAKE_STALL.with(|cell| {
+            if let Some(mut sample) = cell.get() {
+                sample.wall_ms += wall_ms;
+                sample.cpu_ms = sample.cpu_ms.map(|a| a + cpu_ms);
+                sample.wait_ms = match (sample.wait_ms, wait_ms) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
+                cell.set(Some(sample));
+            }
+        });
+    }
+
+    pub(super) fn advance_without_cpu(wall_ms: f64) {
+        FAKE_STALL.with(|cell| {
+            if let Some(mut sample) = cell.get() {
+                sample.wall_ms += wall_ms;
+                sample.cpu_ms = None;
+                cell.set(Some(sample));
+            }
+        });
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+impl Drop for FakeStallClock {
+    fn drop(&mut self) {
+        FAKE_STALL.set(self.previous);
+    }
+}
+
 /// A `virtualize` list at `path`, set up at `site`, was handed `built` rows and mounts
 /// `mounted` of them.
 #[cfg(debug_assertions)]
@@ -103,11 +177,18 @@ pub(crate) fn memo_key_replaced(id: &str, existing: &str, site: &std::panic::Loc
     ));
 }
 
+#[cfg(debug_assertions)]
+enum Stamp {
+    Real(Instant, crate::frame::profile::ThreadCpuMark, Option<f64>),
+    #[cfg(test)]
+    Fake(FakeSample),
+}
+
 /// Times one app callback on the main thread: [`Stall::end`] warns when it spent most of its
 /// time blocked rather than computing.
 pub(crate) struct Stall {
     #[cfg(debug_assertions)]
-    start: Option<(Instant, f64, Option<f64>)>,
+    start: Option<Stamp>,
 }
 
 impl Stall {
@@ -115,7 +196,18 @@ impl Stall {
     pub(crate) fn start() -> Self {
         Stall {
             #[cfg(debug_assertions)]
-            start: if enabled() { crate::frame::profile::cpu_ms().map(|cpu| (Instant::now(), cpu, runq::wait_ms())) } else { None },
+            start: if enabled() {
+                #[cfg(test)]
+                if let Some(sample) = FAKE_STALL.get() {
+                    return Stall { start: Some(Stamp::Fake(sample)) };
+                }
+                // Record the raw cycle/nanosecond mark rather than converted milliseconds: on
+                // Windows the cycle rate is unknown for the first 20 ms, and a mark taken then
+                // still converts at the end once the rate is known.
+                crate::frame::profile::thread_cpu_mark().map(|mark| Stamp::Real(crate::time::now(), mark, runq::wait_ms()))
+            } else {
+                None
+            },
         }
     }
 
@@ -125,12 +217,20 @@ impl Stall {
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     pub(crate) fn end(self, what: impl FnOnce() -> (String, String)) {
         #[cfg(debug_assertions)]
-        if let Some((wall, cpu, wait)) = self.start {
-            let wall = wall.elapsed().as_secs_f64() * 1000.0;
-            if wall > STALL_MS {
-                let mut what = Some(what);
-                end_slow(wall, cpu, wait, &mut || what.take().expect("stall description runs once")());
+        match self.start {
+            Some(Stamp::Real(wall, mark, wait)) => {
+                let wall = wall.elapsed().as_secs_f64() * 1000.0;
+                if wall > STALL_MS {
+                    let mut what = Some(what);
+                    end_slow(wall, mark, wait, &mut || what.take().expect("stall description runs once")());
+                }
             }
+            #[cfg(test)]
+            Some(Stamp::Fake(before)) => {
+                let mut what = Some(what);
+                end_fake(before, &mut || what.take().expect("stall description runs once")());
+            }
+            None => {}
         }
     }
 
@@ -140,24 +240,54 @@ impl Stall {
         #[cfg(not(debug_assertions))]
         let _ = name;
         #[cfg(debug_assertions)]
-        if let Some((wall, cpu, wait)) = self.start {
-            let wall = wall.elapsed().as_secs_f64() * 1000.0;
-            if wall > STALL_MS {
-                end_slow(wall, cpu, wait, &mut || {
+        match self.start {
+            Some(Stamp::Real(wall, mark, wait)) => {
+                let wall = wall.elapsed().as_secs_f64() * 1000.0;
+                if wall > STALL_MS {
+                    end_slow(wall, mark, wait, &mut || {
+                        (name.to_owned(), if name.contains(' ') { name.to_owned() } else { format!("`{name}`") })
+                    });
+                }
+            }
+            #[cfg(test)]
+            Some(Stamp::Fake(before)) => {
+                end_fake(before, &mut || {
                     (name.to_owned(), if name.contains(' ') { name.to_owned() } else { format!("`{name}`") })
                 });
             }
+            None => {}
         }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+fn end_fake(before: FakeSample, what: &mut dyn FnMut() -> (String, String)) {
+    let Some(after) = FAKE_STALL.get() else { return };
+    let wall = after.wall_ms - before.wall_ms;
+    if wall > STALL_MS {
+        let cpu = before.cpu_ms.zip(after.cpu_ms).map(|(a, b)| b - a);
+        let waited = before.wait_ms.zip(after.wait_ms).map(|(a, b)| b - a);
+        end_slow_measured(wall, cpu, waited, false, what);
     }
 }
 
 #[cfg(debug_assertions)]
 #[cold]
 #[inline(never)]
-fn end_slow(wall: f64, cpu: f64, wait: Option<f64>, what: &mut dyn FnMut() -> (String, String)) {
-    let cpu = crate::frame::profile::cpu_ms().map_or(0.0, |now| now - cpu);
+fn end_slow(wall: f64, mark: crate::frame::profile::ThreadCpuMark, wait: Option<f64>, what: &mut dyn FnMut() -> (String, String)) {
+    let cpu = crate::frame::profile::thread_cpu_since(mark).map(|ns| ns / 1e6);
     let waited = wait.and_then(|start| runq::wait_ms().map(|now| now - start));
-    let Some(blocked) = runq::blocked_ms(wall, cpu, waited, waited.is_none() && runq::overloaded()) else { return };
+    end_slow_measured(wall, cpu, waited, waited.is_none() && runq::overloaded(), what);
+}
+
+#[cfg(debug_assertions)]
+#[cold]
+#[inline(never)]
+fn end_slow_measured(wall: f64, cpu: Option<f64>, waited: Option<f64>, loaded: bool, what: &mut dyn FnMut() -> (String, String)) {
+    // Without a thread CPU reading (Windows before its 20 ms cycle-rate window, Windows on ARM,
+    // or a failed OS call), computing cannot be told from blocking: stay quiet.
+    let Some(cpu) = cpu else { return };
+    let Some(blocked) = runq::blocked_ms(wall, cpu, waited, loaded) else { return };
     let (site, name) = what();
     warn_once(format!("stall {site}"), || {
         let queued = waited.filter(|w| *w >= 1.0).map_or_else(String::new, |w| format!(", waited {w:.0} ms for a core"));

@@ -2,6 +2,8 @@
 //! for the refresh a frame will show at, rather than the moment the frame was built, so the
 //! wobble in when frames are built never shows a picture twice or skips one.
 
+#![allow(unsafe_code)]
+
 use rune_core::time::Instant;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -26,7 +28,7 @@ struct Grid {
 static GRID: Mutex<Option<Grid>> = Mutex::new(None);
 
 fn grid() -> Option<Grid> {
-    let now = Instant::now();
+    let now = rune_core::time::now();
     let mut slot = GRID.lock().unwrap();
     if let Some(g) = *slot
         && now.saturating_duration_since(g.read) < FRESH
@@ -42,6 +44,7 @@ fn read(now: Instant) -> Option<Grid> {
     static TIMING: std::sync::OnceLock<Option<GetTiming>> = std::sync::OnceLock::new();
     // SAFETY: dwmapi's documented entry point at its documented signature.
     let get = (*TIMING.get_or_init(|| unsafe { super::mf::symbol(super::mf::system_library("dwmapi.dll")?, c"DwmGetCompositionTimingInfo") }))?;
+    // SAFETY: `DWM_TIMING_INFO` is a plain Win32 C struct where all-zero bytes are valid.
     let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
     info.cbSize = size_of::<DWM_TIMING_INFO>() as u32;
     let (mut qpc, mut frequency) = (0i64, 0i64);

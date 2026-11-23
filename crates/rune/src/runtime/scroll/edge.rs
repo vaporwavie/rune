@@ -29,17 +29,13 @@ pub(in crate::runtime) fn reveal(offset: f64, top: f64, height: f64, viewport: f
     else { offset }
 }
 
-impl RuntimeCore {
-    /// Node `i`'s own soft-clip widths `f` (points) as a device-pixel fade and the rect its ramps
-    /// start from. With `scroll_edge_fade`, top and bottom follow the content hidden under them:
-    /// the ramp starts outside `r` so the edge itself only partly fades. `bottom` is the
-    /// presented bottom edge (see `stuck_offset`).
-    pub(in crate::runtime) fn scroll_edge_fade(&self, i: usize, f: [f32; 4], r: [f32; 4], k: f32, bottom: f32) -> ([f32; 4], [f32; 4]) {
-        let n = &self.tree.nodes[i];
-        let mut own = f.map(|v| v * k);
+impl requests::ScrollTables {
+    /// Node `n`'s own soft-clip widths `f` (points) as a device-pixel fade and the rect its ramps
+    /// start from, given its optional stuck-to-bottom offset.
+    pub(super) fn edge_fade(&self, n: &Node, f: [f32; 4], r: [f32; 4], k: f32, stuck: Option<f64>) -> ([f32; 4], [f32; 4]) {
+        let mut own = f.map(|v| (v * k).clamp(-65504.0, 65504.0));
         let width = n.scroll_edges.fade;
-        let Some(st) = self.scroll.scrolls.get(&n.id).filter(|_| width > 0.0 && n.scroll.is_some()) else { return (own, r) };
-        let stuck = self.stuck_offset(i, bottom);
+        let Some(st) = self.scrolls.get(&n.id).filter(|_| width > 0.0 && n.scroll.is_some()) else { return (own, r) };
         let offset = stuck.unwrap_or(st.offset) + f64::from(st.slack.height());
         let below = if stuck.is_some() { 0.0 } else { st.max - offset };
         let mut origin = r;
@@ -53,9 +49,21 @@ impl RuntimeCore {
             let (style, width) = style.edge(width, out > 0.0);
             let (w, o) = edge_ramp(style, width * k, hidden, k);
             own[edge] = w;
-            origin[edge] = r[edge] + out * o * w.abs();
+            origin[edge] = r[edge] + out * o * paint::soft_edges::fade_extent(w);
         }
         (own, origin)
+    }
+}
+
+impl RuntimeCore {
+    /// Node `i`'s own soft-clip widths `f` (points) as a device-pixel fade and the rect its ramps
+    /// start from. With `scroll_edge_fade`, top and bottom follow the content hidden under them:
+    /// the ramp starts outside `r` so the edge itself only partly fades. `bottom` is the
+    /// presented bottom edge (see `stuck_offset`).
+    pub(in crate::runtime) fn scroll_edge_fade(&self, i: usize, f: [f32; 4], r: [f32; 4], k: f32, bottom: f32) -> ([f32; 4], [f32; 4]) {
+        let n = &self.tree.nodes[i];
+        let stuck = if n.scroll_edges.fade > 0.0 && n.scroll.is_some() { self.stuck_offset(i, bottom) } else { None };
+        self.scroll.edge_fade(n, f, r, k, stuck)
     }
 
     /// Under [`crate::ScrollFade::below_sticky`], the fade under the header heading `section`
@@ -88,27 +96,72 @@ impl RuntimeCore {
         let k = inh.scale * s;
         let (w, o) = edge_ramp(edges.fade_style, edges.fade * k, f64::from(hidden), k);
         if w == 0.0 { return; }
-        let bottom = (inh.anchor_to[1] + (top + shift + height - inh.anchor[1]) * inh.scale) * s;
+        let raw_top = inh.anchor_to[1] + (top + shift - inh.anchor[1]) * inh.scale;
+        let raw_bottom = inh.anchor_to[1] + (top + shift + height - inh.anchor[1]) * inh.scale;
+        let bottom = if !inh.snap.off && !n.vis_flags.no_pixel_snap() && inh.turn == 0 && p.transform.rotate == 0.0 && (inh.scale - 1.0).abs() <= 1e-5 {
+            // Snap to the same device-pixel edge the stuck header box itself draws at (`pixel_snap::snap`),
+            // applying the header's sticky shift so `rigid[1]` cancels the viewport scroll offset.
+            let mut snap = inh.snap;
+            snap.scroll(1, shift);
+            let exact = [0.0, grid(raw_top, s) * s, 0.0, grid(raw_bottom, s) * s];
+            paint::pixel_snap::snap(exact, [0.0; 4], snap.rigid.map(|v| v * s), None, |_, c| c).0[3]
+        } else {
+            raw_bottom * s
+        };
         let inh = &mut self.paint.inh_scratch[section];
         self.scroll.sticky_bands.push((section, inh.paint_clip[1]));
         inh.paint_clip[1] = inh.paint_clip[1].max(bottom);
         inh.paint_fade[1] = w;
-        inh.paint_fade_origin[1] = bottom - o * w.abs();
+        inh.paint_fade_origin[1] = bottom - o * paint::soft_edges::fade_extent(w);
     }
 }
 
 /// The packed ramp `(width, offset)` (see [`partial`]) for an edge with `hidden` points under
-/// it, `width` device pixels wide at `k` device pixels a point; a negative width ramps linearly.
+/// it, `width` device pixels wide at `k` device pixels a point; a negative width ramps linearly,
+/// and a width above [`crate::render::instance::STOP_FADE_BIAS`] uses explicit piecewise-linear stops.
 fn edge_ramp(style: crate::el::FadeStyle, width: f32, hidden: f64, k: f32) -> (f32, f32) {
+    let width = width.clamp(0.0, 65504.0);
     if style.feather {
-        let w = width.min(hidden.max(0.0) as f32 * k);
+        let w = width.min(hidden.max(0.0) as f32 * k).min(65504.0);
+        if w <= 0.0 { return (0.0, 0.0); }
+        if style.stops.is_some() { return (crate::render::STOP_FADE_BIAS + w, 0.0); }
         return (if style.linear { -w } else { w }, 0.0);
     }
     let full = if style.full_at > 0.0 { f64::from(style.full_at) } else { FADE_IN };
     let strength = (hidden / full).clamp(0.0, 1.0) as f32;
-    if !style.linear { return partial(width, strength); }
+    if let Some(stops) = style.stops {
+        let (w, o) = partial_stops(width, strength, stops);
+        return (if w > 0.0 { crate::render::STOP_FADE_BIAS + w.min(65504.0) } else { 0.0 }, o);
+    }
+    if !style.linear {
+        let (w, o) = partial(width, strength);
+        return (w.min(65504.0), o);
+    }
     let (w, o) = partial_linear(width, strength);
-    (-w, o)
+    (-w.min(65504.0), o)
+}
+
+/// [`partial`] on a piecewise-linear ramp through `stops`: finds the exact normalized `offset`
+/// whose curve value equals `1 - strength` so the edge shows `1 - strength` and reaches full
+/// alpha `width` pixels in.
+fn partial_stops(width: f32, strength: f32, stops: [(f32, f32); 3]) -> (f32, f32) {
+    if strength <= 0.0 || width <= 0.0 { return (0.0, 0.0); }
+    if strength >= 1.0 { return (width, 0.0); }
+    let target = 1.0 - strength;
+    let pts = [stops[0], stops[1], stops[2], (1.0, 1.0)];
+    let (mut px, mut py) = (0.0f32, 0.0f32);
+    let mut offset = target;
+    for (nx, ny) in pts {
+        if target <= ny {
+            let dy = ny - py;
+            offset = if dy > 1e-6 { px + (nx - px) * ((target - py) / dy) } else { nx };
+            break;
+        }
+        px = nx;
+        py = ny;
+    }
+    let offset = offset.clamp(0.0, 0.995);
+    (width / (1.0 - offset), offset)
 }
 
 /// [`partial`] on a linear ramp: it starts `1 - strength` of the way in, so the edge shows

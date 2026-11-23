@@ -8,11 +8,15 @@
 //! out as an overlay plane); `CreateSwapChainForComposition` refuses NV12. The window wraps the
 //! handle in a surface of its own DirectComposition device (`handle`).
 
+#![allow(unsafe_code)]
+
+use super::LayerSurface;
 use super::gpu::Device;
 use super::mf::{self, Picture};
 use crate::native_surface::{Format, Matrix, Orient};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -24,7 +28,19 @@ type CreateSurfaceHandle = unsafe extern "system" fn(u32, *const core::ffi::c_vo
 /// `COMPOSITIONOBJECT_READ | COMPOSITIONOBJECT_WRITE`.
 const ALL_ACCESS: u32 = 0x3;
 
+/// The next layer's id (`Layer::id`).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// An id no other layer of this process has or had.
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(super) struct Layer {
+    /// Which layer this is, for the window that shows it. The surface handle's value can't say:
+    /// Windows gives a new handle the value of one just closed, and a clip's layer is closed
+    /// and made again at every pause and seek.
+    id: u64,
     swap: IDXGISwapChain3,
     /// The DirectComposition surface handle the swap chain presents to; closed on drop.
     handle: HANDLE,
@@ -47,7 +63,7 @@ impl Drop for Layer {
     fn drop(&mut self) {
         // SAFETY: the handle this layer made and nobody else closes.
         unsafe {
-            let _ = CloseHandle(self.handle);
+            CloseHandle(self.handle).ok();
         }
     }
 }
@@ -69,19 +85,20 @@ impl Layer {
             let swap = match swap_chain(&device, handle, buffer) {
                 Ok(swap) => swap,
                 Err(e) => {
-                    let _ = CloseHandle(handle);
+                    CloseHandle(handle).ok();
                     return Err(e);
                 }
             };
             let video: ID3D11VideoDevice = device.device.cast().map_err(|_| "no video processor")?;
             let context: ID3D11VideoContext1 = device.context.cast().map_err(|_| "no video processor")?;
-            Ok(Layer { swap, handle, size, buffer, video, context, processor: None, inputs: Vec::new(), picture })
+            Ok(Layer { id: next_id(), swap, handle, size, buffer, video, context, processor: None, inputs: Vec::new(), picture })
         }
     }
 
-    /// The DirectComposition surface handle, for the window's `CreateSurfaceFromHandle`.
-    pub(super) fn handle(&self) -> usize {
-        self.handle.0 as usize
+    /// The layer's id and its DirectComposition surface handle, for the window's
+    /// `CreateSurfaceFromHandle`.
+    pub(super) fn surface(&self) -> LayerSurface {
+        LayerSurface { id: self.id, handle: self.handle.0 as usize }
     }
 
     /// The video's place changed size: the swap chain follows; the next picture fills it.
@@ -221,3 +238,6 @@ fn input_space(picture: &Picture) -> DXGI_COLOR_SPACE_TYPE {
 fn even((w, h): (u32, u32)) -> (u32, u32) {
     ((w.max(2) + 1) & !1, (h.max(2) + 1) & !1)
 }
+
+#[cfg(test)]
+mod tests;
