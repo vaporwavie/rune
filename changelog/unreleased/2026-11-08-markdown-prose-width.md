@@ -1,1 +1,0 @@
-- **`MarkdownStyle::prose_width` caps paragraphs, headings, lists and quotes at a width** while code, diffs, diagrams, tables and images keep the full column, so a column wide enough for code still sets prose at a readable measure.

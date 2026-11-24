@@ -4,17 +4,6 @@
 use super::super::*;
 use super::{Flow, Lead, Renderer, collapsed, collapsed_bottom, collapsed_top, rendered_keys};
 
-fn is_prose(b: &Block) -> bool {
-    matches!(b, Block::Para(_) | Block::Heading(..) | Block::List { .. } | Block::Quote(_))
-}
-
-fn capped(e: El, cap: Option<f32>) -> El {
-    match cap {
-        Some(w) => e.max_w(w),
-        None => e,
-    }
-}
-
 enum RenderFrame<'a> {
     Blocks {
         blocks: &'a [Block],
@@ -30,7 +19,7 @@ enum RenderFrame<'a> {
         after_heading: bool,
         last_dir: Option<rune::Direction>,
         col: El,
-        pending: Option<(String, f32, bool, Option<rune::Direction>, Option<f32>)>,
+        pending: Option<(String, f32, bool, Option<rune::Direction>)>,
     },
     Quote {
         quote_block: &'a Block,
@@ -177,10 +166,10 @@ impl Renderer {
             match top_frame {
                 RenderFrame::Blocks { blocks, pre, maps, names, top_level, in_item, open_tail, allow_memo, idx, prev_mb, after_heading, last_dir, col: cur_col, pending } => {
                     if let Some(child_el) = ret.take() {
-                        let (key, top, prose, own, cap) = pending.take().unwrap();
+                        let (key, top, prose, own) = pending.take().unwrap();
                         let drawn = if prose { bidi::directed(child_el, own.or(*last_dir)) } else { child_el };
                         if own.is_some() { *last_dir = own; }
-                        *cur_col = std::mem::replace(cur_col, el()).child(capped(drawn, cap).key(key).mt(top));
+                        *cur_col = std::mem::replace(cur_col, el()).child(drawn.key(key).mt(top));
                         continue;
                     }
                     let mut descended = false;
@@ -212,7 +201,6 @@ impl Renderer {
                         if i > 0 { self.flow.set(Flow { lead: None, ..self.flow.get() }); }
                         let own = dirs.of(b);
                         let prose = !matches!(b, Block::Code(_) | Block::Diff(_) | Block::Mermaid(_) | Block::Image { .. } | Block::Rule);
-                        let cap = self.s.prose_width.filter(|_| *top_level && is_prose(b));
                         let dir = prose.then(|| own.or(*last_dir)).flatten();
                         let map = maps_slice.get(i).unwrap_or(EMPTY);
                         let pb = pre_slice.and_then(|ps| ps.get(i)).map(Rc::as_ref);
@@ -233,7 +221,7 @@ impl Renderer {
                                     debug_assert_eq!(self.next_source.get(), src_at + src_n);
                                     debug_assert_eq!(self.next_task.get(), task_at + task_n);
                                     let drawn = if prose { bidi::directed(child_el, dir) } else { child_el };
-                                    capped(drawn, cap).key(key_c).mt(top)
+                                    drawn.key(key_c).mt(top)
                                 });
                                 self.next_source.set(src_at + src_n);
                                 self.next_task.set(task_at + task_n);
@@ -245,7 +233,7 @@ impl Renderer {
                         let am = *allow_memo;
                         match b {
                             Block::Quote(inner) => {
-                                *pending = Some((key, top, prose, own, cap));
+                                *pending = Some((key, top, prose, own));
                                 let inner_maps = match map { BlockMap::Quote(m) => m.as_slice(), _ => &[][..] };
                                 let q = self.s.quote;
                                 let saved = self.flow.get();
@@ -257,7 +245,7 @@ impl Renderer {
                                 break;
                             }
                             Block::List { start, items } => {
-                                *pending = Some((key, top, prose, own, cap));
+                                *pending = Some((key, top, prose, own));
                                 let item_maps = match map { BlockMap::List(m) => m.as_slice(), _ => &[][..] };
                                 let saved = self.flow.get();
                                 let indent = match self.s.list_nested {
@@ -273,7 +261,7 @@ impl Renderer {
                                 let child_el = self.leaf_block(b, pb, map);
                                 let drawn = if prose { bidi::directed(child_el, dir) } else { child_el };
                                 if own.is_some() { *last_dir = own; }
-                                *cur_col = std::mem::replace(cur_col, el()).child(capped(drawn, cap).key(key).mt(top));
+                                *cur_col = std::mem::replace(cur_col, el()).child(drawn.key(key).mt(top));
                             }
                         }
                     }
